@@ -92,6 +92,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_compiler_backend,
     is_cuda,
+    is_hip,
     is_non_idle_and_non_empty,
     is_npu,
     make_layers,
@@ -101,6 +102,7 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_npu = is_npu()
 
 if _is_npu:
@@ -368,6 +370,10 @@ def fused_tp_qknorm(
 class MiniMaxM2QKRMSNorm:
     COUNTER = 0
     COMM_MAP: Dict[int, Any] = {}
+    # ROCm AITER qknorm+allreduce (ROCm/aiter#3163) is capped at 80 tokens; larger
+    # prefill batches use the naive path (same policy as vLLM PR 42602 on ROCm).
+    _AITER_FUSED_QKNORM_MAX_TOKENS = 80
+    _aiter_fused_unavailable_warned = False
 
     def __init__(
         self,
@@ -379,6 +385,10 @@ class MiniMaxM2QKRMSNorm:
         self._k_norm = k_norm
         self._world_size = self._q_norm.attn_tp_size
         self._eps = q_norm.variance_epsilon
+        self._use_aiter_fused = False
+        self._max_fused_tokens: Optional[int] = None
+        self._ca_comm = None
+        # CUDA: JIT push-AR kernel. ROCm: AITER custom_fused_qknorm_ar (needs aiter#3163).
         use_fused_norm = get_bool_env_var("SGLANG_USE_FUSED_PARALLEL_QKNORM")
 
         self._forward_impl = self._forward_naive
@@ -394,6 +404,46 @@ class MiniMaxM2QKRMSNorm:
             if counter is not None:
                 self._counter = counter
                 self._forward_impl = self._forward_fused
+        elif self._world_size > 1 and _is_hip and use_fused_norm:
+            ca = MiniMaxM2QKRMSNorm._resolve_aiter_ca_comm()
+            if ca is not None:
+                self._ca_comm = ca
+                self._use_aiter_fused = True
+                self._max_fused_tokens = self._AITER_FUSED_QKNORM_MAX_TOKENS
+                self._forward_impl = self._forward_aiter_fused
+                logger.info(
+                    "[AR] MiniMax QK norm: AITER custom_fused_qknorm_ar enabled "
+                    f"(fused when num_tokens <= {self._max_fused_tokens})"
+                )
+            elif not MiniMaxM2QKRMSNorm._aiter_fused_unavailable_warned:
+                MiniMaxM2QKRMSNorm._aiter_fused_unavailable_warned = True
+                logger.warning(
+                    "SGLANG_USE_FUSED_PARALLEL_QKNORM=1 but AITER "
+                    "custom_fused_qknorm_ar is unavailable; using naive QK norm. "
+                    "Requires aiter build containing ROCm/aiter#3163."
+                )
+
+    @staticmethod
+    def _resolve_aiter_ca_comm() -> Optional[Any]:
+        """AITER CustomAllreduce on the attention-TP (or full-TP) process group."""
+        if not get_bool_env_var("SGLANG_USE_AITER", default="true"):
+            return None
+        if not get_bool_env_var("SGLANG_USE_AITER_AR", default="true"):
+            return None
+        server_args = get_global_server_args()
+        if server_args is not None and server_args.disable_custom_all_reduce:
+            return None
+        from sglang.srt.distributed.parallel_state import get_tp_group
+
+        # Attention-TP group usually equals TP when attn_dp/cp are 1; otherwise it
+        # has no ca_comm and we fall back to the main TP group's communicator.
+        for grp in (get_attention_tp_group(), get_tp_group()):
+            ca = getattr(grp, "ca_comm", None)
+            if ca is None or getattr(ca, "disabled", True):
+                continue
+            if hasattr(ca, "custom_fused_qknorm_ar"):
+                return ca
+        return None
 
     @lru_cache
     @staticmethod
@@ -426,7 +476,19 @@ class MiniMaxM2QKRMSNorm:
         MiniMaxM2QKRMSNorm.COMM_MAP[counter] = comm
         return counter if not comm.disabled else None
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor):
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        max_tok = self._max_fused_tokens
+        if max_tok is not None and q.shape[0] > max_tok:
+            return self._forward_naive(q, k)
+        if self._use_aiter_fused:
+            if v is None:
+                return self._forward_naive(q, k)
+            return self._forward_aiter_fused(q, k, v)
         return self._forward_impl(q, k)
 
     def _forward_naive(self, q: torch.Tensor, k: torch.Tensor):
@@ -454,6 +516,20 @@ class MiniMaxM2QKRMSNorm:
             self._eps,
         )
         return q, k
+
+    def _forward_aiter_fused(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Mirrors vLLM PR 42602 / ROCm/aiter#3163: one kernel for TP allreduce of
+        # per-token (q_var, k_var) plus sharded RMSNorm weights on Q/K.
+        qkv = torch.cat([q, k, v], dim=-1)
+        q_out, k_out, _v_out = self._ca_comm.custom_fused_qknorm_ar(
+            qkv,
+            self._q_norm.weight,
+            self._k_norm.weight,
+            self._eps,
+        )
+        return q_out, k_out
 
 
 class MiniMaxM2MoE(nn.Module):
@@ -816,7 +892,7 @@ class MiniMaxM2Attention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.use_qk_norm:
-            q, k = self.qk_norm_impl.forward(q, k)
+            q, k = self.qk_norm_impl.forward(q, k, v)
         q, k = self.rotary_emb(positions, q, k)
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
