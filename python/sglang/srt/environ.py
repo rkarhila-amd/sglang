@@ -484,6 +484,11 @@ class Envs:
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
+    # DSA indexer: "sglang" (default) or "atom" (ATOM-aligned aiter path on HIP)
+    SGLANG_DSA_INDEXER_IMPL = EnvStr("sglang")
+    SGLANG_DSA_INDEXER_QK_ROPE_FUSION = EnvBool(False)
+    # When set, HIP + FP8 KV defaults DSA sparse MLA to aiter (see --enable-dsa-aiter-mla)
+    SGLANG_DSA_USE_AITER_MLA = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)

@@ -274,7 +274,8 @@ DSA_CHOICES = [
 ]
 NSA_CHOICES = DSA_CHOICES  # deprecated alias
 
-DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer"]
+DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer", "aiter"]
+DSA_INDEXER_IMPL_CHOICES = ["sglang", "atom"]
 
 MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
 
@@ -570,6 +571,8 @@ class ServerArgs:
         None  # auto-detect based on hardware/kv_cache_dtype
     )
     dsa_topk_backend: str = "sgl-kernel"
+    dsa_indexer_impl: str = "sglang"
+    enable_dsa_aiter_mla: bool = False
     disable_flashinfer_autotune: bool = False
     mamba_backend: str = "triton"
 
@@ -1721,6 +1724,21 @@ class ServerArgs:
             self, user_set_prefill, user_set_decode, kv_cache_dtype
         ):
             return
+
+        if self.enable_dsa_aiter_mla:
+            envs.SGLANG_DSA_USE_AITER_MLA.set(True)
+        if (
+            envs.SGLANG_DSA_USE_AITER_MLA.get() or self.enable_dsa_aiter_mla
+        ) and is_hip() and kv_cache_dtype == "fp8_e4m3":
+            if not user_set_prefill:
+                self.dsa_prefill_backend = "aiter"
+            if not user_set_decode:
+                self.dsa_decode_backend = "aiter"
+
+        if self.dsa_indexer_impl == "atom":
+            envs.SGLANG_DSA_INDEXER_IMPL.set("atom")
+            if self.dsa_topk_backend == "sgl-kernel":
+                self.dsa_topk_backend = "aiter"
 
         if not user_set_prefill and not user_set_decode and is_hip():
             self.dsa_prefill_backend = "tilelang"
@@ -5547,8 +5565,25 @@ class ServerArgs:
             default=ServerArgs.dsa_topk_backend,
             type=str,
             choices=DSA_TOPK_BACKEND_CHOICES,
-            help="DSA indexer top-k backend. Options: 'sgl-kernel', 'torch', 'flashinfer'. "
-            "The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
+            help="DSA indexer top-k backend. Options: 'sgl-kernel', 'torch', 'flashinfer', 'aiter'. "
+            "The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false. "
+            "'aiter' uses ATOM-aligned top_k_per_row kernels (requires SGLANG_USE_AITER=1).",
+        )
+        parser.add_argument(
+            "--dsa-indexer-impl",
+            dest="dsa_indexer_impl",
+            default=ServerArgs.dsa_indexer_impl,
+            type=str,
+            choices=DSA_INDEXER_IMPL_CHOICES,
+            help="DSA lightning indexer implementation: 'sglang' (default) or 'atom' "
+            "(ATOM-aligned aiter FP8 indexer on HIP).",
+        )
+        parser.add_argument(
+            "--enable-dsa-aiter-mla",
+            action="store_true",
+            dest="enable_dsa_aiter_mla",
+            help="On HIP with FP8 KV cache, use aiter for DSA sparse MLA prefill/decode "
+            "(sets --dsa-prefill-backend and --dsa-decode-backend to aiter when unset).",
         )
         parser.add_argument(
             "--fp8-gemm-backend",

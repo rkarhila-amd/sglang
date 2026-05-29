@@ -1215,10 +1215,10 @@ DSA_DECODE_IMPL_VARIANTS: tuple[str, ...] = (
 # take in FP8 deployments. The `flashmla_kv` decode kernel and *both*
 # flashmla prefill kernels are the production-relevant FP8 paths.
 DSA_FP8_COMPATIBLE_PREFILL_IMPLS: frozenset[str] = frozenset(
-    {"flashmla_sparse", "flashmla_kv", "flashmla_auto"}
+    {"flashmla_sparse", "flashmla_kv", "flashmla_auto", "aiter"}
 )
 DSA_FP8_COMPATIBLE_DECODE_IMPLS: frozenset[str] = frozenset(
-    {"flashmla_kv", "flashmla_auto"}
+    {"flashmla_kv", "flashmla_auto", "aiter"}
 )
 
 

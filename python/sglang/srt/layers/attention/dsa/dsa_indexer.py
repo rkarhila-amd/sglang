@@ -17,6 +17,11 @@ from sglang.srt.compilation.piecewise_context_manager import (
     is_in_piecewise_cuda_graph,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.atom_indexer import (
+    atom_topk_decode_paged,
+    atom_topk_prefill_ragged,
+    prepare_indexer_kv_cache_view,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
     is_dsa_enable_prefill_cp,
@@ -664,7 +669,19 @@ class Indexer(MultiPlatformOp):
             )
 
         # NOTE(dark): logits should be cleaned in topk_transform
-        topk_result = metadata.topk_transform(logits, self.index_topk)
+        if metadata.topk_backend.is_aiter():
+            next_n = q_fp8.shape[1]
+            out_rows = logits.shape[0]
+            out_slice = topk_result[:out_rows]
+            ctx_lens = (
+                seqlens_32.unsqueeze(-1)
+                if seqlens_32.dim() == 1
+                else seqlens_32
+            )
+            atom_topk_decode_paged(logits, ctx_lens, out_slice, next_n=next_n)
+            topk_result[:out_rows] = out_slice
+        else:
+            topk_result = metadata.topk_transform(logits, self.index_topk)
         # Restore possible padding exist in the hidden states.
         if not _is_hip and q_offset < q_fp8.shape[0]:
             pad_len = q_fp8.shape[0] - q_offset
@@ -839,8 +856,15 @@ class Indexer(MultiPlatformOp):
             assert logits.shape[0] == len(seq_lens_expanded)
             assert logits.shape[1] == k_offset
 
-            raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
-            topk_result[:q_offset] = raw_topk_result
+            if metadata.topk_backend.is_aiter():
+                raw_topk_result = topk_result[:q_offset]
+                atom_topk_prefill_ragged(logits, ks, ke, raw_topk_result)
+                topk_result[:q_offset] = raw_topk_result
+            else:
+                raw_topk_result = metadata.topk_transform(
+                    logits, self.index_topk, ks=ks
+                )
+                topk_result[:q_offset] = raw_topk_result
             return topk_result
 
         bytes_per_row = k_offset * self._MQA_LOGITS_BYTES_PER_ELEM
@@ -901,15 +925,21 @@ class Indexer(MultiPlatformOp):
                 cu_seqlens_q_chunk = cu_seqlens_q_full[start:end]
                 batch_idx_chunk = token_to_batch_idx[start:end]
 
-            raw_topk_chunk = metadata.topk_transform(
-                logits_chunk,
-                self.index_topk,
-                ks=ks[start:end],
-                cu_seqlens_q=cu_seqlens_q_chunk,
-                ke_offset=lengths_chunk,
-                batch_idx_list=batch_idx_chunk,
-                topk_indices_offset_override=topk_offset_chunk,
-            )
+            if metadata.topk_backend.is_aiter():
+                raw_topk_chunk = topk_result[start:end]
+                atom_topk_prefill_ragged(
+                    logits_chunk, ks[start:end], ke[start:end], raw_topk_chunk
+                )
+            else:
+                raw_topk_chunk = metadata.topk_transform(
+                    logits_chunk,
+                    self.index_topk,
+                    ks=ks[start:end],
+                    cu_seqlens_q=cu_seqlens_q_chunk,
+                    ke_offset=lengths_chunk,
+                    batch_idx_list=batch_idx_chunk,
+                    topk_indices_offset_override=topk_offset_chunk,
+                )
             topk_result[start:end] = raw_topk_chunk
             start = end
 
@@ -1247,7 +1277,7 @@ class Indexer(MultiPlatformOp):
             buf = get_token_to_kv_pool().get_index_k_with_scale_buffer(
                 layer_id=layer_id
             )
-            kv_cache = buf.view(-1, page_size, 132).view(fp8_dtype)
+            kv_cache = prepare_indexer_kv_cache_view(buf, page_size)
             out_loc = forward_batch.out_cache_loc
             if not out_loc.is_contiguous():
                 out_loc = out_loc.contiguous()

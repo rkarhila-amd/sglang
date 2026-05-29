@@ -24,6 +24,7 @@ class DSATopKBackend(Enum):
     SGL_KERNEL = "sgl-kernel"
     TORCH = "torch"
     FLASHINFER = "flashinfer"
+    AITER = "aiter"
 
     def is_sgl_kernel(self) -> bool:
         return self == DSATopKBackend.SGL_KERNEL
@@ -33,6 +34,9 @@ class DSATopKBackend(Enum):
 
     def is_flashinfer(self) -> bool:
         return self == DSATopKBackend.FLASHINFER
+
+    def is_aiter(self) -> bool:
+        return self == DSATopKBackend.AITER
 
     def topk_func(
         self,
@@ -70,6 +74,30 @@ class DSATopKBackend(Enum):
                     "dsa_graph_safe": True,
                 },
             )
+        if self.is_aiter():
+            from sglang.srt.layers.attention.dsa.atom_indexer import (
+                atom_topk_decode_paged,
+                atom_topk_prefill_ragged,
+            )
+
+            topk_indices = score.new_full(
+                (score.shape[0], topk), -1, dtype=torch.int32
+            )
+            if row_starts is not None:
+                atom_topk_prefill_ragged(
+                    score, row_starts, lengths, topk_indices
+                )
+            else:
+                context_lens = lengths
+                if context_lens.dim() == 1:
+                    context_lens = context_lens.unsqueeze(-1)
+                atom_topk_decode_paged(
+                    score,
+                    context_lens,
+                    topk_indices,
+                    next_n=context_lens.shape[1],
+                )
+            return topk_indices
         raise RuntimeError(f"Unsupported {self = }.")
 
     def topk_transform(
@@ -163,6 +191,12 @@ class DSATopKBackend(Enum):
                     row_starts=row_starts,
                 )
             raise RuntimeError(f"Unsupported {topk_transform_method = }.")
+
+        if self.is_aiter():
+            raise RuntimeError(
+                "DSATopKBackend.AITER does not support SGLANG_DSA_FUSE_TOPK; "
+                "use unfused top-k (force_unfused_topk=True or SGLANG_DSA_FUSE_TOPK=0)."
+            )
 
         raise RuntimeError(f"Unsupported {self = } for SGLANG_DSA_FUSE_TOPK.")
 
