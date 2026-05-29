@@ -342,6 +342,7 @@ class DeepseekSparseAttnBackend(
         self.enable_auto_select_prefill_impl = self.dsa_prefill_impl == "flashmla_auto"
 
         self._arange_buf = torch.arange(16384, device=self.device, dtype=torch.int32)
+        self.kv_cache_dtype = model_runner.kv_cache_dtype
 
         if _is_hip:
             max_bs = model_runner.req_to_token_pool.size
@@ -403,7 +404,6 @@ class DeepseekSparseAttnBackend(
 
         self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
-        self.kv_cache_dtype = model_runner.kv_cache_dtype
 
         # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
         if self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm":
