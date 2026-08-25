@@ -9,6 +9,17 @@ import triton.language as tl
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_xpu
 
+# Fixed Triton launch configs for decode kernels. Autotune benchmarks multiple
+# configs on first launch and is incompatible with CUDA/HIP graph stream capture.
+_DECODE_SCORE_BLOCK_N = 256
+_DECODE_SCORE_NUM_WARPS = 8
+_DECODE_SCORE_NUM_STAGES = 2
+_MERGE_ATTN_NUM_WARPS = 8
+_MERGE_ATTN_NUM_STAGES = 3
+_TOPK_PARTIAL_BLOCK_K = 256
+_TOPK_PARTIAL_NUM_WARPS = 8
+_TOPK_PARTIAL_NUM_STAGES = 2
+
 from ..common.utils import (
     _bitonic_merge,
     _sort_ids_ascending,
@@ -527,15 +538,6 @@ def _decode_score_attn_kernel(
         "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
     }
 )
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=nw, num_stages=ns)
-        for nw in [4, 8]
-        for ns in [2, 3, 4]
-    ],
-    key=["BLOCK_SIZE_D"],
-    restore_value=["o_ptr"],
-)
 @triton.jit
 def _merge_attn_out_kernel(
     o_ptr,
@@ -590,16 +592,6 @@ def _merge_attn_out_kernel(
     {
         "BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["topk"]),
     }
-)
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_SIZE_K": 256}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_SIZE_K": 256}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_SIZE_K": 128}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_SIZE_K": 128}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_SIZE_K": 64}, num_warps=2, num_stages=2),
-    ],
-    key=["topk"],
 )
 @triton.jit
 def _topk_index_partial_kernel(
@@ -1108,6 +1100,9 @@ def flash_decode_with_topk_idx(
             topk_idx_partial.stride(1),
             topk_idx_partial.stride(2),
             topk_idx_partial.stride(3),
+            BLOCK_SIZE_K=_TOPK_PARTIAL_BLOCK_K,
+            num_warps=_TOPK_PARTIAL_NUM_WARPS,
+            num_stages=_TOPK_PARTIAL_NUM_STAGES,
         )
         grid = (batch_size, num_q_heads)
         _topk_index_merge_kernel[grid](
@@ -1148,6 +1143,8 @@ def flash_decode_with_topk_idx(
         lse.stride(1),
         lse.stride(2),
         NUM_KV_CHUNKS=NUM_KV_CHUNKS,
+        num_warps=_MERGE_ATTN_NUM_WARPS,
+        num_stages=_MERGE_ATTN_NUM_STAGES,
     )
     o = o[0].contiguous()
     return o, topk_idx, real_seq_lens

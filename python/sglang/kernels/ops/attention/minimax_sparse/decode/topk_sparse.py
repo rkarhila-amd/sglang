@@ -13,6 +13,10 @@ from ..common.utils import (
     unit_scale,
 )
 
+# Fixed launch config; see flash_with_topk_idx.py re CUDA graph capture.
+_GQA_SPARSE_DECODE_NUM_WARPS = 8
+_GQA_SPARSE_DECODE_NUM_STAGES = 3
+
 
 @triton.heuristics(
     {
@@ -25,14 +29,6 @@ from ..common.utils import (
         "BATCH_SIZE_BUCKET": lambda args: triton.next_power_of_2(args["batch_size"]),
         "HAS_HISPARSE_SLOTS": lambda args: args["hisparse_slots_ptr"] is not None,
     }
-)
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=nw, num_stages=ns)
-        for nw in [4, 8]
-        for ns in [2, 3, 4, 5]
-    ],
-    key=["BATCH_SIZE_BUCKET", "gqa_group_size", "head_dim", "block_size", "HAS_SINK"],
 )
 @triton.jit
 def _gqa_share_sparse_decode_kernel(
@@ -441,6 +437,8 @@ def flash_decode_with_gqa_share_sparse(
         BLOCK_SIZE_N=block_size,
         NUM_TOPK_CHUNKS=NUM_TOPK_CHUNKS,
         IS_FP8=is_fp8,
+        num_warps=_GQA_SPARSE_DECODE_NUM_WARPS,
+        num_stages=_GQA_SPARSE_DECODE_NUM_STAGES,
     )
     # merge partials into chunk 0
     merge_grid = (batch_size, num_q_heads)
