@@ -178,6 +178,11 @@ def _get_quantization_config(
             {
                 "gate_up_proj": ["gate_proj", "up_proj"],
                 "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
+                # MiniMax sparse index_qkv_proj is [q|k] only when index value is
+                # disabled; index_v_proj weights are absent from the checkpoint but
+                # the model class maps three shards, which trips Quark's fused-layer
+                # ignore check (index_q/k excluded, index_v not listed -> crash).
+                "index_qkv_proj": ["index_q_proj", "index_k_proj"],
             }
         )
 
@@ -1884,18 +1889,20 @@ class PreshardedModelLoader(DefaultModelLoader):
         def _safe(fn) -> int:
             try:
                 return fn()
-            except (AssertionError, AttributeError, RuntimeError):
+            except (AssertionError, AttributeError, RuntimeError, ValueError):
                 return 1
+
+        from sglang.srt.layers.dp_attention import get_moe_cp_size
 
         parallel = get_parallel()
         return {
             "tp": _safe(lambda: parallel.tp_size),
-            "dp": _safe(lambda: parallel.moe_dp_size),
+            "dp": _safe(get_moe_cp_size),
             "ep": _safe(lambda: parallel.moe_ep_size),
             "pp": _safe(lambda: parallel.pp_size),
-            "moe_dense_tp_size": parallel.config.moe_dense_tp_size,
-            "moe_dp_size": get_parallel().config.moe_dp_size,
-            "enable_dp_lm_head": parallel.config.enable_dp_lm_head,
+            "moe_dense_tp_size": parallel.moe_dense_tp_size,
+            "moe_dp_size": get_parallel().moe_dp_size,
+            "enable_dp_lm_head": parallel.enable_dp_lm_head,
             "enable_fp32_lm_head": get_exec().features.enable_fp32_lm_head,
             "quantization": model_config.quantization,
             "model_dtype": str(model_config.dtype),
