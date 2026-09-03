@@ -195,6 +195,22 @@ class AiterRunnerCore(MoeRunnerCore):
         if self.config.no_combine:
             extra["no_combine"] = True
 
+        from sglang.srt.debug.moe_path_debug import log_moe_runner
+
+        _M = runner_input.hidden_states.shape[0]
+        _gate_mode = extra.get("gate_mode", -1)
+        _forward_mode = running_state.get("forward_mode")
+        _layer_id = running_state.get("layer_id")
+        log_moe_runner(
+            M=_M,
+            activation=self.config.activation,
+            gate_mode=_gate_mode,
+            quant_type=runner_input.quant_type.value,
+            swiglu_limit=quant_info.swiglu_limit,
+            forward_mode=str(_forward_mode) if _forward_mode is not None else None,
+            layer_id=_layer_id,
+        )
+
         output = fused_moe(
             hidden_states=runner_input.hidden_states,
             w1=quant_info.w13_weight,

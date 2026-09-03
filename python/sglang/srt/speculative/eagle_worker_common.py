@@ -310,6 +310,18 @@ def prepare_for_draft(
     can_run_decode_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
         forward_batch
     )
+
+    from sglang.srt.debug.moe_path_debug import log_spec_path
+
+    _bs = len(batch.seq_lens) if not batch.forward_mode.is_idle() else 0
+    log_spec_path(
+        phase="draft_decode_prepare",
+        forward_mode=str(batch.forward_mode),
+        bs=_bs,
+        num_tokens_per_req=topk,
+        cuda_graph=bool(can_run_decode_cuda_graph),
+    )
+
     return forward_batch, can_run_decode_cuda_graph
 
 
@@ -653,6 +665,7 @@ def run_eagle_verify(
         speculative_num_draft_tokens=num_draft_tokens,
         next_draft_input=next_draft_input,
         accept_lens=accept_lens,
+        accept_index=accept_index,
         new_seq_lens=new_seq_lens,
         routed_experts_output=forward_batch_output.routed_experts_output,
         indexer_topk_output=forward_batch_output.indexer_topk_output,

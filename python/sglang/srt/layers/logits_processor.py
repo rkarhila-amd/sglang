@@ -406,10 +406,30 @@ class LogitsProcessor(nn.Module):
 
         if not logits_metadata.extend_return_logprob:
             # Compute logits for both input and sampled tokens.
+            if logits_metadata.forward_mode.is_target_verify():
+                from sglang.srt.speculative.spec_verify_debug import (
+                    log_target_verify_lm_head,
+                )
+
+                log_target_verify_lm_head(
+                    site="pruned_hidden",
+                    tensor=pruned_states,
+                    logits_metadata=logits_metadata,
+                )
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
             )
+            if logits_metadata.forward_mode.is_target_verify():
+                from sglang.srt.speculative.spec_verify_debug import (
+                    log_target_verify_lm_head,
+                )
+
+                log_target_verify_lm_head(
+                    site="sampled_logits",
+                    tensor=sampled_logits,
+                    logits_metadata=logits_metadata,
+                )
 
             # Decode mode or extend mode without return_logprob.
             return LogitsProcessorOutput(
@@ -673,8 +693,28 @@ class LogitsProcessor(nn.Module):
         hidden_states, local_hidden_states = self._gather_dp_attn_hidden_states(
             hidden_states, logits_metadata
         )
+        if logits_metadata.forward_mode.is_target_verify():
+            from sglang.srt.speculative.spec_verify_debug import (
+                log_target_verify_lm_head,
+            )
+
+            log_target_verify_lm_head(
+                site="hidden_pre_gemm",
+                tensor=hidden_states,
+                logits_metadata=logits_metadata,
+            )
 
         logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
+        if logits_metadata.forward_mode.is_target_verify():
+            from sglang.srt.speculative.spec_verify_debug import (
+                log_target_verify_lm_head,
+            )
+
+            log_target_verify_lm_head(
+                site="logits_post_gemm",
+                tensor=logits,
+                logits_metadata=logits_metadata,
+            )
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
@@ -691,6 +731,17 @@ class LogitsProcessor(nn.Module):
             else:
                 logits = self._logits_gatherer(logits)
 
+        if logits_metadata.forward_mode.is_target_verify():
+            from sglang.srt.speculative.spec_verify_debug import (
+                log_target_verify_lm_head,
+            )
+
+            log_target_verify_lm_head(
+                site="logits_post_gather",
+                tensor=logits,
+                logits_metadata=logits_metadata,
+            )
+
         if not used_tp_lm_head_all_to_all:
             logits = self._scatter_dp_attn_logits(
                 logits, local_hidden_states, logits_metadata
@@ -699,6 +750,16 @@ class LogitsProcessor(nn.Module):
         logits = self._copy_logits_to_buffer(
             logits, logits_metadata, use_buffer=use_logits_buffer
         )
+        if logits_metadata.forward_mode.is_target_verify():
+            from sglang.srt.speculative.spec_verify_debug import (
+                log_target_verify_lm_head,
+            )
+
+            log_target_verify_lm_head(
+                site="logits_post_buffer",
+                tensor=logits,
+                logits_metadata=logits_metadata,
+            )
 
         if self.final_logit_softcapping:
             if not (_is_npu or _is_cpu):
@@ -707,6 +768,17 @@ class LogitsProcessor(nn.Module):
                 logits = self.final_logit_softcapping * torch.tanh(
                     logits / self.final_logit_softcapping
                 )
+
+        if logits_metadata.forward_mode.is_target_verify():
+            from sglang.srt.speculative.spec_verify_debug import (
+                log_target_verify_lm_head,
+            )
+
+            log_target_verify_lm_head(
+                site="logits_final",
+                tensor=logits,
+                logits_metadata=logits_metadata,
+            )
 
         return logits
 

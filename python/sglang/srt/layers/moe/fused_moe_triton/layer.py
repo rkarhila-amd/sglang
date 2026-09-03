@@ -1534,6 +1534,16 @@ class FusedMoE(torch.nn.Module):
                 hidden_states_pre_quant=pre_quant_input
             )
 
+        if get_bool_env_var("SGLANG_FUSED_MOE_BISECT_DEBUG"):
+            from sglang.srt.debug.fused_moe_bisect_debug import log_fused_moe_bisect
+
+            log_fused_moe_bisect(
+                site="fused_dispatch_hidden",
+                layer_id=self.layer_id,
+                tensor=dispatch_output.hidden_states,
+                forward_batch=None,
+            )
+
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,
         )
@@ -1545,6 +1555,16 @@ class FusedMoE(torch.nn.Module):
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
             final_hidden_states = self.dispatcher.combine(combine_input=combine_input)
+
+            if get_bool_env_var("SGLANG_FUSED_MOE_BISECT_DEBUG"):
+                from sglang.srt.debug.fused_moe_bisect_debug import log_fused_moe_bisect
+
+                log_fused_moe_bisect(
+                    site="fused_combine_out",
+                    layer_id=self.layer_id,
+                    tensor=final_hidden_states,
+                    forward_batch=None,
+                )
 
             # TODO: should we add some conditions here?
             final_hidden_states = final_hidden_states[

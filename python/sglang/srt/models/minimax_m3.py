@@ -91,6 +91,7 @@ from sglang.srt.utils import (
     add_prefix,
     get_device_sm,
     is_cuda,
+    is_gfx95_supported,
     is_hip,
     is_npu,
     log_info_on_rank0,
@@ -304,13 +305,60 @@ class MiniMaxM3MLP(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
+        layer_id: Optional[int] = None,
     ):
+        from sglang.srt.debug.shared_experts_bisect_debug import (
+            log_shared_experts_bisect,
+        )
+
+        if layer_id is not None:
+            log_shared_experts_bisect(
+                site="shared_gate_up_in",
+                layer_id=layer_id,
+                tensor=x,
+                forward_batch=forward_batch,
+            )
+
         gate_up, _ = self.gate_up_proj(x)
+
+        if layer_id is not None:
+            log_shared_experts_bisect(
+                site="shared_gate_up_out",
+                layer_id=layer_id,
+                tensor=gate_up,
+                forward_batch=forward_batch,
+            )
+
         x = self.act_fn(gate_up)
+
+        if layer_id is not None:
+            log_shared_experts_bisect(
+                site="shared_swiglu_out",
+                layer_id=layer_id,
+                tensor=x,
+                forward_batch=forward_batch,
+            )
+
         x, _ = self.down_proj(
             x,
             skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
         )
+
+        if layer_id is not None:
+            from sglang.srt.debug.shared_experts_bisect_debug import (
+                maybe_dump_down_proj_weights,
+            )
+
+            maybe_dump_down_proj_weights(layer_id=layer_id, linear_module=self.down_proj)
+
+        if layer_id is not None:
+            log_shared_experts_bisect(
+                site="shared_down_out",
+                layer_id=layer_id,
+                tensor=x,
+                forward_batch=forward_batch,
+            )
+
         return x
 
 
@@ -395,6 +443,10 @@ class MiniMaxM3MoE(nn.Module):
         else:
             self.shared_experts = None
 
+        self._fused_shared_expert_base_id = (
+            config.num_local_experts if self.num_fused_shared_experts > 0 else None
+        )
+
         self.bf16_router_gemm = envs.SGLANG_OPT_USE_BF16_ROUTER_GEMM.get()
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -427,7 +479,10 @@ class MiniMaxM3MoE(nn.Module):
             return self.forward_deepep(hidden_states, forward_batch)
         else:
             return self.forward_normal(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
+                hidden_states,
+                should_allreduce_fusion,
+                use_reduce_scatter,
+                forward_batch=forward_batch,
             )
 
     def forward_normal(
@@ -435,7 +490,29 @@ class MiniMaxM3MoE(nn.Module):
         hidden_states: torch.Tensor,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
+        from sglang.srt.debug.shared_experts_bisect_debug import (
+            log_shared_experts_bisect,
+        )
+
+        if self.num_fused_shared_experts > 0:
+            from sglang.srt.debug.fused_moe_bisect_debug import log_fused_moe_bisect
+
+            log_fused_moe_bisect(
+                site="moe_in",
+                layer_id=self.layer_id,
+                tensor=hidden_states,
+                forward_batch=forward_batch,
+            )
+        else:
+            log_shared_experts_bisect(
+                site="moe_in",
+                layer_id=self.layer_id,
+                tensor=hidden_states,
+                forward_batch=forward_batch,
+            )
+
         if hidden_states.shape[0] > 0:
             if (
                 self.alt_stream is not None
@@ -444,13 +521,48 @@ class MiniMaxM3MoE(nn.Module):
             ):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
-                shared_output = self._forward_shared_experts(hidden_states)
+                shared_output = self._forward_shared_experts(
+                    hidden_states, forward_batch=forward_batch
+                )
+                log_shared_experts_bisect(
+                    site="moe_shared_out",
+                    layer_id=self.layer_id,
+                    tensor=shared_output,
+                    forward_batch=forward_batch,
+                )
                 with torch.cuda.stream(self.alt_stream):
-                    final_hidden_states = self._forward_router_experts(hidden_states)
+                    final_hidden_states = self._forward_router_experts(
+                    hidden_states, forward_batch=forward_batch
+                )
                 current_stream.wait_stream(self.alt_stream)
             else:
-                shared_output = self._forward_shared_experts(hidden_states)
-                final_hidden_states = self._forward_router_experts(hidden_states)
+                shared_output = self._forward_shared_experts(
+                    hidden_states, forward_batch=forward_batch
+                )
+                log_shared_experts_bisect(
+                    site="moe_shared_out",
+                    layer_id=self.layer_id,
+                    tensor=shared_output,
+                    forward_batch=forward_batch,
+                )
+                final_hidden_states = self._forward_router_experts(
+                    hidden_states, forward_batch=forward_batch
+                )
+            log_shared_experts_bisect(
+                site="moe_routed_out",
+                layer_id=self.layer_id,
+                tensor=final_hidden_states,
+                forward_batch=forward_batch,
+            )
+            if self.num_fused_shared_experts > 0:
+                from sglang.srt.debug.fused_moe_bisect_debug import log_fused_moe_bisect
+
+                log_fused_moe_bisect(
+                    site="fused_moe_out",
+                    layer_id=self.layer_id,
+                    tensor=final_hidden_states,
+                    forward_batch=forward_batch,
+                )
         else:
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -458,14 +570,34 @@ class MiniMaxM3MoE(nn.Module):
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
+            log_shared_experts_bisect(
+                site="moe_combined_out",
+                layer_id=self.layer_id,
+                tensor=final_hidden_states,
+                forward_batch=forward_batch,
+            )
         if self.tp_size > 1 and not should_allreduce_fusion and not use_reduce_scatter:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states
 
-    def _forward_router_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _forward_router_experts(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+    ) -> torch.Tensor:
         router_logits = self._compute_router_logits(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
+        if self.num_fused_shared_experts > 0 and self._fused_shared_expert_base_id is not None:
+            from sglang.srt.debug.fused_moe_bisect_debug import log_fused_moe_topk
+
+            log_fused_moe_topk(
+                layer_id=self.layer_id,
+                topk_output=topk_output,
+                fused_expert_base_id=self._fused_shared_expert_base_id,
+                num_fused_shared_experts=self.num_fused_shared_experts,
+                forward_batch=forward_batch,
+            )
         return self.experts(hidden_states, topk_output)
 
     def forward_deepep(
@@ -486,7 +618,9 @@ class MiniMaxM3MoE(nn.Module):
                     hidden_states, self._forward_shared_experts
                 )
             else:
-                shared_output = self._forward_shared_experts(hidden_states)
+                shared_output = self._forward_shared_experts(
+                    hidden_states, forward_batch=forward_batch
+                )
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -521,9 +655,17 @@ class MiniMaxM3MoE(nn.Module):
         router_logits, _ = self.gate(hidden_states.to(torch.float32))
         return router_logits
 
-    def _forward_shared_experts(self, hidden_states: torch.Tensor):
+    def _forward_shared_experts(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+    ):
         if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
-            return self.shared_experts(hidden_states)
+            return self.shared_experts(
+                hidden_states,
+                forward_batch=forward_batch,
+                layer_id=self.layer_id,
+            )
         else:
             return None
 
@@ -1376,9 +1518,35 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
+        if forward_batch.forward_mode.is_target_verify():
+            from sglang.srt.debug.shared_experts_bisect_debug import (
+                log_shared_experts_bisect,
+            )
+
+            log_shared_experts_bisect(
+                site="post_attn",
+                layer_id=self.layer_id,
+                tensor=hidden_states,
+                forward_batch=forward_batch,
+            )
+            log_shared_experts_bisect(
+                site="residual_pre_mlp",
+                layer_id=self.layer_id,
+                tensor=residual,
+                forward_batch=forward_batch,
+            )
+
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+
+        if forward_batch.forward_mode.is_target_verify():
+            log_shared_experts_bisect(
+                site="post_attn_norm_moe_in",
+                layer_id=self.layer_id,
+                tensor=hidden_states,
+                forward_batch=forward_batch,
+            )
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -1407,6 +1575,30 @@ class MiniMaxM3DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
+            )
+
+        if forward_batch.forward_mode.is_target_verify():
+            from sglang.srt.debug.shared_experts_bisect_debug import (
+                log_shared_experts_bisect,
+            )
+
+            log_shared_experts_bisect(
+                site="layer_out",
+                layer_id=self.layer_id,
+                tensor=hidden_states,
+                forward_batch=forward_batch,
+            )
+
+        if forward_batch.forward_mode.is_target_verify():
+            from sglang.srt.speculative.spec_verify_debug import (
+                log_target_verify_activation,
+            )
+
+            log_target_verify_activation(
+                site="layer_out",
+                layer_id=self.layer_id,
+                tensor=hidden_states,
+                forward_batch=forward_batch,
             )
 
         return hidden_states, residual
@@ -1534,6 +1726,18 @@ class MiniMaxM3Model(nn.Module):
             else:
                 hidden_states = self.norm(hidden_states)
 
+        if forward_batch.forward_mode.is_target_verify():
+            from sglang.srt.speculative.spec_verify_debug import (
+                log_target_verify_activation,
+            )
+
+            log_target_verify_activation(
+                site="final_norm",
+                layer_id=self.end_layer - 1,
+                tensor=hidden_states,
+                forward_batch=forward_batch,
+            )
+
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states
@@ -1597,10 +1801,19 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                 "Shared and routed experts may use different quantization formats "
                 "in ModelOpt mixed-precision checkpoints."
             )
-        if not _is_cuda:
-            return "Shared experts fusion currently requires CUDA devices."
-        if _is_cuda and (_device_sm is not None) and (_device_sm < 80):
-            return "Shared experts fusion requires SM80 or newer GPUs."
+        if (
+            (not _is_cuda or (_device_sm is not None and _device_sm < 80))
+            and (not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4))
+        ):
+            return (
+                "Shared experts fusion requires SM80+ (CUDA) or gfx942+ / MI30x (HIP) "
+                "GPU capability."
+            )
+        if _is_hip and not is_gfx95_supported():
+            return (
+                "MiniMax-M3 shared-expert fusion on HIP requires gfx950+ (MI35x); "
+                "gfx942 / MI30x is not validated yet."
+            )
         if get_parallel().moe_ep_size > 1:
             return "Shared experts fusion is not supported together with expert parallelism yet."
         if get_moe_a2a_backend().is_deepep():

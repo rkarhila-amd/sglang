@@ -30,6 +30,8 @@ from sglang.srt.utils import (
     is_xpu,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
+from sglang.srt.speculative.spec_token_resolve import UNFILLED_PREDICT_TOKEN
+from sglang.srt.speculative.spec_verify_debug import log_eagle_verify_sampling
 
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import GrammarMask
@@ -577,6 +579,17 @@ def eagle_prepare_for_verify(
     # `_forward_raw -> prepare_mlp_sync_batch` pads the batch. Initing
     # here would use pre-pad shapes and trip DSv4 indexer shape match.
 
+    from sglang.srt.debug.moe_path_debug import log_spec_path
+
+    _bs = len(batch.seq_lens) if not batch.forward_mode.is_idle() else 0
+    log_spec_path(
+        phase="target_verify_prepare",
+        forward_mode=str(batch.forward_mode),
+        bs=_bs,
+        num_tokens_per_req=verify_input.draft_token_num,
+        cuda_graph=can_run_cuda_graph,
+    )
+
     return verify_forward_batch, can_run_cuda_graph
 
 
@@ -719,7 +732,9 @@ def eagle_sample(
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     predict_shape = list(next_token_logits.shape)[:-1]
-    predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
+    predict = torch.full(
+        predict_shape, UNFILLED_PREDICT_TOKEN, dtype=torch.int32, device=device
+    ).flatten()
     accept_index = torch.full(
         (bs, verify_input.max_tree_depth), -1, dtype=torch.int32, device=device
     )
@@ -730,6 +745,15 @@ def eagle_sample(
     if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_hip or _is_xpu:
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
+        log_eagle_verify_sampling(
+            phase="pre_verify",
+            bs=bs,
+            draft_token_num=verify_input.draft_token_num,
+            next_token_logits=next_token_logits,
+            target_predict=target_predict,
+            candidates=candidates,
+            forward_mode=str(batch.forward_mode),
+        )
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
             predicts=predict,  # mutable
             accept_index=accept_index,  # mutable
@@ -756,6 +780,17 @@ def eagle_sample(
                 tp_group.broadcast(predict, src=0)
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_correct_drafts, src=0)
+        log_eagle_verify_sampling(
+            phase="post_verify",
+            bs=bs,
+            draft_token_num=verify_input.draft_token_num,
+            next_token_logits=next_token_logits,
+            target_predict=target_predict,
+            candidates=candidates,
+            predict=predict,
+            accept_lens=num_correct_drafts + 1,
+            forward_mode=str(batch.forward_mode),
+        )
     else:
         from sgl_kernel import (
             top_k_renorm_prob,

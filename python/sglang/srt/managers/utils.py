@@ -83,6 +83,9 @@ class GenerationBatchResult:
     # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None
 
+    # EAGLE verify: global node indices into the flat predict buffer.
+    accept_index: Optional[torch.Tensor] = None
+
     block_accept_lens: Optional[torch.Tensor] = None
 
     cap_lens: Optional[torch.Tensor] = None
@@ -155,6 +158,9 @@ class GenerationBatchResult:
 
         if self.accept_lens is not None:
             self.accept_lens = _async_d2h(self.accept_lens)
+
+        if self.accept_index is not None:
+            self.accept_index = _async_d2h(self.accept_index)
 
         if self.block_accept_lens is not None:
             self.block_accept_lens = _async_d2h(self.block_accept_lens)

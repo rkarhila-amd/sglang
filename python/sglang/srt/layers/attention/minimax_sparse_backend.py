@@ -1444,6 +1444,16 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         kv_cached_by_fusion = self._is_sparse_kv_cached_by_fusion(
             forward_batch, layer.layer_id
         )
+        if forward_batch.forward_mode.is_target_verify():
+            from sglang.srt.speculative.spec_verify_debug import (
+                log_minimax_target_verify_forward,
+            )
+
+            log_minimax_target_verify_forward(
+                layer_id=layer.layer_id,
+                forward_batch=forward_batch,
+                q=q,
+            )
         if not kv_cached_by_fusion:
             self.kv_pool.set_fused_kv_index_buffer(
                 layer,
@@ -1607,6 +1617,18 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_o = torch.cat(
                     [idx_o, idx_o.new_zeros(pad_len, *idx_o.shape[1:])], dim=0
                 )
+
+        if forward_batch.forward_mode.is_target_verify():
+            from sglang.srt.speculative.spec_verify_debug import (
+                log_target_verify_activation,
+            )
+
+            log_target_verify_activation(
+                site="sparse_attn_out",
+                layer_id=layer.layer_id,
+                tensor=o,
+                forward_batch=forward_batch,
+            )
 
         return (
             (

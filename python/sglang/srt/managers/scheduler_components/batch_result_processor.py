@@ -13,7 +13,10 @@ from typing import (
 
 import torch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.speculative.spec_token_resolve import (
+    log_spec_accept_resolve,
+    resolve_spec_accept_tokens_from_result,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import (
@@ -730,8 +733,31 @@ class SchedulerBatchResultProcessor:
         stride = result.speculative_num_draft_tokens
         assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
 
+        accept_index_rows = None
+        if result.accept_index is not None:
+            assert result.accept_index.is_cpu
+            accept_index_rows = result.accept_index.tolist()
+
         for i, req in enumerate(batch.reqs):
-            accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
+            accept_tokens = resolve_spec_accept_tokens_from_result(
+                result,
+                i,
+                accept_lens[i],
+                flat_predict=next_token_ids,
+                accept_index_rows=accept_index_rows,
+            )
+            log_spec_accept_resolve(
+                req_idx=i,
+                accept_len=accept_lens[i],
+                stride=stride,
+                tokens=accept_tokens,
+                accept_index_row=(
+                    accept_index_rows[i] if accept_index_rows is not None else None
+                ),
+                batch_size=len(batch.reqs),
+                cuda_graph=result.can_run_cuda_graph,
+                rid=req.rid,
+            )
 
             if req.is_retracted or req.finished():
                 # Nothing to settle: no worker pre-claims the bonus, so
@@ -840,11 +866,21 @@ class SchedulerBatchResultProcessor:
         accept_lens = result.accept_lens.tolist()
         stride = result.speculative_num_draft_tokens
         assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
+        accept_index_rows = None
+        if result.accept_index is not None:
+            assert result.accept_index.is_cpu
+            accept_index_rows = result.accept_index.tolist()
         retained = [None] * len(batch.reqs)
         for i, req in enumerate(batch.reqs):
             if req.grammar is None or req.is_retracted or req.finished():
                 continue
-            accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
+            accept_tokens = resolve_spec_accept_tokens_from_result(
+                result,
+                i,
+                accept_lens[i],
+                flat_predict=next_token_ids,
+                accept_index_rows=accept_index_rows,
+            )
             # Stop accepting once the grammar terminates so the over-drafted suffix
             # is never committed to KV nor emitted; this advances the FSM.
             retained[i] = self._accept_grammar_tokens(req, accept_tokens)

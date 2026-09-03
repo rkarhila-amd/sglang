@@ -45,7 +45,11 @@ if _is_hip:
         w_scales: torch.Tensor,
         y: torch.Tensor,
     ) -> None:
+        from sglang.srt.debug.mxfp4_gemm_debug import log_mxfp4_gemm_boundary
+
+        log_mxfp4_gemm_boundary("before", kernel="gemm_afp4wfp4", t=x)
         _gemm_afp4wfp4_orig(x, w, x_scales, w_scales, y.dtype, y)
+        log_mxfp4_gemm_boundary("after", kernel="gemm_afp4wfp4", t=y)
 
     def _aiter_gemm_afp4wfp4_fake(
         x: torch.Tensor,
@@ -72,7 +76,11 @@ if _is_hip:
         w_scales: torch.Tensor,
         y: torch.Tensor,
     ) -> None:
+        from sglang.srt.debug.mxfp4_gemm_debug import log_mxfp4_pre_quant_boundary
+
+        log_mxfp4_pre_quant_boundary("before", x=x, y=y)
         _gemm_afp4wfp4_pre_quant_orig(x, w, w_scales, y.dtype, y)
+        log_mxfp4_pre_quant_boundary("after", x=x, y=y)
 
     def _aiter_gemm_afp4wfp4_pre_quant_fake(
         x: torch.Tensor,
@@ -95,7 +103,12 @@ if _is_hip:
     def _aiter_dynamic_mxfp4_quant(
         x: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return _dynamic_mxfp4_quant_orig(x)
+        from sglang.srt.debug.mxfp4_gemm_debug import log_mxfp4_gemm_boundary
+
+        log_mxfp4_gemm_boundary("before", kernel="dynamic_mxfp4_quant", t=x)
+        x_q, x_s = _dynamic_mxfp4_quant_orig(x)
+        log_mxfp4_gemm_boundary("after", kernel="dynamic_mxfp4_quant", t=x_q)
+        return x_q, x_s
 
     def _aiter_dynamic_mxfp4_quant_fake(
         x: torch.Tensor,
@@ -210,6 +223,12 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         if not self.is_checkpoint_mxfp4_serialized:
             assert layer.weight.dtype == torch.uint8
             assert layer.weight_scale.dtype == torch.uint8
+
+        from sglang.srt.debug.shared_experts_bisect_debug import (
+            maybe_dump_down_proj_weights_at_load,
+        )
+
+        maybe_dump_down_proj_weights_at_load(linear_module=layer)
 
     def create_weights(
         self,
@@ -652,37 +671,89 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
             x = x.view(-1, x.shape[-1])
             output_shape = [*x.shape[:-1], layer.weight.shape[0]]
 
-        # use_fused_quant_gemm = true, x_q is a bf16/fp16 num
-        # x_s is not None = true, x_q is uint8 num
-        if use_fused_quant_gemm or x_s is not None:
-            x_q = x
-        else:
-            x_q, x_s = dynamic_mxfp4_quant(x)
+        layer_prefix = getattr(layer, "prefix", None)
+        from sglang.srt.debug.mxfp4_gemm_debug import (
+            log_mxfp4_per_layer_before_gemm,
+            log_mxfp4_gemm_boundary,
+            mxfp4_gemm_debug_context,
+        )
 
-        if y is None:
-            y = torch.empty(
-                x_q.shape[0],
-                layer.weight.shape[0],
-                device=x_q.device,
-                dtype=self.out_dtype,
-            )
+        with mxfp4_gemm_debug_context(layer_prefix=layer_prefix, path="apply_weights"):
+            # use_fused_quant_gemm = true, x_q is a bf16/fp16 num
+            # x_s is not None = true, x_q is uint8 num
+            if use_fused_quant_gemm or x_s is not None:
+                x_q = x
+            else:
+                log_mxfp4_per_layer_before_gemm(
+                    x,
+                    kernel="gemm_afp4wfp4",
+                    layer_prefix=layer_prefix,
+                    path="apply_weights_bf16_pre_gemm",
+                )
+                x_q, x_s = dynamic_mxfp4_quant(x)
+                log_mxfp4_gemm_boundary(
+                    "after",
+                    kernel="dynamic_mxfp4_quant",
+                    t=x_q,
+                    layer_prefix=layer_prefix,
+                    path="apply_weights_post_quant",
+                )
 
-        if use_fused_quant_gemm:
-            gemm_afp4wfp4_pre_quant(x_q, layer.weight, layer.weight_scale, y.dtype, y)
-            y = y.to(x.dtype)
-        elif fused_gemm_split_cat:
-            k, v = fused_gemm_afp4wfp4_split_cat(
-                x=x_q,
-                w=layer.weight,
-                y=y,
-                x_scale=x_s,
-                w_scale=layer.weight_scale,
-                S1=S1,
-                S2=S2,
-                dtype=out_dtype,
-            )
-        else:
-            gemm_afp4wfp4(x_q, layer.weight, x_s, layer.weight_scale, self.out_dtype, y)
+            if y is None:
+                y = torch.empty(
+                    x_q.shape[0],
+                    layer.weight.shape[0],
+                    device=x_q.device,
+                    dtype=self.out_dtype,
+                )
+
+            if use_fused_quant_gemm:
+                log_mxfp4_per_layer_before_gemm(
+                    x_q,
+                    kernel="gemm_afp4wfp4_pre_quant",
+                    layer_prefix=layer_prefix,
+                    path="apply_weights_bf16_pre_pre_quant",
+                )
+                gemm_afp4wfp4_pre_quant(
+                    x_q, layer.weight, layer.weight_scale, y.dtype, y
+                )
+                y = y.to(x.dtype)
+                log_mxfp4_gemm_boundary(
+                    "after",
+                    kernel="gemm_afp4wfp4_pre_quant",
+                    t=y,
+                    layer_prefix=layer_prefix,
+                    path="apply_weights_post_gemm",
+                )
+            elif fused_gemm_split_cat:
+                k, v = fused_gemm_afp4wfp4_split_cat(
+                    x=x_q,
+                    w=layer.weight,
+                    y=y,
+                    x_scale=x_s,
+                    w_scale=layer.weight_scale,
+                    S1=S1,
+                    S2=S2,
+                    dtype=out_dtype,
+                )
+            else:
+                if x_s is not None:
+                    log_mxfp4_per_layer_before_gemm(
+                        x_q,
+                        kernel="gemm_afp4wfp4",
+                        layer_prefix=layer_prefix,
+                        path="apply_weights_quant_pre_gemm",
+                    )
+                gemm_afp4wfp4(
+                    x_q, layer.weight, x_s, layer.weight_scale, self.out_dtype, y
+                )
+                log_mxfp4_gemm_boundary(
+                    "after",
+                    kernel="gemm_afp4wfp4",
+                    t=y,
+                    layer_prefix=layer_prefix,
+                    path="apply_weights_post_gemm",
+                )
 
         if bias is not None:
             y = y + bias
