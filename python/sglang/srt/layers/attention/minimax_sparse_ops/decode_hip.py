@@ -1,4 +1,8 @@
 # Copyright 2025 XunhaoLai. All rights reserved.
+"""ROCm MiniMax decode indexer.
+
+CUDA uses kernels.ops.attention.minimax_sparse.decode.flash_with_topk_idx.
+"""
 
 from typing import Optional
 
@@ -6,15 +10,16 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.minimax_sparse.common.utils import (
+    _bitonic_merge,
+    _sort_ids_ascending,
+    check_sparse_kv_fp8,
+    robust_allocator,
+    sparse_out_dtype,
+    unit_scale,
+)
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_xpu
-
-if torch.version.hip is not None:
-    raise RuntimeError(
-        "sglang.kernels.ops.attention.minimax_sparse.decode.flash_with_topk_idx "
-        "is CUDA-only. ROCm decode uses "
-        "sglang.srt.layers.attention.minimax_sparse_ops.decode_hip."
-    )
 
 # Fixed Triton launch configs for decode kernels. Autotune benchmarks multiple
 # configs on first launch and is incompatible with CUDA/HIP graph stream capture.
@@ -27,38 +32,24 @@ _TOPK_PARTIAL_BLOCK_K = 256
 _TOPK_PARTIAL_NUM_WARPS = 8
 _TOPK_PARTIAL_NUM_STAGES = 2
 
-from ..common.utils import (
-    _bitonic_merge,
-    _sort_ids_ascending,
-    check_sparse_kv_fp8,
-    robust_allocator,
-    sparse_out_dtype,
-    unit_scale,
-)
-
 # Must match _MAX_NUM_BLOCKS in ops/attention/minimax_decode_topk.py.
-# CUDA-only module. ROCm decode uses minimax_sparse_ops.decode_hip.
-_JIT_TOPK_MAX_NUM_BLOCKS = 4096
+_JIT_TOPK_MAX_NUM_BLOCKS = 16384
 
 
 def _prune_decode_configs(configs, named_args, **kwargs):
-    """Drop autotune configs whose token tile is smaller than a sparse block.
-
-    BLOCKS_PER_K_BLOCK = BLOCK_SIZE_N // block_size is 0 for those, so they
-    cannot compile. Keep the full list if nothing survives (block_size larger
-    than every tile) and let triton report the real failure.
-    """
+    """Drop autotune configs whose token tile is smaller than a sparse block."""
     block_size = named_args["block_size"]
     kept = [c for c in configs if c.kwargs["BLOCK_SIZE_N"] >= block_size]
     return kept or list(configs)
 
 
-_DECODE_SCORE_CONFIGS = [
-    triton.Config({"BLOCK_SIZE_N": BN}, num_warps=nw, num_stages=ns)
-    for BN in [64, 128, 256, 512]
-    for nw in [4, 8, 16]
-    for ns in [1, 2, 3]
-]
+def _decode_score_block_n(args):
+    # gfx950 pick: 512 for tiny batches (few CTAs), else 128.
+    # Fixed tile: a multi-config autotune sweep is incompatible with HIP graph capture.
+    return max(512 if args["batch_size"] <= 4 else 128, args["block_size"])
+
+
+_DECODE_SCORE_CONFIGS = [triton.Config({}, num_warps=4, num_stages=1)]
 
 _DECODE_SCORE_HEURISTICS = {
     "BLOCK_SIZE_H": lambda args: max(
@@ -66,6 +57,7 @@ _DECODE_SCORE_HEURISTICS = {
     ),
     "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
     "BATCH_SIZE_BUCKET": lambda args: triton.next_power_of_2(args["batch_size"]),
+    "BLOCK_SIZE_N": _decode_score_block_n,
 }
 
 
@@ -79,7 +71,7 @@ _DECODE_SCORE_HEURISTICS = {
         "block_size",
         "SCORE_TYPE",
     ],
-    prune_configs_by={"early_config_prune": _prune_decode_configs},
+    prune_configs_by=None,
 )
 @triton.jit
 def _decode_score_kernel(

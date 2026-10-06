@@ -7,9 +7,6 @@ import torch
 
 from sglang.kernels.ops.attention.minimax_sparse.common.index import topk_index_reduce
 from sglang.kernels.ops.attention.minimax_sparse.common.utils import get_cu_seqblocks
-from sglang.kernels.ops.attention.minimax_sparse.decode.flash_with_topk_idx import (
-    flash_decode_with_topk_idx,
-)
 from sglang.kernels.ops.attention.minimax_sparse.decode.topk_sparse import (
     flash_decode_with_gqa_share_sparse,
 )
@@ -21,6 +18,20 @@ from sglang.kernels.ops.attention.minimax_sparse.prefill.topk_sparse import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_gfx95_supported, is_hip
+
+
+def _flash_decode_with_topk_idx(*args, **kwargs):
+    # ROCm must not import the CUDA indexer module.
+    if is_hip():
+        from sglang.srt.layers.attention.minimax_sparse_ops.decode_hip import (
+            flash_decode_with_topk_idx,
+        )
+    else:
+        from sglang.kernels.ops.attention.minimax_sparse.decode.flash_with_topk_idx import (
+            flash_decode_with_topk_idx,
+        )
+    return flash_decode_with_topk_idx(*args, **kwargs)
+
 
 _use_aiter_gfx95 = envs.SGLANG_USE_AITER.get() and is_hip() and is_gfx95_supported()
 
@@ -369,7 +380,7 @@ def minimax_sparse_decode(
         # Step 1: Flash decode with topk index (using index head). When the dense main
         # attention is used, the indexer emits the page table directly (fused
         # transform) instead of block ids, plus the per-query effective KV length.
-        idx_o, topk_idx, real_seq_lens = flash_decode_with_topk_idx(
+        idx_o, topk_idx, real_seq_lens = _flash_decode_with_topk_idx(
             q=idx_q,
             sink=idx_sink,
             k_cache=idx_k_cache,

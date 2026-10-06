@@ -3,11 +3,17 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.minimax_sparse.decode.flash_with_topk_idx import (
-    flash_decode_with_topk_idx,
-)
 from sglang.srt.environ import envs
-from sglang.srt.utils import get_device, is_xpu
+from sglang.srt.utils import get_device, is_hip, is_xpu
+
+if is_hip():
+    from sglang.srt.layers.attention.minimax_sparse_ops.decode_hip import (
+        flash_decode_with_topk_idx,
+    )
+else:
+    from sglang.kernels.ops.attention.minimax_sparse.decode.flash_with_topk_idx import (
+        flash_decode_with_topk_idx,
+    )
 
 DEVICE = get_device()
 RTOL_VS_REF = 5e-3
