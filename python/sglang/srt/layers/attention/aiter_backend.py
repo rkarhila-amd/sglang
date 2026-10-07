@@ -31,6 +31,7 @@ from sglang.srt.layers.dcp import update_local_kv_lens_for_dcp
 from sglang.srt.layers.dcp.planner import plan_dcp_decode_metadata
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
@@ -57,6 +58,9 @@ try:
         paged_attention_ragged,
     )
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
+    from aiter.ops.triton.attention.mla import (
+        mla_prefill_fwd as triton_mla_prefill_fwd,
+    )
     from aiter.ops.triton.attention.unified_attention import unified_attention
 
     from sglang.kernels.ops.attention.unified_attention_3d_mtp import (
@@ -311,6 +315,13 @@ class AiterAttnBackend(AttentionBackend):
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
     extend_dummy_seqs_capped_by_req_pool: bool = True
+
+    @property
+    def supports_ragged_verify_graph(self) -> bool:
+        # Page-size-1 MLA decode/verify goes through Triton mla_prefill_fwd,
+        # which reads a real per-request query indptr. DCP and paged KV stay
+        # on the uniform decode kernels.
+        return self.use_mla and self.page_size == 1 and self.dcp_world_size <= 1
 
     def __init__(
         self,
@@ -1365,6 +1376,81 @@ class AiterAttnBackend(AttentionBackend):
             return 1
         return int(seq_lens.max().item())
 
+    def _mla_triton_prefill_decode(
+        self,
+        q: torch.Tensor,
+        k_buffer: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        k_descale,
+    ) -> torch.Tensor:
+        """MLA decode / target-verify via Triton ``mla_prefill_fwd``.
+
+        That kernel takes ``cu_seqlens_q``, so a compact verify batch can mix
+        query lengths. fp8 query + fp8 KV (A8W8) is used whenever the cache is
+        fp8; the absorbed query is quantized per tensor and both descales are
+        passed through. bf16 KV keeps the query in bf16.
+        """
+        q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        layout = resolve_ragged_verify_layout(forward_batch)
+        use_layout = (
+            layout is not None and q.shape[0] == layout.graph_num_tokens
+        )
+        if use_layout:
+            num_seqs = layout.bs
+            cu_seqlens_q = layout.qo_indptr_device
+            seqused_k = (
+                forward_batch.seq_lens[:num_seqs] + layout.verify_lens
+            ).to(torch.int32)
+        else:
+            cu_seqlens_q = self.forward_metadata.qo_indptr
+            num_seqs = cu_seqlens_q.shape[0] - 1
+            kv_indptr = self.forward_metadata.kv_indptr
+            seqused_k = (
+                kv_indptr[1 : num_seqs + 1] - kv_indptr[:num_seqs]
+            ).to(torch.int32)
+
+        # page_size 1: one KV block per token, and the block id is the slot.
+        block_tables = self.req_to_token.index_select(
+            0, forward_batch.req_pool_indices[:num_seqs].to(torch.int64)
+        )
+        if block_tables.dtype != torch.int32:
+            block_tables = block_tables.to(torch.int32)
+
+        kv_buffer = k_buffer.view(-1, 1, 1, layer.qk_head_dim)
+        q_descale = None
+        kv_descale = None
+        if kv_buffer.dtype == fp8_dtype:
+            if q.dtype != fp8_dtype:
+                q_fp8, q_descale = scaled_fp8_quant(q.reshape(q.shape[0], -1))
+                q = q_fp8.view(q.shape)
+            if isinstance(k_descale, torch.Tensor):
+                kv_descale = k_descale
+            elif isinstance(getattr(layer, "k_scale", None), torch.Tensor):
+                kv_descale = layer.k_scale
+
+        out = torch.empty(
+            (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
+            dtype=self.input_dtype,
+            device=q.device,
+        )
+        triton_mla_prefill_fwd(
+            q,
+            kv_buffer,
+            out,
+            cu_seqlens_q,
+            seqused_k,
+            self.max_context_len,
+            block_tables,
+            layer.scaling,
+            layer.v_head_dim,
+            layer.qk_head_dim - layer.v_head_dim,
+            True,
+            q_descale,
+            kv_descale,
+        )
+        return out
+
     def _forward_mla_decode(
         self,
         q: torch.Tensor,
@@ -1375,6 +1461,11 @@ class AiterAttnBackend(AttentionBackend):
         k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         max_q_len = self.forward_metadata.max_q_len or 1
+
+        if self.page_size == 1:
+            return self._mla_triton_prefill_decode(
+                q, k_buffer, layer, forward_batch, k_descale
+            )
 
         if prefer_mla_gluon_decode(
             head_pad_mode=getattr(self, "head_pad_mode", "none"),
@@ -3518,6 +3609,11 @@ class AiterAttnBackend(AttentionBackend):
                         )
                     return o
             elif forward_batch.forward_mode.is_target_verify():
+                if self.page_size == 1:
+                    return self._mla_triton_prefill_decode(
+                        q, K_Buffer, layer, forward_batch, k_descale
+                    )
+
                 if prefer_mla_gluon_decode(
                     head_pad_mode=getattr(self, "head_pad_mode", "none"),
                     num_head=getattr(self, "num_head", layer.tp_q_head_num),
