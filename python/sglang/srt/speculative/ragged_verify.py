@@ -253,6 +253,34 @@ def build_ragged_target_verify_geometry(
     )
 
 
+def copy_extend_graph_qo_indptr(
+    dest: torch.Tensor,
+    layout: RaggedVerifyLayout,
+    bs: int,
+) -> RaggedVerifyLayout:
+    """Copy a ragged verify ``qo_indptr`` into the preallocated graph buffer.
+
+    ``dest`` is the attention backend's ``qo_indptr`` storage. The decode
+    graph captured that pointer, so replay must fill it in place. Pads to
+    ``bs`` when the live layout has fewer rows. Does not read lengths on
+    the host.
+    """
+    if layout.bs != bs:
+        layout = layout.padded_to_bucket(padded_bs=bs)
+    src = layout.qo_indptr_device
+    n = bs + 1
+    if src.shape[0] < n:
+        raise ValueError(
+            f"ragged qo_indptr length {src.shape[0]} is shorter than bs+1 ({n})"
+        )
+    if src.dtype != dest.dtype:
+        raise ValueError(
+            f"ragged qo_indptr dtype {src.dtype} != graph buffer {dest.dtype}"
+        )
+    dest[:n].copy_(src[:n])
+    return layout
+
+
 def compute_target_verify_graph_key(
     *,
     bs: int,
