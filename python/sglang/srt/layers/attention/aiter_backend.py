@@ -3794,6 +3794,10 @@ class AiterAttnBackend(AttentionBackend):
                     else seq_lens + self.num_draft_tokens
                 )
             else:
+                # Prefix length only. extend_attention_fwd addresses the new
+                # tokens through qo_indptr. seq_lens + verify_lens is the
+                # flashinfer/unified geometry and would count those tokens
+                # twice on this kernel.
                 kv_lens = seq_lens
             if self.use_muse_attention_paths and self._use_unified_verify:
                 # Unified verify reads the block page table only; the token-level
@@ -3982,10 +3986,33 @@ class AiterAttnBackend(AttentionBackend):
                         verify_seqlen_k=verify_seqlen_k,
                     )
                 else:
-                    # DFLASH/DSPARK verify replay always passes custom_mask=None
-                    # (see resolve_dflash_verify_mask_policy). Mirror Triton:
-                    # copy only when a mask is provided; otherwise leave None so
-                    # the kernel uses its built-in causal path.
+                    # Uniform arange above is the static capture. Compact
+                    # replay carries a ragged layout; overwrite the same
+                    # buffer so the captured kernel sees per-request widths.
+                    # max_extend_len stays verify_tokens_per_req, the captured
+                    # window, so this path does not sync on max(verify_lens).
+                    layout = (
+                        getattr(spec_info, "ragged_verify_layout", None)
+                        if spec_info is not None
+                        else None
+                    )
+                    if layout is not None:
+                        from sglang.srt.speculative.ragged_verify import (
+                            copy_extend_graph_qo_indptr,
+                        )
+
+                        layout = copy_extend_graph_qo_indptr(
+                            self.qo_indptr, layout, bs
+                        )
+                        qo_indptr = self.qo_indptr[: bs + 1]
+                        verify_lens = layout.verify_lens[:bs]
+                        seq_mask_len = verify_lens * (seq_lens[:bs] + verify_lens)
+                    else:
+                        seq_mask_len = max_q_len * (seq_lens + max_q_len)
+                    # DFLASH/DSPARK verify replay passes custom_mask=None
+                    # (see resolve_dflash_verify_mask_policy). Copy only when
+                    # a mask is provided; otherwise leave None so the kernel
+                    # uses its built-in causal path.
                     custom_mask = self.cuda_graph_custom_mask
                     if (
                         spec_info is not None
@@ -3996,7 +4023,6 @@ class AiterAttnBackend(AttentionBackend):
                         )
                     else:
                         custom_mask = None
-                    seq_mask_len = max_q_len * (seq_lens + max_q_len)
                     mask_indptr = self.mask_indptr[: bs + 1]
                     mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
 
