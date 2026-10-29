@@ -169,6 +169,40 @@ class TestComputeVerifyTokenBudget(CustomTestCase):
         ).budget
         self.assertLessEqual(budget, 1)
 
+    def test_full_window_table_keeps_budget_across_batch_cliff(self):
+        # Probes are batch_size * 8, the 1D profiler's full-window axis.
+        # SPS falls once the batch crosses a wave, the same shape as the
+        # MI308X table. A short window must not inherit a smaller batch's rate.
+        table = SpsCostTable(
+            sample_batch_tokens=[8, 16, 64, 96, 128, 512],
+            sample_steps_per_sec=[4.5, 4.5, 4.2, 2.2, 2.2, 1.0],
+            max_batch_tokens=512,
+        )
+        cfg = DSparkScheduleConfig(gamma=7)
+        confidence = torch.full((64, 7), 0.5, dtype=torch.float32)
+        survival = _survival_from_confidence(confidence)
+        decision = compute_verify_token_budget(
+            history_survival_probs=survival, sps_table=table, cfg=cfg
+        )
+        n_pos = int((survival >= cfg.survival_eps).sum().item())
+        self.assertEqual(n_pos, 64 * 7)
+        self.assertEqual(decision.budget, n_pos)
+        self.assertAlmostEqual(decision.predicted_step_seconds, 1.0, places=5)
+
+    def test_token_axis_table_still_stops_at_sps_cliff(self):
+        # A probe that is not a multiple of max_verify_len keeps N+budget.
+        table = SpsCostTable(
+            sample_batch_tokens=[1, 2, 3, 4, 5, 6, 7, 8],
+            sample_steps_per_sec=[1.0, 1.0, 1.0, 0.01, 0.01, 0.01, 0.01, 0.01],
+            max_batch_tokens=64,
+        )
+        cfg = DSparkScheduleConfig(gamma=7)
+        survival = _survival_from_confidence(torch.full((1, 7), 0.99))
+        budget = compute_verify_token_budget(
+            history_survival_probs=survival, sps_table=table, cfg=cfg
+        ).budget
+        self.assertEqual(budget, 2)
+
     def test_decision_predicted_step_matches_additive_table_at_budget(self):
         survival = torch.tensor([[0.9, 0.8, 0.7, 0.6]], dtype=torch.float32)
         cfg = DSparkScheduleConfig(gamma=4)
