@@ -2471,10 +2471,17 @@ class AiterAttnBackend(AttentionBackend):
                     cprr_empty_rows=cprr_empty_rows,
                 )
             else:
-                draft_num = forward_batch.input_ids.shape[0] // bs
+                # Divide by the batch size captured above, then rebind bs to
+                # the live rows. Uniform verify depends on that order.
+                packed_tokens = forward_batch.input_ids.shape[0]
+                draft_num = packed_tokens // bs
                 bs = len(forward_batch.req_pool_indices)
+                layout = getattr(spec_info, "ragged_verify_layout", None)
+                if layout is not None and layout.bs != bs:
+                    layout = layout.padded_to_bucket(padded_bs=bs)
 
                 if self._use_unified_verify:
+                    # Page-table verify still assumes one width per request.
                     page_table, qo_indptr, max_q_len, swa_page_table = (
                         self._build_verify_unified_metadata(
                             bs,
@@ -2496,13 +2503,41 @@ class AiterAttnBackend(AttentionBackend):
                         swa_out_cache_loc=swa_out_cache_loc,
                     )
                 else:
-                    qo_indptr = torch.arange(
-                        0,
-                        (1 + bs) * draft_num,
-                        step=draft_num,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
+                    if layout is None:
+                        qo_indptr = torch.arange(
+                            0,
+                            (1 + bs) * draft_num,
+                            step=draft_num,
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                        max_extend_len = draft_num
+                        seq_mask_len = draft_num * (
+                            forward_batch.seq_lens + draft_num
+                        )
+                    else:
+                        # extend_attention_fwd addresses new tokens with
+                        # qo_indptr and the cached prefix with kv_indptr.
+                        # generate_attn_arg_prefill adds verify_lens onto the
+                        # paged KV for flashinfer-style kernels; using it here
+                        # would count the extend tokens twice. Take only the
+                        # layout indptr that helper returns.
+                        qo_indptr = layout.qo_indptr_device
+                        if (
+                            qo_indptr.dtype != torch.int32
+                            or qo_indptr.device != self.device
+                        ):
+                            qo_indptr = qo_indptr.to(
+                                device=self.device, dtype=torch.int32
+                            )
+                        verify_lens = layout.verify_lens
+                        if layout.verify_lens_cpu:
+                            max_extend_len = max(layout.verify_lens_cpu)
+                        else:
+                            max_extend_len = int(verify_lens.max().item())
+                        lens = verify_lens[:bs]
+                        seq_lens_bs = forward_batch.seq_lens[:bs]
+                        seq_mask_len = lens * (seq_lens_bs + lens)
 
                     kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
                     kv_indptr = kv_indptr[: bs + 1]
@@ -2523,7 +2558,6 @@ class AiterAttnBackend(AttentionBackend):
                     )
 
                     custom_mask = spec_info.custom_mask
-                    seq_mask_len = draft_num * (forward_batch.seq_lens + draft_num)
                     mask_indptr = self.mask_indptr
                     mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
                     mask_indptr = mask_indptr[: bs + 1]
@@ -2533,11 +2567,11 @@ class AiterAttnBackend(AttentionBackend):
                         kv_indices,
                         qo_indptr,
                         None,
-                        draft_num,
+                        max_extend_len,
                         None,
                         custom_mask=custom_mask,
                         mask_indptr=mask_indptr,
-                        max_extend_len=draft_num,
+                        max_extend_len=max_extend_len,
                     )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
