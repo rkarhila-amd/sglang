@@ -3342,10 +3342,20 @@ class AiterAttnBackend(AttentionBackend):
                         swa_page_table=_swa_page_table,
                     )
                 else:
+                    # DFLASH/DSPARK verify replay always passes custom_mask=None
+                    # (see resolve_dflash_verify_mask_policy). Mirror Triton:
+                    # copy only when a mask is provided; otherwise leave None so
+                    # the kernel uses its built-in causal path.
                     custom_mask = self.cuda_graph_custom_mask
-                    custom_mask[: spec_info.custom_mask.shape[0]] = (
-                        spec_info.custom_mask
-                    )
+                    if (
+                        spec_info is not None
+                        and getattr(spec_info, "custom_mask", None) is not None
+                    ):
+                        custom_mask[: spec_info.custom_mask.shape[0]] = (
+                            spec_info.custom_mask
+                        )
+                    else:
+                        custom_mask = None
                     seq_mask_len = max_q_len * (seq_lens + max_q_len)
                     mask_indptr = self.mask_indptr[: bs + 1]
                     mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)

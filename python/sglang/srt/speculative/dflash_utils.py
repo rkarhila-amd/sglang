@@ -39,6 +39,10 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
         "TRTLLMHAAttnBackend",
         "TRTLLMMLABackend",
         "XPUAttentionBackend",
+        # ROCm aiter: DFLASH/DSPARK replay passes custom_mask=None; capturing
+        # with a mask buffer leaves a stale-buffer graph (same class as
+        # sgl-project/sglang#43054). Skip so capture+replay both use causal.
+        "AiterAttnBackend",
     }
 )
 
