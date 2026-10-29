@@ -381,6 +381,10 @@ class AiterAttnBackend(AttentionBackend):
     # can never carry more seqs than the pool.
     extend_dummy_seqs_capped_by_req_pool: bool = True
 
+    # The decode runner will not replay a compact verify graph unless the
+    # backend opts in. The replay path fills qo_indptr from the ragged layout.
+    supports_ragged_verify_graph: bool = True
+
     # declare here to avoid CI failure in test_aiter_fp8_q_unified_attention.py
     use_mla_auto_kv_splits: bool = False
 
