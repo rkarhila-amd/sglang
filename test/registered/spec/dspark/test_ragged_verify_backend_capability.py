@@ -22,6 +22,7 @@ class TestRaggedVerifyGraphCapability(CustomTestCase):
         """Every backend with a ragged-verify metadata path must opt in; a
         dropped flag silently disables ragged graphs for that backend (the
         runner falls back to eager with no other test going red)."""
+        from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             DeepseekV4AttnBackend,
         )
@@ -34,6 +35,7 @@ class TestRaggedVerifyGraphCapability(CustomTestCase):
             TRTLLMHAAttnBackend,
             DeepseekV4AttnBackend,
             FlashAttentionBackend,
+            AiterAttnBackend,
         ):
             with self.subTest(backend=backend.__name__):
                 self.assertTrue(backend.supports_ragged_verify_graph)
