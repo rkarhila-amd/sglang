@@ -66,9 +66,11 @@ def _backend(**overrides):
 class TestAiterVerifyFlydslGate(CustomTestCase):
     def test_env_default_off(self):
         os.environ.pop("SGLANG_AITER_VERIFY_FLYDSL", None)
+        os.environ.pop("SGLANG_AITER_VERIFY_FLYDSL_EXTEND", None)
         from sglang.srt.environ import envs
 
         self.assertFalse(envs.SGLANG_AITER_VERIFY_FLYDSL.get())
+        self.assertFalse(envs.SGLANG_AITER_VERIFY_FLYDSL_EXTEND.get())
 
     def test_ready_layer_passes(self):
         _backend()._flydsl_require_layer(_layer(), None)
@@ -116,6 +118,27 @@ class TestFlydslVerifyLiveBatch(CustomTestCase):
     def test_live_wider_than_pool_raises(self):
         with self.assertRaises(ValueError):
             flydsl_verify_live_batch(32, 8, 3)
+
+
+class TestFlydslExtendPlan(CustomTestCase):
+    def test_ragged_103_rows_plan_from_qo_indptr(self):
+        # Conc16 crashed in pa_decode: 103 query rows, pool 13, qlen 8.
+        # Extend does not need one width. Twelve 8s plus a 7 is 103.
+        widths = [8] * 12 + [7]
+        qo = [0]
+        for width in widths:
+            qo.append(qo[-1] + width)
+        backend = _backend()
+        backend.forward_metadata = SimpleNamespace(
+            qo_indptr=torch.tensor(qo, dtype=torch.int32)
+        )
+        self.assertEqual(backend._flydsl_extend_plan(103, 13), (13, 8))
+
+    def test_missing_qo_indptr_raises(self):
+        backend = _backend()
+        backend.forward_metadata = SimpleNamespace(qo_indptr=None)
+        with self.assertRaises(RuntimeError):
+            backend._flydsl_extend_plan(8, 1)
 
 
 class TestFlydslBlockTable(CustomTestCase):
