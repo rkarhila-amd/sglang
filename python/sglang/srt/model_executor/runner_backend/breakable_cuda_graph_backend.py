@@ -49,6 +49,105 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
+
+def _is_logits_processor_output(output: Any) -> bool:
+    return type(output).__name__ == "LogitsProcessorOutput"
+
+
+def logits_processor_output_rows(output: Any) -> Optional[int]:
+    """Leading rows of a logits output, or None when ``output`` is another type.
+
+    Verify capture returns one row per token, which can exceed the graph key
+    when that key is a request count. The shared buffer has to fit those rows.
+    """
+    if not _is_logits_processor_output(output):
+        return None
+    import dataclasses
+
+    rows: list[int] = []
+    for field in dataclasses.fields(output):
+        value = getattr(output, field.name)
+        if torch.is_tensor(value) and value.ndim >= 1:
+            rows.append(int(value.shape[0]))
+    return max(rows) if rows else 0
+
+
+def alloc_logits_processor_output(output: Any, size: int) -> Any:
+    """A same-structure logits output whose tensor fields hold ``size`` rows.
+
+    Non-tensor fields stay None. Capture does not replay host lists, and
+    aliasing them into the shared buffer would let later shapes overwrite
+    each other. A tensor longer than ``size`` keeps its own row count so the
+    first (largest) capture still fits token rows above the graph key.
+    """
+    import dataclasses
+
+    kwargs = {}
+    for field in dataclasses.fields(output):
+        value = getattr(output, field.name)
+        if torch.is_tensor(value):
+            if value.ndim == 0:
+                kwargs[field.name] = value.new_empty(())
+            else:
+                rows = max(int(size), int(value.shape[0]))
+                kwargs[field.name] = value.new_empty((rows, *value.shape[1:]))
+        else:
+            kwargs[field.name] = None
+    return type(output)(**kwargs)
+
+
+def slice_logits_processor_output(output: Any, num_tokens: int) -> Any:
+    import dataclasses
+
+    changes = {}
+    for field in dataclasses.fields(output):
+        value = getattr(output, field.name)
+        if torch.is_tensor(value) and value.ndim >= 1:
+            changes[field.name] = value[:num_tokens]
+    return dataclasses.replace(output, **changes)
+
+
+def copy_logits_processor_output(
+    output: Any, output_buffer: Any, num_tokens: int
+) -> None:
+    import dataclasses
+
+    if not _is_logits_processor_output(output_buffer):
+        raise ValueError(
+            f"BCG logits output buffer has the wrong type: {type(output_buffer)}"
+        )
+    src_fields = {
+        field.name: getattr(output, field.name) for field in dataclasses.fields(output)
+    }
+    dst_fields = {
+        field.name: getattr(output_buffer, field.name)
+        for field in dataclasses.fields(output_buffer)
+    }
+    if src_fields.keys() != dst_fields.keys():
+        raise ValueError(
+            "BCG logits output structure changed between capture sizes: "
+            f"{src_fields.keys()} != {dst_fields.keys()}"
+        )
+    for name, value in src_fields.items():
+        dest = dst_fields[name]
+        if value is None and dest is None:
+            continue
+        if not (torch.is_tensor(value) and torch.is_tensor(dest)):
+            raise ValueError(
+                f"BCG logits field {name} is not a tensor pair: "
+                f"{type(value)} vs {type(dest)}"
+            )
+        if value.ndim == 0:
+            dest.copy_(value)
+            continue
+        if value.shape[0] < num_tokens or dest.shape[0] < num_tokens:
+            raise ValueError(
+                f"BCG logits field {name} has {value.shape[0]} source rows and "
+                f"{dest.shape[0]} buffer rows, need {num_tokens}"
+            )
+        dest[:num_tokens].copy_(value[:num_tokens])
+
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
@@ -179,6 +278,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         runner_rows = self._cuda_graph_runner.cuda_graph_output_rows(output)
         if runner_rows is not None:
             return runner_rows
+        logits_rows = logits_processor_output_rows(output)
+        if logits_rows is not None:
+            return logits_rows
         if torch.is_tensor(output):
             return min(cap, output.shape[0])
         if isinstance(output, PPProxyTensors):
@@ -205,6 +307,8 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return tuple(self._alloc_full_buffer(o, size) for o in output)
         if isinstance(output, list):
             return [self._alloc_full_buffer(o, size) for o in output]
+        if _is_logits_processor_output(output):
+            return alloc_logits_processor_output(output, size)
         raise TypeError(f"Unsupported BCG output type: {type(output)}")
 
     def _slice_output(self, output: Any, num_tokens: int) -> Any:
@@ -218,6 +322,8 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return tuple(self._slice_output(item, num_tokens) for item in output)
         if isinstance(output, list):
             return [self._slice_output(item, num_tokens) for item in output]
+        if _is_logits_processor_output(output):
+            return slice_logits_processor_output(output, num_tokens)
         raise TypeError(f"Unsupported BCG output type: {type(output)}")
 
     def _copy_output_to_buffer(
@@ -256,6 +362,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 )
             for item, buffer in zip(output, output_buffer):
                 self._copy_output_to_buffer(item, buffer, num_tokens)
+            return
+        if _is_logits_processor_output(output):
+            copy_logits_processor_output(output, output_buffer, num_tokens)
             return
         raise TypeError(
             "Unsupported BCG output buffer pair: "
