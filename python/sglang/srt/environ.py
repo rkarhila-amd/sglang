@@ -1033,6 +1033,13 @@ class Envs:
     # the SHUFFLE KV layout that enables pa_decode_gluon for full-attn
     # decode without runtime permutes.
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
+    # Target verify and decode on FlyDSL pa_decode (gfx942, page 16, bf16 KV).
+    # Off by default: the NHD split-KV path stays the server. When set, the
+    # target full-attention pool is SHUFFLE 5D and the default page size is
+    # 16. The draft pool stays NHD at that page size. Do not also set
+    # SGLANG_AITER_KV_CACHE_LAYOUT=vectorized_5d; that env rewrites every
+    # MHA pool, including the draft. Eager only; CUDA-graph capture raises.
+    SGLANG_AITER_VERIFY_FLYDSL = EnvBool(False)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     # Set this to 1 to stop sglang from clearing an inherited
     # ROCPROFILER_REGISTER_LIBRARY.

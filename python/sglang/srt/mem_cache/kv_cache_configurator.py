@@ -2483,6 +2483,7 @@ class KVCacheConfigurator:
             resolve_qsa_indexer_dtype,
         )
 
+        kv_cache_layout = self._flydsl_target_kv_layout(full_pool_class)
         qsa_profile = parse_qsa_profile(self.model_config.hf_config)
         qsa_indexer_dtype = get_model().qsa_indexer_dtype
         if qsa_indexer_dtype != "auto" and qsa_profile is None:
@@ -2493,7 +2494,13 @@ class KVCacheConfigurator:
         if qsa_profile is None:
             pool_class = HybridLinearKVPool
             extra_args["use_mla"] = self.use_mla_backend
+            if kv_cache_layout is not None:
+                extra_args["kv_cache_layout"] = kv_cache_layout
         else:
+            if kv_cache_layout is not None:
+                raise RuntimeError(
+                    "SGLANG_AITER_VERIFY_FLYDSL does not support a QSA KV pool."
+                )
             pool_class = QSATokenToKVPool
             extra_args.update(
                 qsa_index_kv_heads=qsa_profile.kv_heads,
@@ -2524,6 +2531,29 @@ class KVCacheConfigurator:
             **extra_args,
         )
         return token_to_kv_pool
+
+    def _flydsl_target_kv_layout(self, pool_class: type) -> Optional[str]:
+        """SHUFFLE 5D on the target full-attention pool only.
+
+        The draft worker stays NHD. Triton ``extend_attention_fwd`` reads a
+        3D token-major buffer, and a global ``SGLANG_AITER_KV_CACHE_LAYOUT``
+        would rewrite that pool too. Page size is still the server page size.
+        """
+        if self.is_draft_worker or self.use_mla_backend:
+            return None
+        if not envs.SGLANG_AITER_VERIFY_FLYDSL.get():
+            return None
+        if pool_class is not MHATokenToKVPool:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL needs the plain MHA KV pool for "
+                f"full attention, got {pool_class.__name__}."
+            )
+        logger.info(
+            "SGLANG_AITER_VERIFY_FLYDSL: target full-attention KV is "
+            "vectorized_5d at page_size=%s. Draft KV stays NHD.",
+            self.pool_page_size,
+        )
+        return "vectorized_5d"
 
     def _hybrid_full_attention_pool_class(
         self, *, mha_pool_class: type, mla_pool_class: type, dsa_pool_class: type

@@ -92,6 +92,8 @@ from sglang.srt.layers.attention.aiter_mla_gluon import (
     prefer_mla_gluon_decode,
 )
 from sglang.srt.layers.attention.aiter_utils import (
+    FlydslPaDecode,
+    flydsl_block_table,
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
 )
@@ -3736,6 +3738,201 @@ class AiterAttnBackend(AttentionBackend):
                 "different attention backend."
             )
 
+    def _flydsl_runner(self) -> FlydslPaDecode:
+        runner = getattr(self, "_flydsl_runner_obj", None)
+        if runner is None:
+            runner = FlydslPaDecode()
+            self._flydsl_runner_obj = runner
+        return runner
+
+    def _flydsl_require_eager(self) -> None:
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+
+        if get_is_capture_mode() or torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL does not capture CUDA graphs. "
+                "Launch the server with --disable-decode-cuda-graph."
+            )
+
+    def _flydsl_require_layer(self, layer: RadixAttention, sinks) -> None:
+        if not self.kv_cache_is_vectorized_5d:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL requires the target full-attention "
+                "pool to be SHUFFLE 5D. The pool builder selects that layout; "
+                "do not set SGLANG_AITER_KV_CACHE_LAYOUT (it would rewrite the "
+                "draft pool too). The NHD cache is not converted per step."
+            )
+        if self.page_size != 16:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL requires page_size=16 "
+                f"(got {self.page_size}). Page 64 is slower at a 93k prefix."
+            )
+        if self.kv_cache_dtype == fp8_dtype:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL is bf16 KV only. Do not enable FP8 KV."
+            )
+        if sinks is not None or layer.logit_cap:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL does not support attention sinks "
+                "or logit cap."
+            )
+        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL does not apply a sliding window "
+                f"(layer {layer.layer_id} has "
+                f"sliding_window_size={layer.sliding_window_size})."
+            )
+        if layer.qk_head_dim != layer.v_head_dim:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL requires qk_head_dim == v_head_dim, "
+                f"got {layer.qk_head_dim} and {layer.v_head_dim}."
+            )
+
+    def _flydsl_launch(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        context: torch.Tensor,
+        query_length: int,
+        max_context: int,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+    ) -> None:
+        bs = context.shape[0]
+        table = flydsl_block_table(
+            self.req_to_token,
+            forward_batch.req_pool_indices[:bs],
+            self.page_size,
+            max_context,
+        )
+        q3 = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        o3 = o.reshape(-1, layer.tp_q_head_num, layer.v_head_dim)
+        n_tokens = bs * query_length
+        if q3.shape[0] != n_tokens or o3.shape[0] != n_tokens:
+            raise RuntimeError(
+                "FlyDSL query/output rows must equal batch * query_length: "
+                f"q={q3.shape[0]} o={o3.shape[0]} need {n_tokens}"
+            )
+        if not getattr(self, "_flydsl_logged", False):
+            logger.info(
+                "AITER_VERIFY_FLYDSL page=%s qlen=%s bs=%s max_context=%s "
+                "k_cache=%s",
+                self.page_size,
+                query_length,
+                bs,
+                max_context,
+                tuple(k_cache.shape),
+            )
+            self._flydsl_logged = True
+        self._flydsl_runner().run(
+            o3,
+            q3,
+            k_cache,
+            v_cache,
+            context,
+            table,
+            float(layer.scaling),
+            query_length,
+            max_context,
+        )
+
+    def _forward_target_verify_flydsl(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        sinks,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> None:
+        """Uniform-width target verify. ``seq_lens`` is the prefix; the
+        verify tokens were just written into the 5D pool at
+        ``prefix .. prefix + qlen``.
+        """
+        self._flydsl_require_eager()
+        self._flydsl_require_layer(layer, sinks)
+        if k is None or v is None:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL needs the verify tokens written "
+                "into the KV pool on this forward (k/v are None)."
+            )
+        md = self.forward_metadata
+        bs = len(forward_batch.req_pool_indices)
+        qlen = int(md.max_q_len or 0)
+        qo = md.qo_indptr
+        if qo is None or qlen < 1 or qo.shape[0] < bs + 1:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL is missing verify qo_indptr metadata."
+            )
+        step_key = (id(md), "verify")
+        cached = getattr(self, "_flydsl_step", None)
+        if cached is None or cached[0] != step_key:
+            n_tokens = int(qo[bs].item())
+            if n_tokens != bs * qlen:
+                raise RuntimeError(
+                    "SGLANG_AITER_VERIFY_FLYDSL requires one verify width for "
+                    f"the whole batch, got {n_tokens} tokens, batch {bs}, "
+                    f"max_q_len {qlen}."
+                )
+            # GPU seq_lens is the prefix. seq_lens_cpu may already include qlen.
+            context = (
+                forward_batch.seq_lens[:bs].to(dtype=torch.int32) + qlen
+            ).contiguous()
+            max_context = int(context.max().item())
+            self._flydsl_step = (step_key, context, qlen, max_context)
+        else:
+            _, context, qlen, max_context = cached
+        k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
+        self._flydsl_launch(
+            q,
+            o,
+            layer,
+            forward_batch,
+            context,
+            qlen,
+            max_context,
+            k_cache,
+            v_cache,
+        )
+
+    def _forward_decode_flydsl(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        sinks,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+    ) -> None:
+        """qlen-1 decode. ``seq_lens`` already includes the token just written."""
+        self._flydsl_require_eager()
+        self._flydsl_require_layer(layer, sinks)
+        bs = forward_batch.batch_size
+        md = self.forward_metadata
+        step_key = (id(md), "decode")
+        cached = getattr(self, "_flydsl_step", None)
+        if cached is None or cached[0] != step_key:
+            context = forward_batch.seq_lens[:bs].to(dtype=torch.int32).contiguous()
+            max_context = int(context.max().item())
+            self._flydsl_step = (step_key, context, 1, max_context)
+        else:
+            _, context, _, max_context = cached
+        self._flydsl_launch(
+            q,
+            o,
+            layer,
+            forward_batch,
+            context,
+            1,
+            max_context,
+            k_cache,
+            v_cache,
+        )
+
     def _verify_splitkv_eligible(self, layer: RadixAttention, sinks) -> bool:
         """Eager causal target-verify can use aiter's split-KV paged kernel.
 
@@ -4326,6 +4523,12 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 else:
                     o = torch.empty_like(q)
+
+                if envs.SGLANG_AITER_VERIFY_FLYDSL.get():
+                    self._forward_target_verify_flydsl(
+                        q, o, layer, forward_batch, sinks, k, v
+                    )
+                    return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
                 # target_verify goes through unified_attention when topk == 1
                 # (the linear draft chain gives a pure causal mask). MLA and
@@ -4988,10 +5191,16 @@ class AiterAttnBackend(AttentionBackend):
             if self.kv_cache_is_vectorized_5d:
                 # SHUFFLE 5D pool: pa_decode_gluon for full + SWA layers
                 # (see :func:`aiter_utils.forward_decode_vectorized_5d`
-                # for the dispatch rationale).
-                forward_decode_vectorized_5d(
-                    self, q, layer, forward_batch, k_cache, v_cache, o, sinks
-                )
+                # for the dispatch rationale). FlyDSL replaces that kernel
+                # when the verify flag is on, including qlen-1 decode.
+                if envs.SGLANG_AITER_VERIFY_FLYDSL.get():
+                    self._forward_decode_flydsl(
+                        q, o, layer, forward_batch, sinks, k_cache, v_cache
+                    )
+                else:
+                    forward_decode_vectorized_5d(
+                        self, q, layer, forward_batch, k_cache, v_cache, o, sinks
+                    )
             elif self.use_triton_unified_attention:
                 bs = forward_batch.batch_size
                 window_size = (-1, -1)
