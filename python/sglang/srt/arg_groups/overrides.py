@@ -1362,9 +1362,7 @@ def _page_size_default(view: Any) -> dict:
         # FlyDSL pa_decode on gfx942 is fastest at page 16 for the long-prefix
         # GQA-6 head-256 verify shape. The target full-attention pool is
         # vectorized_5d; the draft pool stays NHD at this same page size.
-        logger.info(
-            "Setting page_size=16 as default for SGLANG_AITER_VERIFY_FLYDSL."
-        )
+        logger.info("Setting page_size=16 as default for SGLANG_AITER_VERIFY_FLYDSL.")
         return {"page_size": 16}
     if (
         get_platform().is_hip

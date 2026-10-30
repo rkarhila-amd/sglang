@@ -2521,9 +2521,7 @@ class AiterAttnBackend(AttentionBackend):
                             device=self.device,
                         )
                         max_extend_len = draft_num
-                        seq_mask_len = draft_num * (
-                            forward_batch.seq_lens + draft_num
-                        )
+                        seq_mask_len = draft_num * (forward_batch.seq_lens + draft_num)
                     else:
                         # extend_attention_fwd addresses new tokens with
                         # qo_indptr and the cached prefix with kv_indptr.
@@ -3824,8 +3822,7 @@ class AiterAttnBackend(AttentionBackend):
             )
         if not getattr(self, "_flydsl_logged", False):
             logger.info(
-                "AITER_VERIFY_FLYDSL page=%s qlen=%s bs=%s max_context=%s "
-                "k_cache=%s",
+                "AITER_VERIFY_FLYDSL page=%s qlen=%s bs=%s max_context=%s k_cache=%s",
                 self.page_size,
                 query_length,
                 bs,

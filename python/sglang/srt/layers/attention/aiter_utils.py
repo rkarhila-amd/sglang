@@ -365,9 +365,7 @@ class FlydslPaDecode:
             query = query.contiguous()
         out = output
         if out.shape != query.shape or not out.is_contiguous():
-            out = torch.empty(
-                query.shape, dtype=query.dtype, device=query.device
-            )
+            out = torch.empty(query.shape, dtype=query.dtype, device=query.device)
 
         key = (batch, num_kv_heads, query.device)
         plan = plan_pa_decode(
@@ -394,9 +392,7 @@ class FlydslPaDecode:
             self._scratch = (
                 exp_sums,
                 torch.empty_like(exp_sums),
-                torch.empty(
-                    *scalar, head_dim, dtype=query.dtype, device=query.device
-                ),
+                torch.empty(*scalar, head_dim, dtype=query.dtype, device=query.device),
             )
             self._scratch_key = scratch_key
         exp_sums, max_logits, temporary = self._scratch
