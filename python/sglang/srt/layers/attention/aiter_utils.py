@@ -420,6 +420,34 @@ class FlydslPaDecode:
             output.copy_(out)
 
 
+def flydsl_verify_live_batch(q_rows: int, qlen: int, pool_bs: int) -> int:
+    """How many leading requests ``q_rows`` cover at one uniform ``qlen``.
+
+    The scheduler pool can be longer than this forward's query. Hybrid verify
+    rewrites ``batch_size`` to ``num_tokens // width`` and leaves a trailing
+    pool slot in place, so a 24-row query at width 8 is 3 requests even when
+    ``req_pool_indices`` still has 4. Those query rows are packed in pool
+    order, so the kernel reads the prefix. A ragged width is not a multiple
+    of ``qlen`` and is rejected.
+    """
+    if qlen < 1:
+        raise ValueError(f"query length must be positive, got {qlen}")
+    if pool_bs < 1:
+        raise ValueError(f"verify pool must be positive, got {pool_bs}")
+    if q_rows < 1 or q_rows % qlen != 0:
+        raise ValueError(
+            f"FlyDSL verify query rows {q_rows} are not a positive multiple "
+            f"of qlen {qlen} (pool {pool_bs})"
+        )
+    live = q_rows // qlen
+    if live > pool_bs:
+        raise ValueError(
+            f"FlyDSL verify live batch {live} exceeds pool {pool_bs} "
+            f"(query rows {q_rows}, qlen {qlen})"
+        )
+    return live
+
+
 def flydsl_block_table(
     req_to_token: torch.Tensor,
     req_indices: torch.Tensor,

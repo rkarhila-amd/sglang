@@ -94,6 +94,7 @@ from sglang.srt.layers.attention.aiter_mla_gluon import (
 from sglang.srt.layers.attention.aiter_utils import (
     FlydslPaDecode,
     flydsl_block_table,
+    flydsl_verify_live_batch,
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
 )
@@ -3866,23 +3867,39 @@ class AiterAttnBackend(AttentionBackend):
                 "into the KV pool on this forward (k/v are None)."
             )
         md = self.forward_metadata
-        bs = len(forward_batch.req_pool_indices)
+        pool_bs = len(forward_batch.req_pool_indices)
         qlen = int(md.max_q_len or 0)
+        q_rows = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).shape[0]
+        try:
+            bs = flydsl_verify_live_batch(q_rows, qlen, pool_bs)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
         qo = md.qo_indptr
-        if qo is None or qlen < 1 or qo.shape[0] < bs + 1:
+        if qo is None or qo.shape[0] <= bs:
             raise RuntimeError(
                 "SGLANG_AITER_VERIFY_FLYDSL is missing verify qo_indptr metadata."
             )
-        step_key = (id(md), "verify")
+        # qo is a uniform arange at qlen, so the prefix of a wider plan still
+        # names this query. A ragged indptr fails the equality.
+        if int(qo[bs].item()) != q_rows:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL requires one verify width for "
+                f"the whole batch, got qo[{bs}]={int(qo[bs].item())}, "
+                f"query rows {q_rows}, qlen {qlen}, pool {pool_bs}."
+            )
+        if bs != pool_bs and not getattr(self, "_flydsl_trimmed_logged", False):
+            logger.info(
+                "AITER_VERIFY_FLYDSL trimming pool %s to %s requests "
+                "(q_rows=%s qlen=%s)",
+                pool_bs,
+                bs,
+                q_rows,
+                qlen,
+            )
+            self._flydsl_trimmed_logged = True
+        step_key = (id(md), "verify", q_rows, bs)
         cached = getattr(self, "_flydsl_step", None)
         if cached is None or cached[0] != step_key:
-            n_tokens = int(qo[bs].item())
-            if n_tokens != bs * qlen:
-                raise RuntimeError(
-                    "SGLANG_AITER_VERIFY_FLYDSL requires one verify width for "
-                    f"the whole batch, got {n_tokens} tokens, batch {bs}, "
-                    f"max_q_len {qlen}."
-                )
             # GPU seq_lens is the prefix. seq_lens_cpu may already include qlen.
             context = (
                 forward_batch.seq_lens[:bs].to(dtype=torch.int32) + qlen
