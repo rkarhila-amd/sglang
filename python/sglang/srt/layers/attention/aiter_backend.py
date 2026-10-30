@@ -3867,6 +3867,12 @@ class AiterAttnBackend(AttentionBackend):
         pool_bs = len(forward_batch.req_pool_indices)
         qlen = int(md.max_q_len or 0)
         q_rows = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).shape[0]
+        if envs.SGLANG_AITER_VERIFY_FLYDSL_EXTEND.get():
+            bs, max_extend = self._flydsl_extend_plan(q_rows, pool_bs)
+            self._forward_target_verify_flydsl_extend(
+                q, o, layer, forward_batch, k, v, bs, max_extend
+            )
+            return
         try:
             bs = flydsl_verify_live_batch(q_rows, qlen, pool_bs)
         except ValueError as exc:
@@ -3916,6 +3922,106 @@ class AiterAttnBackend(AttentionBackend):
             max_context,
             k_cache,
             v_cache,
+        )
+
+    def _flydsl_extend_plan(self, q_rows: int, pool_bs: int) -> tuple[int, int]:
+        """Live request count and max query width from the ragged qo indptr.
+
+        ``pa_decode`` needs one width. ``extend_attention_fwd`` does not, and
+        compact verify mixes widths (103 rows is not a multiple of 8).
+        """
+        qo = self.forward_metadata.qo_indptr
+        if qo is None or int(qo.shape[0]) < 2:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL_EXTEND is missing verify qo_indptr."
+            )
+        limit = min(pool_bs, int(qo.shape[0]) - 1)
+        vals = [int(v) for v in qo[: limit + 1].tolist()]
+        bs = next((i for i, v in enumerate(vals) if v == q_rows), None)
+        if bs is None or bs < 1:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL_EXTEND qo_indptr does not cover "
+                f"{q_rows} query rows (pool {pool_bs}, prefix {vals[:8]})."
+            )
+        width = max(vals[i + 1] - vals[i] for i in range(bs))
+        if width < 1:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL_EXTEND saw an empty verify window."
+            )
+        return bs, width
+
+    def _forward_target_verify_flydsl_extend(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        bs: int,
+        qlen: int,
+    ) -> None:
+        """Causal extend: prefix gathered out of the SHUFFLE pool, verify K/V fresh.
+
+        ``pa_decode`` attends by re-reading the verify window from the cache.
+        The page-16 NHD server, which keeps the short GSM8K repair, passes
+        those tokens as ``k_extend`` / ``v_extend`` and the prefix as the
+        buffer. This is that contract on the SHUFFLE pool.
+        """
+        from sglang.kernels.ops.kvcache.shuffle_5d_cache import (
+            launch_gather_shuffle_5d_to_linear,
+        )
+
+        md = self.forward_metadata
+        kv_indptr = md.kv_indptr[: bs + 1]
+        total = int(kv_indptr[-1].item())
+        k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
+        if total > 0:
+            k_lin, v_lin = launch_gather_shuffle_5d_to_linear(
+                k_cache, v_cache, md.kv_indices[:total]
+            )
+            kv_indices = torch.arange(total, device=k_lin.device, dtype=torch.int64)
+        else:
+            k_lin = k_cache.new_empty((0, layer.tp_k_head_num, layer.qk_head_dim))
+            v_lin = v_cache.new_empty((0, layer.tp_v_head_num, layer.v_head_dim))
+            kv_indices = torch.empty(0, device=q.device, dtype=torch.int64)
+        if not getattr(self, "_flydsl_extend_logged", False):
+            logger.info(
+                "AITER_VERIFY_FLYDSL extend-gather page=%s qlen=%s bs=%s "
+                "prefix_tokens=%s",
+                self.page_size,
+                qlen,
+                bs,
+                total,
+            )
+            self._flydsl_extend_logged = True
+        q3 = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        k3 = k.reshape(-1, layer.tp_k_head_num, layer.qk_head_dim).contiguous()
+        v3 = v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim).contiguous()
+        o3 = o.reshape(-1, layer.tp_q_head_num, layer.v_head_dim)
+        mask_indptr = md.mask_indptr
+        if mask_indptr is not None:
+            mask_indptr = mask_indptr[: bs + 1]
+        self.extend_attention_fwd(
+            q3,
+            k3,
+            v3,
+            o3,
+            k_lin,
+            v_lin,
+            md.qo_indptr[: bs + 1],
+            kv_indptr,
+            kv_indices,
+            None,
+            True,
+            mask_indptr,
+            qlen,
+            1.0,
+            1.0,
+            layer.scaling,
+            logit_cap=layer.logit_cap,
+            page_size=1,
+            identity_kv_indices=True,
         )
 
     def _forward_decode_flydsl(

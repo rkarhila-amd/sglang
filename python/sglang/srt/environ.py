@@ -1040,6 +1040,9 @@ class Envs:
     # SGLANG_AITER_KV_CACHE_LAYOUT=vectorized_5d; that env rewrites every
     # MHA pool, including the draft. Eager only; CUDA-graph capture raises.
     SGLANG_AITER_VERIFY_FLYDSL = EnvBool(False)
+    # Verify with extend_attention_fwd on fresh K/V plus the SHUFFLE prefix
+    # gathered to NHD. pa_decode stays the decode kernel. Off by default.
+    SGLANG_AITER_VERIFY_FLYDSL_EXTEND = EnvBool(False)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     # Set this to 1 to stop sglang from clearing an inherited
     # ROCPROFILER_REGISTER_LIBRARY.
