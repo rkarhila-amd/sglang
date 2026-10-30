@@ -92,6 +92,9 @@ from sglang.srt.layers.attention.aiter_mla_gluon import (
     prefer_mla_gluon_decode,
 )
 from sglang.srt.layers.attention.aiter_utils import (
+    FlydslPaDecode,
+    flydsl_block_table,
+    flydsl_verify_live_batch,
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
 )
@@ -182,11 +185,17 @@ class MlaPrefillPsMetadata:
 
 
 def _kv_cache_is_vectorized_5d(pool) -> bool:
-    """Whether ``pool`` stores K/V in the SHUFFLE 5D layout. A pool with a
-    window sub-pool answers with its full view's layout, or its window view's
-    when it routes no full layers (a draft fused into the window sub-pool)."""
+    """Whether ``pool`` stores K/V in the SHUFFLE 5D layout.
+
+    A hybrid pool keeps that layout on its full-attention child, not on
+    itself. A pool with a window sub-pool answers with its full view's
+    layout, or its window view's when it routes no full layers (a draft
+    fused into the window sub-pool)."""
     router = pool.layer_router
-    if router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
+    wrapped = router.wrapped_view()
+    if wrapped is not None:
+        pool = wrapped
+    elif router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
         has_full = router.sub_pool(IdSpaceKind.FULL) is not None
         pool = router.view(IdSpaceKind.FULL if has_full else IdSpaceKind.SLIDING_WINDOW)
     return getattr(pool, "kv_cache_layout", "nhd") == "vectorized_5d"
@@ -2471,10 +2480,17 @@ class AiterAttnBackend(AttentionBackend):
                     cprr_empty_rows=cprr_empty_rows,
                 )
             else:
-                draft_num = forward_batch.input_ids.shape[0] // bs
+                # Divide by the batch size captured above, then rebind bs to
+                # the live rows. Uniform verify depends on that order.
+                packed_tokens = forward_batch.input_ids.shape[0]
+                draft_num = packed_tokens // bs
                 bs = len(forward_batch.req_pool_indices)
+                layout = getattr(spec_info, "ragged_verify_layout", None)
+                if layout is not None and layout.bs != bs:
+                    layout = layout.padded_to_bucket(padded_bs=bs)
 
                 if self._use_unified_verify:
+                    # Page-table verify still assumes one width per request.
                     page_table, qo_indptr, max_q_len, swa_page_table = (
                         self._build_verify_unified_metadata(
                             bs,
@@ -2496,13 +2512,39 @@ class AiterAttnBackend(AttentionBackend):
                         swa_out_cache_loc=swa_out_cache_loc,
                     )
                 else:
-                    qo_indptr = torch.arange(
-                        0,
-                        (1 + bs) * draft_num,
-                        step=draft_num,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
+                    if layout is None:
+                        qo_indptr = torch.arange(
+                            0,
+                            (1 + bs) * draft_num,
+                            step=draft_num,
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                        max_extend_len = draft_num
+                        seq_mask_len = draft_num * (forward_batch.seq_lens + draft_num)
+                    else:
+                        # extend_attention_fwd addresses new tokens with
+                        # qo_indptr and the cached prefix with kv_indptr.
+                        # generate_attn_arg_prefill adds verify_lens onto the
+                        # paged KV for flashinfer-style kernels; using it here
+                        # would count the extend tokens twice. Take only the
+                        # layout indptr that helper returns.
+                        qo_indptr = layout.qo_indptr_device
+                        if (
+                            qo_indptr.dtype != torch.int32
+                            or qo_indptr.device != self.device
+                        ):
+                            qo_indptr = qo_indptr.to(
+                                device=self.device, dtype=torch.int32
+                            )
+                        verify_lens = layout.verify_lens
+                        if layout.verify_lens_cpu:
+                            max_extend_len = max(layout.verify_lens_cpu)
+                        else:
+                            max_extend_len = int(verify_lens.max().item())
+                        lens = verify_lens[:bs]
+                        seq_lens_bs = forward_batch.seq_lens[:bs]
+                        seq_mask_len = lens * (seq_lens_bs + lens)
 
                     kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
                     kv_indptr = kv_indptr[: bs + 1]
@@ -2523,7 +2565,6 @@ class AiterAttnBackend(AttentionBackend):
                     )
 
                     custom_mask = spec_info.custom_mask
-                    seq_mask_len = draft_num * (forward_batch.seq_lens + draft_num)
                     mask_indptr = self.mask_indptr
                     mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
                     mask_indptr = mask_indptr[: bs + 1]
@@ -2533,11 +2574,11 @@ class AiterAttnBackend(AttentionBackend):
                         kv_indices,
                         qo_indptr,
                         None,
-                        draft_num,
+                        max_extend_len,
                         None,
                         custom_mask=custom_mask,
                         mask_indptr=mask_indptr,
-                        max_extend_len=draft_num,
+                        max_extend_len=max_extend_len,
                     )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
@@ -3342,10 +3383,20 @@ class AiterAttnBackend(AttentionBackend):
                         swa_page_table=_swa_page_table,
                     )
                 else:
+                    # DFLASH/DSPARK verify replay always passes custom_mask=None
+                    # (see resolve_dflash_verify_mask_policy). Mirror Triton:
+                    # copy only when a mask is provided; otherwise leave None so
+                    # the kernel uses its built-in causal path.
                     custom_mask = self.cuda_graph_custom_mask
-                    custom_mask[: spec_info.custom_mask.shape[0]] = (
-                        spec_info.custom_mask
-                    )
+                    if (
+                        spec_info is not None
+                        and getattr(spec_info, "custom_mask", None) is not None
+                    ):
+                        custom_mask[: spec_info.custom_mask.shape[0]] = (
+                            spec_info.custom_mask
+                        )
+                    else:
+                        custom_mask = None
                     seq_mask_len = max_q_len * (seq_lens + max_q_len)
                     mask_indptr = self.mask_indptr[: bs + 1]
                     mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
@@ -3691,6 +3742,479 @@ class AiterAttnBackend(AttentionBackend):
                 "(SGLANG_USE_AITER_UNIFIED_ATTN=1) or select a "
                 "different attention backend."
             )
+
+    def _flydsl_runner(self) -> FlydslPaDecode:
+        runner = getattr(self, "_flydsl_runner_obj", None)
+        if runner is None:
+            runner = FlydslPaDecode()
+            self._flydsl_runner_obj = runner
+        return runner
+
+    def _flydsl_require_eager(self) -> None:
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+
+        if get_is_capture_mode() or torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL does not capture CUDA graphs. "
+                "Launch the server with --disable-decode-cuda-graph."
+            )
+
+    def _flydsl_require_layer(self, layer: RadixAttention, sinks) -> None:
+        if not self.kv_cache_is_vectorized_5d:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL requires the target full-attention "
+                "pool to be SHUFFLE 5D. The pool builder selects that layout; "
+                "do not set SGLANG_AITER_KV_CACHE_LAYOUT (it would rewrite the "
+                "draft pool too). The NHD cache is not converted per step."
+            )
+        if self.page_size != 16:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL requires page_size=16 "
+                f"(got {self.page_size}). Page 64 is slower at a 93k prefix."
+            )
+        if self.kv_cache_dtype == fp8_dtype:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL is bf16 KV only. Do not enable FP8 KV."
+            )
+        if sinks is not None or layer.logit_cap:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL does not support attention sinks "
+                "or logit cap."
+            )
+        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL does not apply a sliding window "
+                f"(layer {layer.layer_id} has "
+                f"sliding_window_size={layer.sliding_window_size})."
+            )
+        if layer.qk_head_dim != layer.v_head_dim:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL requires qk_head_dim == v_head_dim, "
+                f"got {layer.qk_head_dim} and {layer.v_head_dim}."
+            )
+
+    def _flydsl_launch(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        context: torch.Tensor,
+        query_length: int,
+        max_context: int,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+    ) -> None:
+        bs = context.shape[0]
+        table = flydsl_block_table(
+            self.req_to_token,
+            forward_batch.req_pool_indices[:bs],
+            self.page_size,
+            max_context,
+        )
+        q3 = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        o3 = o.reshape(-1, layer.tp_q_head_num, layer.v_head_dim)
+        n_tokens = bs * query_length
+        if q3.shape[0] != n_tokens or o3.shape[0] != n_tokens:
+            raise RuntimeError(
+                "FlyDSL query/output rows must equal batch * query_length: "
+                f"q={q3.shape[0]} o={o3.shape[0]} need {n_tokens}"
+            )
+        if not getattr(self, "_flydsl_logged", False):
+            logger.info(
+                "AITER_VERIFY_FLYDSL page=%s qlen=%s bs=%s max_context=%s k_cache=%s",
+                self.page_size,
+                query_length,
+                bs,
+                max_context,
+                tuple(k_cache.shape),
+            )
+            self._flydsl_logged = True
+        self._flydsl_runner().run(
+            o3,
+            q3,
+            k_cache,
+            v_cache,
+            context,
+            table,
+            float(layer.scaling),
+            query_length,
+            max_context,
+        )
+
+    def _forward_target_verify_flydsl(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        sinks,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> None:
+        """Uniform-width target verify. ``seq_lens`` is the prefix; the
+        verify tokens were just written into the 5D pool at
+        ``prefix .. prefix + qlen``.
+        """
+        self._flydsl_require_eager()
+        self._flydsl_require_layer(layer, sinks)
+        if k is None or v is None:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL needs the verify tokens written "
+                "into the KV pool on this forward (k/v are None)."
+            )
+        md = self.forward_metadata
+        pool_bs = len(forward_batch.req_pool_indices)
+        qlen = int(md.max_q_len or 0)
+        q_rows = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).shape[0]
+        if envs.SGLANG_AITER_VERIFY_FLYDSL_EXTEND.get():
+            bs, max_extend = self._flydsl_extend_plan(q_rows, pool_bs)
+            self._forward_target_verify_flydsl_extend(
+                q, o, layer, forward_batch, k, v, bs, max_extend
+            )
+            return
+        try:
+            bs = flydsl_verify_live_batch(q_rows, qlen, pool_bs)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        qo = md.qo_indptr
+        if qo is None or qo.shape[0] <= bs:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL is missing verify qo_indptr metadata."
+            )
+        # qo is a uniform arange at qlen, so the prefix of a wider plan still
+        # names this query. A ragged indptr fails the equality.
+        if int(qo[bs].item()) != q_rows:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL requires one verify width for "
+                f"the whole batch, got qo[{bs}]={int(qo[bs].item())}, "
+                f"query rows {q_rows}, qlen {qlen}, pool {pool_bs}."
+            )
+        if bs != pool_bs and not getattr(self, "_flydsl_trimmed_logged", False):
+            logger.info(
+                "AITER_VERIFY_FLYDSL trimming pool %s to %s requests "
+                "(q_rows=%s qlen=%s)",
+                pool_bs,
+                bs,
+                q_rows,
+                qlen,
+            )
+            self._flydsl_trimmed_logged = True
+        step_key = (id(md), "verify", q_rows, bs)
+        cached = getattr(self, "_flydsl_step", None)
+        if cached is None or cached[0] != step_key:
+            # GPU seq_lens is the prefix. seq_lens_cpu may already include qlen.
+            context = (
+                forward_batch.seq_lens[:bs].to(dtype=torch.int32) + qlen
+            ).contiguous()
+            max_context = int(context.max().item())
+            self._flydsl_step = (step_key, context, qlen, max_context)
+        else:
+            _, context, qlen, max_context = cached
+        k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
+        self._flydsl_launch(
+            q,
+            o,
+            layer,
+            forward_batch,
+            context,
+            qlen,
+            max_context,
+            k_cache,
+            v_cache,
+        )
+
+    def _flydsl_extend_plan(self, q_rows: int, pool_bs: int) -> tuple[int, int]:
+        """Live request count and max query width from the ragged qo indptr.
+
+        ``pa_decode`` needs one width. ``extend_attention_fwd`` does not, and
+        compact verify mixes widths (103 rows is not a multiple of 8).
+        """
+        qo = self.forward_metadata.qo_indptr
+        if qo is None or int(qo.shape[0]) < 2:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL_EXTEND is missing verify qo_indptr."
+            )
+        limit = min(pool_bs, int(qo.shape[0]) - 1)
+        vals = [int(v) for v in qo[: limit + 1].tolist()]
+        bs = next((i for i, v in enumerate(vals) if v == q_rows), None)
+        if bs is None or bs < 1:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL_EXTEND qo_indptr does not cover "
+                f"{q_rows} query rows (pool {pool_bs}, prefix {vals[:8]})."
+            )
+        width = max(vals[i + 1] - vals[i] for i in range(bs))
+        if width < 1:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL_EXTEND saw an empty verify window."
+            )
+        return bs, width
+
+    def _forward_target_verify_flydsl_extend(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        bs: int,
+        qlen: int,
+    ) -> None:
+        """Causal extend: prefix gathered out of the SHUFFLE pool, verify K/V fresh.
+
+        ``pa_decode`` attends by re-reading the verify window from the cache.
+        The page-16 NHD server, which keeps the short GSM8K repair, passes
+        those tokens as ``k_extend`` / ``v_extend`` and the prefix as the
+        buffer. This is that contract on the SHUFFLE pool.
+        """
+        from sglang.kernels.ops.kvcache.shuffle_5d_cache import (
+            launch_gather_shuffle_5d_to_linear,
+        )
+
+        md = self.forward_metadata
+        kv_indptr = md.kv_indptr[: bs + 1]
+        total = int(kv_indptr[-1].item())
+        k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
+        if total > 0:
+            k_lin, v_lin = launch_gather_shuffle_5d_to_linear(
+                k_cache, v_cache, md.kv_indices[:total]
+            )
+            kv_indices = torch.arange(total, device=k_lin.device, dtype=torch.int64)
+        else:
+            k_lin = k_cache.new_empty((0, layer.tp_k_head_num, layer.qk_head_dim))
+            v_lin = v_cache.new_empty((0, layer.tp_v_head_num, layer.v_head_dim))
+            kv_indices = torch.empty(0, device=q.device, dtype=torch.int64)
+        if not getattr(self, "_flydsl_extend_logged", False):
+            logger.info(
+                "AITER_VERIFY_FLYDSL extend-gather page=%s qlen=%s bs=%s "
+                "prefix_tokens=%s",
+                self.page_size,
+                qlen,
+                bs,
+                total,
+            )
+            self._flydsl_extend_logged = True
+        q3 = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        k3 = k.reshape(-1, layer.tp_k_head_num, layer.qk_head_dim).contiguous()
+        v3 = v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim).contiguous()
+        o3 = o.reshape(-1, layer.tp_q_head_num, layer.v_head_dim)
+        mask_indptr = md.mask_indptr
+        if mask_indptr is not None:
+            mask_indptr = mask_indptr[: bs + 1]
+        self.extend_attention_fwd(
+            q3,
+            k3,
+            v3,
+            o3,
+            k_lin,
+            v_lin,
+            md.qo_indptr[: bs + 1],
+            kv_indptr,
+            kv_indices,
+            None,
+            True,
+            mask_indptr,
+            qlen,
+            1.0,
+            1.0,
+            layer.scaling,
+            logit_cap=layer.logit_cap,
+            page_size=1,
+            identity_kv_indices=True,
+        )
+
+    def _forward_decode_flydsl(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        sinks,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+    ) -> None:
+        """qlen-1 decode. ``seq_lens`` already includes the token just written."""
+        self._flydsl_require_eager()
+        self._flydsl_require_layer(layer, sinks)
+        bs = forward_batch.batch_size
+        md = self.forward_metadata
+        step_key = (id(md), "decode")
+        cached = getattr(self, "_flydsl_step", None)
+        if cached is None or cached[0] != step_key:
+            context = forward_batch.seq_lens[:bs].to(dtype=torch.int32).contiguous()
+            max_context = int(context.max().item())
+            self._flydsl_step = (step_key, context, 1, max_context)
+        else:
+            _, context, _, max_context = cached
+        self._flydsl_launch(
+            q,
+            o,
+            layer,
+            forward_batch,
+            context,
+            1,
+            max_context,
+            k_cache,
+            v_cache,
+        )
+
+    def _verify_splitkv_eligible(self, layer: RadixAttention, sinks) -> bool:
+        """Eager causal target-verify can use aiter's split-KV paged kernel.
+
+        ``extend_attention_fwd`` launches one workgroup per sequence and head,
+        so a long prefix is latency-bound on gfx942. ``paged_attention_ragged``
+        splits KV into 256-token partitions. Its MTP tile does not pack GQA 6
+        with a verify window of 8, so each query token is its own sequence and
+        re-reads KV. CUDA-graph capture is refused: the plan allocates.
+        """
+        if not get_bool_env_var("SGLANG_AITER_VERIFY_SPLITKV", "1"):
+            return False
+        if self.use_mla or self.kv_cache_is_vectorized_5d or self.page_size != 1:
+            return False
+        if self.topk not in (None, 1):
+            return False
+        if sinks is not None or layer.logit_cap:
+            return False
+        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+            return False
+        if layer.qk_head_dim != layer.v_head_dim:
+            return False
+        md = self.forward_metadata
+        if md is None or md.qo_indptr is None or md.custom_mask is not None:
+            return False
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+
+        return not get_is_capture_mode()
+
+    def _build_verify_splitkv_plan(self, forward_batch: ForwardBatch):
+        """One paged sequence per query token. Query w sees prefix+w+1 KV."""
+        md = self.forward_metadata
+        bs = len(forward_batch.req_pool_indices)
+        qo = md.qo_indptr
+        if qo.shape[0] < bs + 1:
+            return None
+        device = qo.device
+        verify_lens = (qo[1 : bs + 1] - qo[:bs]).to(torch.int32)
+        if verify_lens.numel() == 0:
+            return None
+        n_tokens = int(qo[bs].item())
+        if n_tokens <= 0:
+            return None
+        slot = torch.arange(bs, device=device).repeat_interleave(verify_lens)
+        if slot.shape[0] != n_tokens:
+            return None
+        starts = qo[:bs].to(torch.int32)
+        pos = torch.arange(n_tokens, device=device, dtype=torch.int32) - starts[slot]
+        seq_lens = forward_batch.seq_lens[:bs].to(device=device, dtype=torch.int32)
+        kv_lens = seq_lens[slot] + pos + 1
+        kv_indptr = torch.empty(n_tokens + 1, dtype=torch.int32, device=device)
+        kv_indptr[0] = 0
+        kv_indptr[1:] = torch.cumsum(kv_lens, dim=0)
+        total = int(kv_indptr[-1].item())
+        if total <= 0:
+            return None
+        req_q = forward_batch.req_pool_indices[:bs].to(device=device)
+        req_q = req_q.repeat_interleave(verify_lens)
+        kv_indices = torch.empty(total, dtype=self.req_to_token.dtype, device=device)
+        create_flashinfer_kv_indices_triton[(n_tokens, 4)](
+            self.req_to_token,
+            req_q,
+            kv_lens,
+            kv_indptr,
+            None,
+            kv_indices,
+            self.req_to_token.stride(0),
+            TOKEN_BLOCK_PARALLEL=True,
+        )
+        if kv_indices.dtype != torch.int32:
+            kv_indices = kv_indices.to(torch.int32)
+        return n_tokens, kv_indptr, kv_indices
+
+    def _verify_splitkv_workspace(self, n_tokens: int, num_heads: int, head_size: int):
+        nparts = self.max_num_partitions
+        nbytes = (
+            n_tokens * num_heads * nparts * head_size * 4
+            + 2 * n_tokens * num_heads * nparts * 4
+        )
+        buf = getattr(self, "_verify_splitkv_workspace_buf", None)
+        if buf is None or buf.numel() < nbytes:
+            self._verify_splitkv_workspace_buf = torch.empty(
+                nbytes, dtype=torch.uint8, device=self.device
+            )
+        return self._verify_splitkv_workspace_buf
+
+    def _forward_target_verify_splitkv(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        sinks,
+    ) -> bool:
+        if not self._verify_splitkv_eligible(layer, sinks):
+            return False
+        plan = getattr(self.forward_metadata, "_splitkv_plan", None)
+        if plan is None:
+            plan = self._build_verify_splitkv_plan(forward_batch)
+            if plan is None:
+                return False
+            self.forward_metadata._splitkv_plan = plan
+            if not getattr(self, "_verify_splitkv_logged", False):
+                n_logged, kv_indptr_logged, _ = plan
+                logger.info(
+                    "AITER_VERIFY_SPLITKV n_tokens=%s index_tokens=%s partitions=%s",
+                    n_logged,
+                    int(kv_indptr_logged[-1].item()),
+                    self.max_num_partitions,
+                )
+                self._verify_splitkv_logged = True
+        n_tokens, kv_indptr, kv_indices = plan
+        q3 = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        if q3.shape[0] != n_tokens:
+            if not getattr(self, "_verify_splitkv_skip_logged", False):
+                logger.info(
+                    "AITER_VERIFY_SPLITKV skip q_tokens=%s plan_tokens=%s",
+                    int(q3.shape[0]),
+                    n_tokens,
+                )
+                self._verify_splitkv_skip_logged = True
+            return False
+        if not q3.is_contiguous():
+            q3 = q3.contiguous()
+        out3 = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+        write = out3 if out3.is_contiguous() else torch.empty_like(q3)
+        k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
+        k_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
+        v_descale = layer.v_scale if layer.v_scale is not None else self.v_scale
+        workspace = self._verify_splitkv_workspace(
+            n_tokens, layer.tp_q_head_num, layer.v_head_dim
+        )
+        paged_attention_ragged(
+            write,
+            workspace,
+            q3,
+            k_cache.view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
+            v_cache.view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
+            float(layer.scaling),
+            kv_indptr,
+            kv_indices,
+            self.kv_last_page_len,
+            1,
+            self.max_num_partitions,
+            None,
+            self._get_aiter_paged_ragged_kv_cache_dtype(),
+            "NHD",
+            0.0,
+            k_descale,
+            v_descale,
+            None,
+            _AITER_PARTITION_SIZE_ROCM,
+            1,
+        )
+        if write is not out3:
+            out3.copy_(write)
+        return True
 
     def forward_extend(
         self,
@@ -4126,6 +4650,12 @@ class AiterAttnBackend(AttentionBackend):
                 else:
                     o = torch.empty_like(q)
 
+                if envs.SGLANG_AITER_VERIFY_FLYDSL.get():
+                    self._forward_target_verify_flydsl(
+                        q, o, layer, forward_batch, sinks, k, v
+                    )
+                    return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
                 # target_verify goes through unified_attention when topk == 1
                 # (the linear draft chain gives a pure causal mask). MLA and
                 # draft_extend still use the legacy extend_attention_fwd path.
@@ -4252,6 +4782,11 @@ class AiterAttnBackend(AttentionBackend):
                     return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
                 self._reject_target_verify_cross_layer_kv(k, v)
+
+                if self._forward_target_verify_splitkv(
+                    q, o, layer, forward_batch, sinks
+                ):
+                    return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
                 self.extend_attention_fwd(
                     q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -4782,10 +5317,16 @@ class AiterAttnBackend(AttentionBackend):
             if self.kv_cache_is_vectorized_5d:
                 # SHUFFLE 5D pool: pa_decode_gluon for full + SWA layers
                 # (see :func:`aiter_utils.forward_decode_vectorized_5d`
-                # for the dispatch rationale).
-                forward_decode_vectorized_5d(
-                    self, q, layer, forward_batch, k_cache, v_cache, o, sinks
-                )
+                # for the dispatch rationale). FlyDSL replaces that kernel
+                # when the verify flag is on, including qlen-1 decode.
+                if envs.SGLANG_AITER_VERIFY_FLYDSL.get():
+                    self._forward_decode_flydsl(
+                        q, o, layer, forward_batch, sinks, k_cache, v_cache
+                    )
+                else:
+                    forward_decode_vectorized_5d(
+                        self, q, layer, forward_batch, k_cache, v_cache, o, sinks
+                    )
             elif self.use_triton_unified_attention:
                 bs = forward_batch.batch_size
                 window_size = (-1, -1)

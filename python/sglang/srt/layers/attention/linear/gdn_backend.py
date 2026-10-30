@@ -541,6 +541,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
     """Attention backend for GDN (Gated Delta Network) linear attention."""
 
     needs_cpu_seq_lens: bool = False
+    # Conv uses dense scratch; recurrence consumes ragged query_start_loc.
+    supports_ragged_verify_graph: bool = True
     supports_mis: bool = True
     requires_contiguous_prefill_state: bool = True
 
@@ -1289,11 +1291,28 @@ class GDNAttnBackend(MambaAttnBackendBase):
             state_cache_indices = cache_indices
 
         if is_target_verify:
-            batch_size = seq_len // forward_batch.spec_info.draft_token_num
+            # Compact/ragged verify packs a non-uniform token count; do not
+            # assume seq_len % draft_token_num == 0 (sgl-project/sglang#38897).
             draft_token_num = forward_batch.spec_info.draft_token_num
-            mixed_qkv_reshaped = mixed_qkv.view(
-                batch_size, draft_token_num, -1
-            ).transpose(1, 2)
+            ragged_layout = forward_batch.spec_info.ragged_verify_layout
+            if ragged_layout is None:
+                batch_size = seq_len // draft_token_num
+                dense_token_indices = None
+                mixed_qkv_dense = mixed_qkv.view(batch_size, draft_token_num, -1)
+            else:
+                batch_size = query_start_loc.shape[0] - 1
+                num_dense_tokens = batch_size * draft_token_num
+                dense_token_indices = forward_metadata.ragged_verify_dense_indices
+                assert dense_token_indices is not None
+                dense = mixed_qkv.new_empty(
+                    num_dense_tokens + 1, mixed_qkv.shape[-1]
+                )
+                dense.index_copy_(0, dense_token_indices, mixed_qkv)
+                mixed_qkv_dense = dense[:num_dense_tokens].view(
+                    batch_size, draft_token_num, -1
+                )
+
+            mixed_qkv_reshaped = mixed_qkv_dense.transpose(1, 2)
             mixed_qkv_processed = causal_conv1d_update(
                 mixed_qkv_reshaped,
                 conv_states,
@@ -1307,7 +1326,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
             )
-            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+            mixed_qkv_flat = mixed_qkv_processed.transpose(1, 2).reshape(
+                batch_size * draft_token_num, -1
+            )
+            if dense_token_indices is None:
+                mixed_qkv = mixed_qkv_flat
+            else:
+                gather_indices = forward_metadata.ragged_verify_dense_gather_indices
+                assert gather_indices is not None
+                mixed_qkv = mixed_qkv_flat[gather_indices]
         else:
             if forward_metadata.has_mamba_track_mask:
                 mixed_qkv_to_track = mixed_qkv[

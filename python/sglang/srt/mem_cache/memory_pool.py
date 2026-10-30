@@ -2217,9 +2217,8 @@ class MHATokenToKVPool(KVCache, MHAKVView):
         self.use_native_move_kv_cache = envs.SGLANG_NATIVE_MOVE_KV_CACHE.get()
         if kv_cache_layout is not None:
             # Explicit physical-layout selector wins over the platform default.
-            # This is a label only; layouts that change buffer identity (e.g. the
-            # page-granularity envelope) live in a dedicated pool subclass
-            # (PageMajorMHATokenToKVPool) rather than in branches here.
+            # vectorized_5d changes the buffer shape (see the setup below).
+            # The page-granularity envelope still lives in PageMajorMHATokenToKVPool.
             self.use_hnd = False
             self.kv_cache_layout = kv_cache_layout
         elif self.use_hnd:
@@ -2240,17 +2239,18 @@ class MHATokenToKVPool(KVCache, MHAKVView):
                         "expected 'nhd' or 'vectorized_5d'."
                     )
                 self.kv_cache_layout = layout
-                if layout == "vectorized_5d":
-                    # X = 16 / storage itemsize: sized by the STORAGE dtype (not compute
-                    # dtype) since it tiles the 16-byte on-pool vector.
-                    self._kv_vector_x = 16 // self.store_dtype.itemsize
-                    assert (self.size + self.page_size) % self.page_size == 0
-                    assert self.page_size % self._kv_vector_x == 0, (
-                        f"page_size={self.page_size} must be divisible by "
-                        f"X={self._kv_vector_x} for vectorized_5d layout"
-                    )
-                    assert self.head_dim % self._kv_vector_x == 0
-                    assert self.v_head_dim % self._kv_vector_x == 0
+        if self.kv_cache_layout == "vectorized_5d":
+            # X = 16 / storage itemsize: sized by the STORAGE dtype (not compute
+            # dtype) since it tiles the 16-byte on-pool vector. Applies whether
+            # the layout came from the env var or from an explicit argument.
+            self._kv_vector_x = 16 // self.store_dtype.itemsize
+            assert (self.size + self.page_size) % self.page_size == 0
+            assert self.page_size % self._kv_vector_x == 0, (
+                f"page_size={self.page_size} must be divisible by "
+                f"X={self._kv_vector_x} for vectorized_5d layout"
+            )
+            assert self.head_dim % self._kv_vector_x == 0
+            assert self.v_head_dim % self._kv_vector_x == 0
 
         self.quant_method = (
             quant_method if quant_method is not None else UnquantizedKVCacheMethod()
@@ -2267,9 +2267,14 @@ class MHATokenToKVPool(KVCache, MHAKVView):
             else None
         )
 
-        if enable_kv_cache_copy and not self.use_hnd:
-            # The tiled byte copy assumes NHD slot-rows; HND uses a (page, off)
-            # gather in move_kv_cache instead, so skip the slot-row copy config.
+        if (
+            enable_kv_cache_copy
+            and not self.use_hnd
+            and self.kv_cache_layout != "vectorized_5d"
+        ):
+            # The tiled byte copy assumes NHD slot-rows. HND gathers by
+            # (page, off). SHUFFLE 5D moves a token with the shuffle
+            # writer, so neither path uses this warmup.
             self._init_kv_copy_and_warmup()
         else:
             self._kv_copy_config = None
@@ -2758,6 +2763,11 @@ class MHATokenToKVPool(KVCache, MHAKVView):
         return ptrs, lens, item_lens
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        if self.kv_cache_layout == "vectorized_5d":
+            raise NotImplementedError(
+                "CPU KV offload indexes NHD slot rows. The SHUFFLE 5D pool "
+                "used by SGLANG_AITER_VERIFY_FLYDSL stays on device."
+            )
         assert not self.use_hnd, (
             "CPU KV offload indexes by slot (NHD); HND KV cache "
             "(SGLANG_USE_HND_KVCACHE) is not supported with CPU offload yet."
@@ -2782,6 +2792,11 @@ class MHATokenToKVPool(KVCache, MHAKVView):
     def load_cpu_copy(
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
+        if self.kv_cache_layout == "vectorized_5d":
+            raise NotImplementedError(
+                "CPU KV offload indexes NHD slot rows. The SHUFFLE 5D pool "
+                "used by SGLANG_AITER_VERIFY_FLYDSL stays on device."
+            )
         assert not self.use_hnd, (
             "CPU KV offload indexes by slot (NHD); HND KV cache "
             "(SGLANG_USE_HND_KVCACHE) is not supported with CPU offload yet."
@@ -3291,6 +3306,10 @@ class MHATokenToKVPool(KVCache, MHAKVView):
         maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
         maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
 
+        if self.kv_cache_layout == "vectorized_5d":
+            self._move_kv_cache_vectorized_5d(tgt_loc, src_loc)
+            return
+
         if self.use_hnd:
             pages_t, offs_t = tgt_loc // self.page_size, tgt_loc % self.page_size
             pages_s, offs_s = src_loc // self.page_size, src_loc % self.page_size
@@ -3301,6 +3320,33 @@ class MHATokenToKVPool(KVCache, MHAKVView):
             return
 
         self._move_kv_cache_impl(tgt_loc, src_loc)
+
+    def _move_kv_cache_vectorized_5d(
+        self, tgt_loc: torch.Tensor, src_loc: torch.Tensor
+    ) -> None:
+        """Move token slots inside a SHUFFLE 5D pool.
+
+        The tiled NHD copy treats dim 0 as a token row. Here dim 0 is a page,
+        so a token is gathered to ``(T, H, D)`` and written back with the same
+        kernel that prefill and append use. The gather finishes before the
+        store, so overlapping source and target slots stay coherent.
+        """
+        if tgt_loc.numel() == 0:
+            return
+        from sglang.kernels.ops.kvcache.shuffle_5d_cache import (
+            launch_gather_shuffle_5d_to_linear,
+            launch_reshape_and_cache_shuffle_5d,
+        )
+
+        src = src_loc.reshape(-1)
+        tgt = tgt_loc.reshape(-1)
+        for key_cache, value_cache in zip(self.k_buffer, self.v_buffer):
+            key_lin, value_lin = launch_gather_shuffle_5d_to_linear(
+                key_cache, value_cache, src
+            )
+            launch_reshape_and_cache_shuffle_5d(
+                key_lin, value_lin, key_cache, value_cache, tgt
+            )
 
     def _move_kv_cache_impl(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         # Physical move strategy. Override for layouts that change buffer
@@ -4122,6 +4168,7 @@ class HybridLinearKVPool(KVCache):
         # full-attention layers instead of constructing one internally.
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
+        kv_cache_layout: Optional[str] = None,
     ):
         self.size = size
         self.dtype = dtype
@@ -4152,6 +4199,11 @@ class HybridLinearKVPool(KVCache):
             post_capture_kwargs = (
                 {"post_capture_active": True} if post_capture_active else {}
             )
+            layout_kwargs = (
+                {"kv_cache_layout": kv_cache_layout}
+                if kv_cache_layout is not None
+                else {}
+            )
             self.full_kv_pool = TokenToKVPoolClass(
                 size=size,
                 page_size=self.page_size,
@@ -4164,6 +4216,7 @@ class HybridLinearKVPool(KVCache):
                 enable_kv_cache_copy=enable_kv_cache_copy,
                 quant_method=quant_method,
                 **post_capture_kwargs,
+                **layout_kwargs,
             )
         elif use_dsa:
             # DSA sparse full-attention layers share the MLA latent layout and
@@ -4478,8 +4531,11 @@ class HybridLinearKVPool(KVCache):
             )
 
     def get_v_head_dim(self):
-        # Use start_layer to handle pipeline parallelism where layer 0
-        # may not be present in this stage's buffer.
+        # The MHA child stores v_head_dim. Reading shape[-1] is wrong for
+        # SHUFFLE 5D, whose value buffer ends in the vector width.
+        v_dim = getattr(self.full_kv_pool, "v_head_dim", None)
+        if v_dim is not None:
+            return v_dim
         return self.full_kv_pool.get_value_buffer(self.full_kv_pool.start_layer).shape[
             -1
         ]
