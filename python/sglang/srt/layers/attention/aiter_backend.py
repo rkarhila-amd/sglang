@@ -3736,6 +3736,163 @@ class AiterAttnBackend(AttentionBackend):
                 "different attention backend."
             )
 
+    def _verify_splitkv_eligible(self, layer: RadixAttention, sinks) -> bool:
+        """Eager causal target-verify can use aiter's split-KV paged kernel.
+
+        ``extend_attention_fwd`` launches one workgroup per sequence and head,
+        so a long prefix is latency-bound on gfx942. ``paged_attention_ragged``
+        splits KV into 256-token partitions. Its MTP tile does not pack GQA 6
+        with a verify window of 8, so each query token is its own sequence and
+        re-reads KV. CUDA-graph capture is refused: the plan allocates.
+        """
+        if not get_bool_env_var("SGLANG_AITER_VERIFY_SPLITKV", "1"):
+            return False
+        if self.use_mla or self.kv_cache_is_vectorized_5d or self.page_size != 1:
+            return False
+        if self.topk not in (None, 1):
+            return False
+        if sinks is not None or layer.logit_cap:
+            return False
+        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+            return False
+        if layer.qk_head_dim != layer.v_head_dim:
+            return False
+        md = self.forward_metadata
+        if md is None or md.qo_indptr is None or md.custom_mask is not None:
+            return False
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+
+        return not get_is_capture_mode()
+
+    def _build_verify_splitkv_plan(self, forward_batch: ForwardBatch):
+        """One paged sequence per query token. Query w sees prefix+w+1 KV."""
+        md = self.forward_metadata
+        bs = len(forward_batch.req_pool_indices)
+        qo = md.qo_indptr
+        if qo.shape[0] < bs + 1:
+            return None
+        device = qo.device
+        verify_lens = (qo[1 : bs + 1] - qo[:bs]).to(torch.int32)
+        if verify_lens.numel() == 0:
+            return None
+        n_tokens = int(qo[bs].item())
+        if n_tokens <= 0:
+            return None
+        slot = torch.arange(bs, device=device).repeat_interleave(verify_lens)
+        if slot.shape[0] != n_tokens:
+            return None
+        starts = qo[:bs].to(torch.int32)
+        pos = torch.arange(n_tokens, device=device, dtype=torch.int32) - starts[slot]
+        seq_lens = forward_batch.seq_lens[:bs].to(device=device, dtype=torch.int32)
+        kv_lens = seq_lens[slot] + pos + 1
+        kv_indptr = torch.empty(n_tokens + 1, dtype=torch.int32, device=device)
+        kv_indptr[0] = 0
+        kv_indptr[1:] = torch.cumsum(kv_lens, dim=0)
+        total = int(kv_indptr[-1].item())
+        if total <= 0:
+            return None
+        req_q = forward_batch.req_pool_indices[:bs].to(device=device)
+        req_q = req_q.repeat_interleave(verify_lens)
+        kv_indices = torch.empty(total, dtype=self.req_to_token.dtype, device=device)
+        create_flashinfer_kv_indices_triton[(n_tokens, 4)](
+            self.req_to_token,
+            req_q,
+            kv_lens,
+            kv_indptr,
+            None,
+            kv_indices,
+            self.req_to_token.stride(0),
+            TOKEN_BLOCK_PARALLEL=True,
+        )
+        if kv_indices.dtype != torch.int32:
+            kv_indices = kv_indices.to(torch.int32)
+        return n_tokens, kv_indptr, kv_indices
+
+    def _verify_splitkv_workspace(self, n_tokens: int, num_heads: int, head_size: int):
+        nparts = self.max_num_partitions
+        nbytes = (
+            n_tokens * num_heads * nparts * head_size * 4
+            + 2 * n_tokens * num_heads * nparts * 4
+        )
+        buf = getattr(self, "_verify_splitkv_workspace_buf", None)
+        if buf is None or buf.numel() < nbytes:
+            self._verify_splitkv_workspace_buf = torch.empty(
+                nbytes, dtype=torch.uint8, device=self.device
+            )
+        return self._verify_splitkv_workspace_buf
+
+    def _forward_target_verify_splitkv(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        sinks,
+    ) -> bool:
+        if not self._verify_splitkv_eligible(layer, sinks):
+            return False
+        plan = getattr(self.forward_metadata, "_splitkv_plan", None)
+        if plan is None:
+            plan = self._build_verify_splitkv_plan(forward_batch)
+            if plan is None:
+                return False
+            self.forward_metadata._splitkv_plan = plan
+            if not getattr(self, "_verify_splitkv_logged", False):
+                n_logged, kv_indptr_logged, _ = plan
+                logger.info(
+                    "AITER_VERIFY_SPLITKV n_tokens=%s index_tokens=%s partitions=%s",
+                    n_logged,
+                    int(kv_indptr_logged[-1].item()),
+                    self.max_num_partitions,
+                )
+                self._verify_splitkv_logged = True
+        n_tokens, kv_indptr, kv_indices = plan
+        q3 = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        if q3.shape[0] != n_tokens:
+            if not getattr(self, "_verify_splitkv_skip_logged", False):
+                logger.info(
+                    "AITER_VERIFY_SPLITKV skip q_tokens=%s plan_tokens=%s",
+                    int(q3.shape[0]),
+                    n_tokens,
+                )
+                self._verify_splitkv_skip_logged = True
+            return False
+        if not q3.is_contiguous():
+            q3 = q3.contiguous()
+        out3 = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+        write = out3 if out3.is_contiguous() else torch.empty_like(q3)
+        k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
+        k_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
+        v_descale = layer.v_scale if layer.v_scale is not None else self.v_scale
+        workspace = self._verify_splitkv_workspace(
+            n_tokens, layer.tp_q_head_num, layer.v_head_dim
+        )
+        paged_attention_ragged(
+            write,
+            workspace,
+            q3,
+            k_cache.view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
+            v_cache.view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
+            float(layer.scaling),
+            kv_indptr,
+            kv_indices,
+            self.kv_last_page_len,
+            1,
+            self.max_num_partitions,
+            None,
+            self._get_aiter_paged_ragged_kv_cache_dtype(),
+            "NHD",
+            0.0,
+            k_descale,
+            v_descale,
+            None,
+            _AITER_PARTITION_SIZE_ROCM,
+            1,
+        )
+        if write is not out3:
+            out3.copy_(write)
+        return True
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -4296,6 +4453,11 @@ class AiterAttnBackend(AttentionBackend):
                     return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
                 self._reject_target_verify_cross_layer_kv(k, v)
+
+                if self._forward_target_verify_splitkv(
+                    q, o, layer, forward_batch, sinks
+                ):
+                    return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
                 self.extend_attention_fwd(
                     q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
