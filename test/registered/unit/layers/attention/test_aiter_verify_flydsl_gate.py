@@ -14,7 +14,10 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
-from sglang.srt.layers.attention.aiter_utils import flydsl_block_table
+from sglang.srt.layers.attention.aiter_utils import (
+    flydsl_block_table,
+    flydsl_verify_live_batch,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -96,6 +99,23 @@ class TestAiterVerifyFlydslGate(CustomTestCase):
     def test_eager_passes(self):
         with _stub_capture(False):
             _backend()._flydsl_require_eager()
+
+
+class TestFlydslVerifyLiveBatch(CustomTestCase):
+    def test_uniform_matches_pool(self):
+        self.assertEqual(flydsl_verify_live_batch(32, 8, 4), 4)
+
+    def test_trailing_pool_slot_uses_query_prefix(self):
+        # GSM8K conc4 crashed with q=24 and a 4-wide plan (need 32).
+        self.assertEqual(flydsl_verify_live_batch(24, 8, 4), 3)
+
+    def test_ragged_rows_raise(self):
+        with self.assertRaises(ValueError):
+            flydsl_verify_live_batch(22, 8, 4)
+
+    def test_live_wider_than_pool_raises(self):
+        with self.assertRaises(ValueError):
+            flydsl_verify_live_batch(32, 8, 3)
 
 
 class TestFlydslBlockTable(CustomTestCase):
