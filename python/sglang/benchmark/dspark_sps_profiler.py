@@ -1107,12 +1107,23 @@ def postprocess_round(
         graph_tier = aligned_verify_tokens.pop()
         budget = int(frac * batch_size_per_rank * (verify_num_draft_tokens - 1))
         batch_tokens = batch_size_per_rank + budget
+        full_tokens = batch_size_per_rank * verify_num_draft_tokens
         if graph_tier < batch_tokens:
             raise RuntimeError(
                 f"Round bs={batch_size} frac={frac}: replayed graph tier "
                 f"{graph_tier} is smaller than the pinned M={batch_tokens} "
                 f"(= {batch_size_per_rank} + int({frac} * {batch_size_per_rank} "
                 f"* {verify_num_draft_tokens - 1})); the budget pin did not take."
+            )
+        # CUDA-graph buckets may round the pin up by a few tokens. Measuring
+        # the entire draft window on a shorter pin means the verify-all
+        # layout ignored dspark_force_budget_frac (uninitialized SPS table).
+        if batch_tokens < full_tokens - 1 and graph_tier >= full_tokens:
+            raise RuntimeError(
+                f"Round bs={batch_size} frac={frac}: measured num_verify_tokens="
+                f"{graph_tier}, the full window {full_tokens}, while the pin "
+                f"asked for M={batch_tokens}. The compact verify-all layout "
+                "ignored dspark_force_budget_frac."
             )
     else:
         batch_tokens = expected_tokens
