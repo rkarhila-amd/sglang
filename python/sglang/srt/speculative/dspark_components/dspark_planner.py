@@ -377,6 +377,13 @@ class DSparkVerifyPlanner:
             )
         )
 
+    def _forced_budget_pin_active(self) -> bool:
+        # The width profiler sets this while the SPS table is still the
+        # uninitialized sentinel. Verify-all would ignore the pin and every
+        # frac would measure the full draft window.
+        planner = self._budget_planner
+        return planner is not None and planner.forced_budget_frac is not None
+
     def schedule_layout(
         self,
         *,
@@ -390,7 +397,11 @@ class DSparkVerifyPlanner:
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
-        if self._is_verify_all and self._ragged_verify_mode is RaggedVerifyMode.COMPACT:
+        if (
+            self._is_verify_all
+            and self._ragged_verify_mode is RaggedVerifyMode.COMPACT
+            and not self._forced_budget_pin_active()
+        ):
             # Verify-all: the uniform layout (or None, past the captured grid)
             # is constant per (bs, tier); serve it from cache instead of paying
             # the per-step schedule and its host<->device round-trips.
@@ -405,6 +416,18 @@ class DSparkVerifyPlanner:
                     tier_num_reqs=global_num_reqs,
                 )
             return self._uniform_layout_cache[key]
+        if (
+            self._is_verify_all
+            and self._ragged_verify_mode is RaggedVerifyMode.COMPACT
+            and self._forced_budget_pin_active()
+            and not getattr(self, "_logged_force_budget_pin", False)
+        ):
+            self._logged_force_budget_pin = True
+            logger.info(
+                "DSpark force-budget pin is active on the verify-all path; "
+                "scheduling verify lengths from dspark_force_budget_frac "
+                "instead of the uniform full window."
+            )
         verify_lens = self._schedule_verify_lens(
             req_pool_indices=req_pool_indices,
             prefix_lens=prefix_lens,
