@@ -317,8 +317,10 @@ class FlydslPaDecode:
 
     def __init__(self):
         self._plans: dict = {}
-        self._scratch = None
-        self._scratch_key = None
+        # One scratch set per (heads, capacity, query rows). A ragged verify
+        # step launches two widths; swapping a single buffer would allocate
+        # on every layer.
+        self._scratch_cache: dict = {}
 
     def run(
         self,
@@ -386,16 +388,19 @@ class FlydslPaDecode:
             query.dtype,
             query.device,
         )
-        if self._scratch_key != scratch_key:
+        cached = self._scratch_cache.get(scratch_key)
+        if cached is None:
             scalar = (num_kv_heads, int(plan.capacity), rows)
             exp_sums = torch.empty(scalar, dtype=torch.float32, device=query.device)
-            self._scratch = (
+            cached = (
                 exp_sums,
                 torch.empty_like(exp_sums),
                 torch.empty(*scalar, head_dim, dtype=query.dtype, device=query.device),
             )
-            self._scratch_key = scratch_key
-        exp_sums, max_logits, temporary = self._scratch
+            self._scratch_cache[scratch_key] = cached
+            if len(self._scratch_cache) > 16:
+                self._scratch_cache.pop(next(iter(self._scratch_cache)))
+        exp_sums, max_logits, temporary = cached
 
         pa_decode(
             out,
@@ -424,7 +429,7 @@ def flydsl_verify_live_batch(q_rows: int, qlen: int, pool_bs: int) -> int:
     pool slot in place, so a 24-row query at width 8 is 3 requests even when
     ``req_pool_indices`` still has 4. Those query rows are packed in pool
     order, so the kernel reads the prefix. A ragged width is not a multiple
-    of ``qlen`` and is rejected.
+    of ``qlen``; ``flydsl_verify_width_groups`` launches those.
     """
     if qlen < 1:
         raise ValueError(f"query length must be positive, got {qlen}")
@@ -442,6 +447,69 @@ def flydsl_verify_live_batch(q_rows: int, qlen: int, pool_bs: int) -> int:
             f"(query rows {q_rows}, qlen {qlen})"
         )
     return live
+
+
+def flydsl_verify_width_groups(
+    qo_vals: list[int],
+    q_rows: int,
+    pool_bs: int,
+) -> tuple[int, list[tuple[int, list[int]]]]:
+    """Live batch and ``(width, request positions)`` groups from ``qo_indptr``.
+
+    The live batch is the first index whose prefix sum equals ``q_rows``.
+    Requests that share a width are one ``pa_decode`` launch. The width is
+    the indptr delta, never rounded up to the batch max: a 7-token request
+    must not read an eighth KV token. Positions within a group stay in pool
+    order. Groups are ordered by the first request of that width.
+    """
+    if q_rows < 1:
+        raise ValueError(f"query rows must be positive, got {q_rows}")
+    if pool_bs < 1:
+        raise ValueError(f"verify pool must be positive, got {pool_bs}")
+    if len(qo_vals) < 2:
+        raise ValueError("verify qo_indptr is missing")
+    limit = min(pool_bs, len(qo_vals) - 1)
+    bs = None
+    for i in range(1, limit + 1):
+        if qo_vals[i] == q_rows:
+            bs = i
+            break
+        if qo_vals[i] > q_rows:
+            raise ValueError(
+                f"qo_indptr jumps over {q_rows} query rows at request {i} "
+                f"(qo={qo_vals[: i + 1]}, pool {pool_bs})"
+            )
+    if bs is None:
+        raise ValueError(
+            f"qo_indptr does not cover {q_rows} query rows "
+            f"(pool {pool_bs}, prefix {qo_vals[: min(8, len(qo_vals))]})"
+        )
+    buckets: dict[int, list[int]] = {}
+    order: list[int] = []
+    for i in range(bs):
+        width = qo_vals[i + 1] - qo_vals[i]
+        if width < 1:
+            raise ValueError(
+                f"verify width at request {i} is {width} (qo={qo_vals[: bs + 1]})"
+            )
+        if width not in buckets:
+            order.append(width)
+            buckets[width] = []
+        buckets[width].append(i)
+    return bs, [(width, buckets[width]) for width in order]
+
+
+def flydsl_group_row_indices(
+    qo_vals: list[int], width: int, positions: list[int]
+) -> list[int]:
+    """Query-row ids for one width group. Not a contiguous slice when a
+    different width sits between two members.
+    """
+    rows: list[int] = []
+    for i in positions:
+        start = qo_vals[i]
+        rows.extend(range(start, start + width))
+    return rows
 
 
 def flydsl_block_table(
