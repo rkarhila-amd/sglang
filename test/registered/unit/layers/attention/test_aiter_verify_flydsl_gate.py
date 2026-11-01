@@ -17,6 +17,8 @@ from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
 from sglang.srt.layers.attention.aiter_utils import (
     flydsl_block_table,
     flydsl_group_row_indices,
+    flydsl_note_scratch,
+    flydsl_use_graph_bound,
     flydsl_verify_live_batch,
     flydsl_verify_width_groups,
 )
@@ -95,14 +97,80 @@ class TestAiterVerifyFlydslGate(CustomTestCase):
     def test_sliding_window_disabled_passes(self):
         _backend()._flydsl_require_layer(_layer(sliding_window_size=-1), None)
 
-    def test_capture_raises(self):
-        with _stub_capture(True):
+    def test_stream_capture_raises(self):
+        # Ragged and extend still sync. Only an actual stream capture refuses
+        # them. The session capture flag is also set in a breakable eager gap.
+        import sglang.srt.layers.attention.aiter_backend as backend_mod
+
+        previous = backend_mod.flydsl_stream_capturing
+        backend_mod.flydsl_stream_capturing = lambda: True
+        try:
             with self.assertRaises(RuntimeError):
                 _backend()._flydsl_require_eager()
+        finally:
+            backend_mod.flydsl_stream_capturing = previous
+
+    def test_capture_mode_flag_does_not_raise(self):
+        with _stub_capture(True):
+            _backend()._flydsl_require_eager()
 
     def test_eager_passes(self):
         with _stub_capture(False):
             _backend()._flydsl_require_eager()
+
+    def test_ragged_verify_graph_stays_off(self):
+        self.assertFalse(AiterAttnBackend.supports_ragged_verify_graph)
+
+
+class TestFlydslGraphBound(CustomTestCase):
+    def test_full_graph_uses_the_bound(self):
+        self.assertTrue(
+            flydsl_use_graph_bound(
+                stream_capturing=False, capture_mode=True, breakable=False
+            )
+        )
+        self.assertTrue(
+            flydsl_use_graph_bound(
+                stream_capturing=True, capture_mode=True, breakable=False
+            )
+        )
+
+    def test_breakable_gap_keeps_the_measured_length(self):
+        self.assertFalse(
+            flydsl_use_graph_bound(
+                stream_capturing=False, capture_mode=True, breakable=True
+            )
+        )
+
+    def test_eager_keeps_the_measured_length(self):
+        self.assertFalse(
+            flydsl_use_graph_bound(
+                stream_capturing=False, capture_mode=False, breakable=False
+            )
+        )
+
+    def test_capture_max_is_the_shorter_of_context_and_table(self):
+        backend = _backend()
+        backend.max_context_len = 8192
+        backend.req_to_token = torch.zeros(4, 1000)
+        self.assertEqual(backend._flydsl_capture_max_context(), 1000)
+        backend._flydsl_capture_max_cached = None
+        backend.req_to_token = torch.zeros(4, 9000)
+        self.assertEqual(backend._flydsl_capture_max_context(), 8192)
+
+    def test_pinned_scratch_is_not_evicted(self):
+        cache: dict = {}
+        pinned: dict = {}
+        for i in range(16):
+            flydsl_note_scratch(cache, pinned, i, i, pin=True)
+        self.assertEqual(len(cache), 16)
+        flydsl_note_scratch(cache, pinned, 16, 16, pin=False)
+        self.assertEqual(len(cache), 17)
+        self.assertIn(0, cache)
+        flydsl_note_scratch(cache, pinned, 17, 17, pin=False)
+        self.assertNotIn(16, cache)
+        self.assertIn(0, cache)
+        self.assertIn(17, cache)
 
 
 class TestFlydslVerifyLiveBatch(CustomTestCase):
@@ -207,7 +275,7 @@ class TestFlydslGroupedVerifyLaunch(CustomTestCase):
         self.heads = 2
         self.dim = 4
 
-    def _run(self, widths, q_rows, pool_bs, qlen, seq, pool_ids=None):
+    def _run(self, widths, q_rows, pool_bs, qlen, seq, pool_ids=None, graph_bound=False):
         qo = _qo(widths)
         if pool_ids is None:
             pool_ids = list(range(pool_bs))
@@ -247,6 +315,7 @@ class TestFlydslGroupedVerifyLaunch(CustomTestCase):
                     "rows": int(q3.shape[0]),
                     "q_ids": [int(v) for v in q3[:, 0, 0].tolist()],
                     "ctx": [int(v) for v in context.tolist()],
+                    "max_context": max_context,
                     "req": None
                     if req_indices is None
                     else [int(v) for v in req_indices.tolist()],
@@ -255,6 +324,9 @@ class TestFlydslGroupedVerifyLaunch(CustomTestCase):
             o_in.reshape(-1, heads, dim).fill_(float(query_length))
 
         backend._flydsl_launch = fake_launch
+        if graph_bound:
+            backend._flydsl_graph_bound = lambda: True
+            backend._flydsl_capture_max_context = lambda: 4096
         fb = SimpleNamespace(
             req_pool_indices=torch.tensor(pool_ids, dtype=torch.int64),
             seq_lens=torch.tensor(seq, dtype=torch.int32),
@@ -307,7 +379,19 @@ class TestFlydslGroupedVerifyLaunch(CustomTestCase):
         self.assertEqual(self.calls[0]["qlen"], 8)
         self.assertEqual(self.calls[0]["rows"], 24)
         self.assertEqual(self.calls[0]["ctx"], [18, 28, 38])
+        self.assertEqual(self.calls[0]["max_context"], 38)
         self.assertIsNone(self.calls[0]["req"])
+        self.assertTrue(torch.all(o[:, 0, 0] == 8))
+
+    def test_graph_bound_keeps_lengths_and_bakes_host_max(self):
+        # Eager max of this batch is 38. A captured graph has to specialize
+        # on the host bound instead, without padding the per-request lengths.
+        o = self._run(
+            [8, 8, 8, 8], 24, 4, 8, [10, 20, 30, 40], graph_bound=True
+        )
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0]["ctx"], [18, 28, 38])
+        self.assertEqual(self.calls[0]["max_context"], 4096)
         self.assertTrue(torch.all(o[:, 0, 0] == 8))
 
     def test_sum_divisible_by_max_still_groups(self):
