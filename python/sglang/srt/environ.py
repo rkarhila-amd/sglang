@@ -549,6 +549,13 @@ class Envs:
     # length; any other request keeps the planner length. The SPS token
     # budget does not cap an overridden row.
     SGLANG_DSPARK_ORACLE_VERIFY_LENS = EnvStr("")
+    # Debug: append one JSON object per decode step. Empty disables it.
+    # Attention-TP rank 0 only. Each line has the batch size, the SPS cost
+    # terms at the chosen budget (bias, alpha, theta, predicted step, score),
+    # and per request the rid, confidence, survival, verify length, and the
+    # accept length from that step. A host sync of those small tensors runs
+    # on every step while the path is set.
+    SGLANG_DSPARK_PLANNER_JSONL = EnvStr("")
     SGLANG_DSPARK_LOG_SPS_PRED_INTERVAL = EnvInt(0)
     SGLANG_DSPARK_STS_COLLECT_PATH = EnvStr("")
     SGLANG_DSPARK_BLOCK_ACCEPT_ESTIMATE_PATH = EnvStr("")

@@ -1048,6 +1048,13 @@ class VerifyBudgetDecision(msgspec.Struct):
     budget: int
     predicted_step_seconds: Optional[float] = None
     predicted_theta: Optional[float] = None
+    # Additive table only. bias + alpha(bs) + theta(bs + budget) is the
+    # predicted step. predicted_theta is the score tau_star / step_time,
+    # not the theta term. m_tokens is bs + budget before probe clamping.
+    bias_seconds: Optional[float] = None
+    alpha_seconds: Optional[float] = None
+    theta_seconds: Optional[float] = None
+    m_tokens: Optional[int] = None
 
 
 def _table_is_full_window_only(sps_table: SpsCostTable, max_verify_len: int) -> bool:
@@ -1115,6 +1122,10 @@ def compute_verify_token_budget(
     tau_star = num_requests + torch.cat(
         [torch.zeros(1, dtype=torch.float64), prefix_sum]
     )
+    bias_seconds = None
+    alpha_seconds = None
+    theta_seconds = None
+    m_tokens = None
     if isinstance(sps_table, SpsAdditiveCostTable):
         step_time = _additive_step_time_tensor(
             table=sps_table,
@@ -1124,6 +1135,14 @@ def compute_verify_token_budget(
         theta = tau_star / step_time
         idx = int(torch.argmax(theta))
         predicted_step_seconds = float(step_time[idx])
+        m_tokens = int(num_requests) + int(idx)
+        bias_seconds = float(sps_table.bias_seconds)
+        alpha_seconds = _interp_clamped(
+            sps_table.bs_probes, sps_table.alpha_seconds, float(num_requests)
+        )
+        theta_seconds = _interp_clamped(
+            sps_table.m_probes, sps_table.theta_seconds, float(m_tokens)
+        )
     else:
         batch_tokens = _sps_batch_tokens_for_budgets(
             sps_table=sps_table,
@@ -1140,6 +1159,10 @@ def compute_verify_token_budget(
         budget=idx,
         predicted_step_seconds=predicted_step_seconds,
         predicted_theta=float(theta[idx]),
+        bias_seconds=bias_seconds,
+        alpha_seconds=alpha_seconds,
+        theta_seconds=theta_seconds,
+        m_tokens=m_tokens,
     )
 
 

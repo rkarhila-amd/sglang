@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
 import math
+import os
 import statistics
 import time
 from collections import deque
@@ -725,6 +727,147 @@ class ConfidenceMetricsProbe:
 _STS_COLLECT_FLUSH_EVERY: int = 256
 
 
+def _jsonl_round(value: Optional[float], digits: int) -> Optional[float]:
+    if value is None:
+        return None
+    return round(float(value), digits)
+
+
+def _tensor_rows(value: Optional[torch.Tensor]) -> Optional[list]:
+    if value is None:
+        return None
+    return value.detach().to("cpu").tolist()
+
+
+class PlannerJsonlWriter:
+    """Append one planner record per decode step. Off unless the path is set.
+
+    Attention-TP rank 0 writes. Other ranks construct a disabled writer.
+    Opening the file fails the process so a bad path is visible at boot.
+    A later write error is logged once and then the writer disables itself.
+    """
+
+    def __init__(self, *, path: str, attn_tp_rank: int) -> None:
+        self._path = path
+        self._fp = None
+        self._warned = False
+        self.enabled = bool(path) and int(attn_tp_rank) == 0
+        if not self.enabled:
+            return
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        self._fp = open(path, "a", encoding="utf-8")
+        logger.info("DSpark planner JSONL writing to %s", path)
+
+    def write_step(
+        self,
+        *,
+        forward_ct: int,
+        bs: int,
+        mode: str,
+        budget: Optional[int],
+        decision,
+        rids: Optional[list],
+        verify_lens: Optional[torch.Tensor],
+        confidence: Optional[torch.Tensor],
+        commit_lens: torch.Tensor,
+        correct_len: Optional[torch.Tensor],
+        fallback_verify_len: int,
+    ) -> None:
+        if not self.enabled or self._fp is None:
+            return
+        try:
+            record = self._record(
+                forward_ct=forward_ct,
+                bs=bs,
+                mode=mode,
+                budget=budget,
+                decision=decision,
+                rids=rids,
+                verify_lens=verify_lens,
+                confidence=confidence,
+                commit_lens=commit_lens,
+                correct_len=correct_len,
+                fallback_verify_len=fallback_verify_len,
+            )
+            self._fp.write(json.dumps(record, separators=(",", ":")) + "\n")
+            self._fp.flush()
+        except Exception:
+            if not self._warned:
+                self._warned = True
+                logger.exception("DSpark planner JSONL write failed; disabling")
+            self.enabled = False
+
+    def _record(
+        self,
+        *,
+        forward_ct: int,
+        bs: int,
+        mode: str,
+        budget: Optional[int],
+        decision,
+        rids: Optional[list],
+        verify_lens: Optional[torch.Tensor],
+        confidence: Optional[torch.Tensor],
+        commit_lens: torch.Tensor,
+        correct_len: Optional[torch.Tensor],
+        fallback_verify_len: int,
+    ) -> dict:
+        lens_rows = _tensor_rows(verify_lens)
+        conf_rows = _tensor_rows(confidence)
+        acc_rows = _tensor_rows(commit_lens)
+        correct_rows = _tensor_rows(correct_len)
+        sps = None
+        if decision is not None:
+            sps = {
+                "bias_s": _jsonl_round(decision.bias_seconds, 6),
+                "alpha_s": _jsonl_round(decision.alpha_seconds, 6),
+                "theta_s": _jsonl_round(decision.theta_seconds, 6),
+                "m": decision.m_tokens,
+                "predicted_step_s": _jsonl_round(decision.predicted_step_seconds, 6),
+                "score": _jsonl_round(decision.predicted_theta, 6),
+            }
+        reqs: list[dict] = []
+        for row in range(int(bs)):
+            conf = None if conf_rows is None else conf_rows[row]
+            survival = None
+            if not isinstance(conf, list):
+                conf = None
+            if conf is not None:
+                running = 1.0
+                survival = []
+                for prob in conf:
+                    running *= float(prob)
+                    survival.append(round(running, 4))
+                conf = [round(float(prob), 4) for prob in conf]
+            if lens_rows is None:
+                verify_len = int(fallback_verify_len)
+            else:
+                verify_len = int(lens_rows[row])
+            reqs.append(
+                {
+                    "rid": None if rids is None else rids[row],
+                    "verify_len": verify_len,
+                    "acc_len": int(acc_rows[row]),
+                    "correct_drafts": (
+                        None if correct_rows is None else int(correct_rows[row])
+                    ),
+                    "confidence": conf,
+                    "survival": survival,
+                }
+            )
+        return {
+            "v": 1,
+            "forward_ct": int(forward_ct),
+            "bs": int(bs),
+            "mode": mode,
+            "budget": None if budget is None else int(budget),
+            "sps": sps,
+            "reqs": reqs,
+        }
+
+
 class DsparkStepObservers:
     """Facade over the per-step observability sinks (info dumper, confidence
     probe, STS collection, block-accept estimator). The worker's decode path
@@ -751,11 +894,16 @@ class DsparkStepObservers:
             verify_num_draft_tokens=verify_num_draft_tokens,
             tp_rank=tp_rank,
         )
+        attn_tp_rank = get_parallel().attn_tp_rank
+        self._planner_jsonl = PlannerJsonlWriter(
+            path=envs.SGLANG_DSPARK_PLANNER_JSONL.get(),
+            attn_tp_rank=attn_tp_rank,
+        )
         self._info_dumper = DsparkInfoDumper(
             components=resolve_enabled_components(),
             gamma=gamma,
             verify_num_draft_tokens=verify_num_draft_tokens,
-            attn_tp_rank=get_parallel().attn_tp_rank,
+            attn_tp_rank=attn_tp_rank,
             device=device,
             mode_value=planner.mode_value,
             sps_report_interval=envs.SGLANG_DSPARK_LOG_SPS_PRED_INTERVAL.get(),
@@ -886,8 +1034,25 @@ class DsparkStepObservers:
                 prefix_lens=prefix_lens,
                 layout=layout,
             )
+        want_decision = self._planner_jsonl.enabled or self._info_dumper.enabled
+        budget_decision = planner.take_budget_decision() if want_decision else None
+        if self._planner_jsonl.enabled:
+            self._planner_jsonl.write_step(
+                forward_ct=forward_ct,
+                bs=bs,
+                mode=planner.mode_value,
+                budget=verify_token_budget,
+                decision=budget_decision,
+                rids=(
+                    [req.rid for req in reqs] if len(reqs) == bs else None
+                ),
+                verify_lens=layout.verify_lens if layout is not None else None,
+                confidence=confidence,
+                commit_lens=commit_lens,
+                correct_len=correct_len,
+                fallback_verify_len=self._verify_num_draft_tokens,
+            )
         if self._info_dumper.enabled:
-            budget_decision = planner.take_budget_decision()
             predicted_step_ms = (
                 None
                 if budget_decision is None
