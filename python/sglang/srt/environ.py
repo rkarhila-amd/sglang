@@ -544,6 +544,11 @@ class Envs:
     SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS = EnvBool(False)
     SGLANG_DSPARK_DEBUG_DUMP = EnvTuple(tuple())
+    # Debug oracle: "copy=8,summary_ja=4". Empty leaves the SPS planner in
+    # charge. A request whose rid is okind:<kind>:<id> takes that verify
+    # length; any other request keeps the planner length. The SPS token
+    # budget does not cap an overridden row.
+    SGLANG_DSPARK_ORACLE_VERIFY_LENS = EnvStr("")
     SGLANG_DSPARK_LOG_SPS_PRED_INTERVAL = EnvInt(0)
     SGLANG_DSPARK_STS_COLLECT_PATH = EnvStr("")
     SGLANG_DSPARK_BLOCK_ACCEPT_ESTIMATE_PATH = EnvStr("")
