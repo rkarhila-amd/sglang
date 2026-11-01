@@ -71,6 +71,7 @@ from sglang.srt.speculative.dspark_components.dspark_observability import (
 )
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkVerifyPlanner,
+    kind_from_oracle_rid,
     alloc_verify_window,
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
@@ -1095,6 +1096,20 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_pool_indices=batch.req_pool_indices,
         )
 
+        task_kinds = None
+        if self._verify_planner._oracle_verify_lens:
+            if len(batch.reqs) == bs:
+                task_kinds = [
+                    kind_from_oracle_rid(getattr(req, "rid", None))
+                    for req in batch.reqs
+                ]
+            elif not getattr(self, "_logged_oracle_req_mismatch", False):
+                self._logged_oracle_req_mismatch = True
+                logger.warning(
+                    "DSpark oracle skipped: %d reqs != batch bs %d.",
+                    len(batch.reqs),
+                    bs,
+                )
         layout = self._verify_planner.schedule_layout(
             req_pool_indices=batch.req_pool_indices,
             prefix_lens=prefix_lens,
@@ -1103,6 +1118,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             budget=verify_token_budget,
             global_num_reqs=global_num_reqs,
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
+            task_kinds=task_kinds,
         )
         run_compact = self._verify_planner.should_run_compact(layout=layout)
 

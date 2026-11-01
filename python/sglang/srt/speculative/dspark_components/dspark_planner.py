@@ -55,6 +55,58 @@ logger = logging.getLogger(__name__)
 # Scheduled verify lengths must not exceed the per-step token budget.
 _VERIFY_LEN_BUDGET = Invariant("dspark.verify_len_budget", Bucket.GUARD, IsTrue())
 
+# Client marks a book-easyhard kind without touching the radix extra_key.
+# extra_key would split the shared prefix cache. Format: okind:<kind>:<id>
+_ORACLE_RID_PREFIX = "okind:"
+
+
+def parse_oracle_verify_lens(spec: str) -> dict[str, int]:
+    """Parse SGLANG_DSPARK_ORACLE_VERIFY_LENS. Empty spec is the planner."""
+    text = (spec or "").strip()
+    if not text:
+        return {}
+    out: dict[str, int] = {}
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise ValueError(
+                "SGLANG_DSPARK_ORACLE_VERIFY_LENS entries must be kind=length, "
+                f"got {part!r}"
+            )
+        kind, raw = part.split("=", 1)
+        kind = kind.strip()
+        try:
+            length = int(raw.strip())
+        except ValueError as exc:
+            raise ValueError(
+                "SGLANG_DSPARK_ORACLE_VERIFY_LENS length for "
+                f"{kind!r} is not an int ({raw.strip()!r})"
+            ) from exc
+        if not kind or length < 1:
+            raise ValueError(
+                "SGLANG_DSPARK_ORACLE_VERIFY_LENS needs a non-empty kind and "
+                f"a length >= 1, got kind={kind!r} length={length}"
+            )
+        if kind in out:
+            raise ValueError(
+                f"SGLANG_DSPARK_ORACLE_VERIFY_LENS repeats kind {kind!r}"
+            )
+        out[kind] = length
+    return out
+
+
+def kind_from_oracle_rid(rid: Optional[str]) -> Optional[str]:
+    """Return the kind in an okind:<kind>:<id> request id, else None."""
+    if not isinstance(rid, str) or not rid.startswith(_ORACLE_RID_PREFIX):
+        return None
+    rest = rid[len(_ORACLE_RID_PREFIX) :]
+    kind, sep, unique = rest.partition(":")
+    if not sep or not kind or not unique:
+        return None
+    return kind
+
 
 class VerifyWindow(msgspec.Struct, frozen=True):
     positions_2d: torch.Tensor
@@ -83,6 +135,14 @@ class DSparkVerifyPlanner:
         self.device = device
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self._tp_sync = tp_sync
+        self._tp_rank = tp_rank
+        self._oracle_verify_lens = parse_oracle_verify_lens(
+            envs.SGLANG_DSPARK_ORACLE_VERIFY_LENS.get()
+        )
+        self._logged_oracle_step = False
+        self._logged_oracle_static = False
+        self._logged_oracle_mismatch = False
+        self._logged_oracle_clamp = False
         self._align_verify_tokens_to_graph_tier = (
             get_spec().speculative_dspark_align_verify_tokens_to_graph_tier
         )
@@ -175,6 +235,17 @@ class DSparkVerifyPlanner:
                 and get_parallel().pp_size == 1
                 and not envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
             )
+            if tp_rank == 0 and self._oracle_verify_lens:
+                logger.info(
+                    "DSpark oracle verify lengths active: %s. "
+                    "A request rid okind:<kind>:<id> uses that length; "
+                    "untagged requests keep the planner length. "
+                    "The SPS token budget does not cap an overridden row.",
+                    ",".join(
+                        f"{kind}={length}"
+                        for kind, length in self._oracle_verify_lens.items()
+                    ),
+                )
             if tp_rank == 0:
                 sps_table_source = (
                     get_spec().speculative_dspark_sps_table_path or "uninitialized"
@@ -382,13 +453,22 @@ class DSparkVerifyPlanner:
         budget: Optional[int],
         global_num_reqs: Optional[int] = None,
         dp_tier_num_tokens: Optional[int] = None,
+        task_kinds: Optional[list[Optional[str]]] = None,
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
+            if self._oracle_verify_lens and not self._logged_oracle_static:
+                self._logged_oracle_static = True
+                if self._tp_rank == 0:
+                    logger.warning(
+                        "DSpark oracle verify lengths are set but ragged "
+                        "verify mode is static; the oracle is ignored."
+                    )
             return None
         if (
             self._is_verify_all
             and self._ragged_verify_mode is RaggedVerifyMode.COMPACT
             and not self._forced_budget_pin_active()
+            and not self._oracle_verify_lens
         ):
             # Verify-all: the uniform layout (or None, past the captured grid)
             # is constant per (bs, tier); serve it from cache instead of paying
@@ -427,6 +507,7 @@ class DSparkVerifyPlanner:
                 global_num_reqs=global_num_reqs,
                 dp_tier_num_tokens=dp_tier_num_tokens,
             ),
+            task_kinds=task_kinds,
         )
         if verify_lens is None:
             assert dp_tier_num_tokens is None, (
@@ -546,6 +627,60 @@ class DSparkVerifyPlanner:
             min_verify_len=self._schedule_cfg.min_verify_len,
         )
 
+    def _apply_oracle_verify_lens(
+        self,
+        *,
+        verify_lens: Optional[torch.Tensor],
+        task_kinds: Optional[list[Optional[str]]],
+        device: torch.device,
+    ) -> tuple[Optional[torch.Tensor], int]:
+        table = self._oracle_verify_lens
+        if not table or not task_kinds:
+            return verify_lens, 0
+        if (
+            verify_lens is not None
+            and int(verify_lens.shape[0]) != len(task_kinds)
+        ):
+            if not self._logged_oracle_mismatch and self._tp_rank == 0:
+                self._logged_oracle_mismatch = True
+                logger.warning(
+                    "DSpark oracle kind count %d != verify_lens %d; "
+                    "leaving the planner lengths.",
+                    len(task_kinds),
+                    int(verify_lens.shape[0]),
+                )
+            return verify_lens, 0
+        max_len = self._schedule_cfg.resolved_max_verify_len()
+        min_len = max(self._schedule_cfg.min_verify_len, 1)
+        planned = None
+        if verify_lens is not None:
+            planned = verify_lens.detach().to(dtype=torch.int32).tolist()
+        out: list[int] = []
+        n_hit = 0
+        for index, kind in enumerate(task_kinds):
+            if kind in table:
+                length = table[kind]
+                if length < min_len or length > max_len:
+                    if not self._logged_oracle_clamp and self._tp_rank == 0:
+                        self._logged_oracle_clamp = True
+                        logger.warning(
+                            "DSpark oracle length %s=%d clamped to [%d, %d].",
+                            kind,
+                            length,
+                            min_len,
+                            max_len,
+                        )
+                    length = min(max(length, min_len), max_len)
+                out.append(length)
+                n_hit += 1
+            elif planned is None:
+                return None, 0
+            else:
+                out.append(int(planned[index]))
+        if n_hit == 0:
+            return verify_lens, 0
+        return torch.tensor(out, device=device, dtype=torch.int32), n_hit
+
     def _schedule_verify_lens(
         self,
         *,
@@ -554,17 +689,37 @@ class DSparkVerifyPlanner:
         device: torch.device,
         confidence: Optional[torch.Tensor],
         budget: Optional[int],
+        task_kinds: Optional[list[Optional[str]]] = None,
     ) -> Optional[torch.Tensor]:
-        if self._budget_planner is None or confidence is None or budget is None:
+        planned = (
+            self._budget_planner is not None
+            and confidence is not None
+            and budget is not None
+        )
+        verify_lens = None
+        if planned:
+            verify_lens = ScheduleVerifyLensTopk.execute(
+                confidence=confidence,
+                budget=budget,
+                cfg=self._schedule_cfg,
+            ).to(device=device, dtype=torch.int32)
+        verify_lens, n_oracle = self._apply_oracle_verify_lens(
+            verify_lens=verify_lens,
+            task_kinds=task_kinds,
+            device=device,
+        )
+        if verify_lens is None:
             return None
-        verify_lens = ScheduleVerifyLensTopk.execute(
-            confidence=confidence,
-            budget=budget,
-            cfg=self._schedule_cfg,
-        ).to(device=device, dtype=torch.int32)
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_PLAN, verify_lens)
 
-        if resolve_level() >= InvariantCheckLevel.WARN:
+        # The oracle is allowed to ignore the SPS budget. Check the planner
+        # lens only when no row was replaced.
+        if (
+            n_oracle == 0
+            and planned
+            and budget is not None
+            and resolve_level() >= InvariantCheckLevel.WARN
+        ):
             verify_lens_64 = verify_lens.to(torch.int64)
             effective_floor = max(self._schedule_cfg.min_verify_len, 1)
             expect(
@@ -572,8 +727,16 @@ class DSparkVerifyPlanner:
                 (verify_lens_64 - effective_floor).sum() <= budget,
                 msg=f"budget={budget}",
             )
+        if n_oracle and not self._logged_oracle_step and self._tp_rank == 0:
+            self._logged_oracle_step = True
+            logger.info(
+                "DSpark oracle overrode %d/%d verify lengths on the first "
+                "scheduled step.",
+                n_oracle,
+                int(verify_lens.shape[0]),
+            )
 
-        if envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER.get():
+        if planned and envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER.get():
             self._log_verify_lens_decision(
                 req_pool_indices=req_pool_indices,
                 prefix_lens=prefix_lens,
