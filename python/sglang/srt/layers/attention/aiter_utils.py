@@ -18,6 +18,56 @@ from typing import TYPE_CHECKING
 
 import torch
 
+
+def flydsl_stream_capturing() -> bool:
+    """True only while this stream is recording a CUDA graph.
+
+    ``get_is_capture_mode`` is also set for the pre-capture warmup and for
+    a breakable eager gap. Those are not stream captures.
+    """
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
+def flydsl_use_graph_bound(
+    *, stream_capturing: bool, capture_mode: bool, breakable: bool
+) -> bool:
+    """Whether uniform ``pa_decode`` should bake a host max-context bound.
+
+    A full CUDA graph, including its pre-capture warmup, must specialize on
+    one bound: replay does not re-enter Python, and a different
+    ``max_context_length`` compiles a different kernel. A breakable eager
+    gap sets the capture-mode flag while the stream is not capturing; that
+    launch keeps the measured length.
+    """
+    if breakable and not stream_capturing:
+        return False
+    return bool(stream_capturing or capture_mode)
+
+
+def flydsl_note_scratch(
+    cache: dict, pinned: dict, key, value, pin: bool
+) -> None:
+    """Remember scratch, and keep any entry a captured graph still holds.
+
+    The eager cache stays at 16 keys. Pinned entries are the tensors
+    recorded into a CUDA graph; dropping them would free that storage
+    while the graph still writes it.
+    """
+    cache[key] = value
+    if pin:
+        pinned[key] = value
+    if len(cache) <= 16:
+        return
+    for old in list(cache.keys()):
+        if old == key or old in pinned:
+            continue
+        cache.pop(old)
+        return
+
+
 try:
     # `mha_batch_prefill_func` is re-exported at the aiter top level via
     # `aiter/__init__.py` (`from .ops.mha import *`). Note: a bare
@@ -316,8 +366,12 @@ class FlydslPaDecode:
 
     def __init__(self):
         self._plans: dict = {}
-        self._scratch = None
-        self._scratch_key = None
+        # One scratch set per (heads, capacity, query rows). A ragged verify
+        # step launches two widths; swapping a single buffer would allocate
+        # on every layer.
+        self._scratch_cache: dict = {}
+        # Scratch recorded into a CUDA graph. Never evicted.
+        self._scratch_pinned: dict = {}
 
     def run(
         self,
@@ -330,6 +384,7 @@ class FlydslPaDecode:
         softmax_scale: float,
         query_length: int,
         max_context_length: int,
+        pin_scratch: bool = False,
     ) -> None:
         from aiter.ops.flydsl.pa_decode import pa_decode, plan_pa_decode
 
@@ -393,8 +448,14 @@ class FlydslPaDecode:
                 torch.empty_like(exp_sums),
                 torch.empty(*scalar, head_dim, dtype=query.dtype, device=query.device),
             )
-            self._scratch_key = scratch_key
-        exp_sums, max_logits, temporary = self._scratch
+        flydsl_note_scratch(
+            self._scratch_cache,
+            self._scratch_pinned,
+            scratch_key,
+            cached,
+            pin_scratch,
+        )
+        exp_sums, max_logits, temporary = cached
 
         pa_decode(
             out,
