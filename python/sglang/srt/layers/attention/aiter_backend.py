@@ -102,6 +102,7 @@ from sglang.srt.layers.attention.aiter_mla_gluon import (
 from sglang.srt.layers.attention.aiter_utils import (
     FlydslPaDecode,
     flydsl_block_table,
+    flydsl_forward_ragged_padded,
     flydsl_group_row_indices,
     flydsl_stream_capturing,
     flydsl_use_graph_bound,
@@ -436,9 +437,11 @@ class AiterAttnBackend(AttentionBackend):
     # Set in __init__; declared here for tests that build the backend without it
     # (test_aiter_fp8_kv_scales_paths.py).
     deterministic_prefill_max_q: Optional[int] = None
-    # Uniform FlyDSL verify can be captured. Ragged widths still host-sync
-    # (qo_indptr.tolist and a fresh output per group), so this stays off
-    # until that path fills metadata in place. Block graphs do not need it.
+    # Uniform FlyDSL verify captures. Mixed widths on a graph use
+    # flydsl_forward_ragged_padded (one right-aligned window, no host
+    # sync). The grouped eager path still syncs, and this flag stays off
+    # until a mixed-width numeric compare against that path passes.
+    # HybridLinearAttnBackend ANDs this with the GDN flag.
     supports_ragged_verify_graph: bool = False
 
     def __init__(
@@ -4134,6 +4137,45 @@ class AiterAttnBackend(AttentionBackend):
             pin_scratch=self._flydsl_graph_bound(),
         )
 
+    def _forward_target_verify_flydsl_padded(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        layout,
+    ) -> None:
+        """Graph path for mixed verify widths. One padded ``pa_decode``.
+
+        Eager ragged batches stay on the grouped launch. The host width is
+        the capture cap (``draft_token_num`` on the target, which is
+        ``speculative_num_draft_tokens``).
+        """
+        spec = getattr(forward_batch, "spec_info", None)
+        max_q = getattr(spec, "draft_token_num", None) if spec is not None else None
+        if not max_q:
+            max_q = self.num_draft_tokens
+        max_q = int(max_q or 0)
+        if max_q < 1:
+            raise RuntimeError(
+                "FlyDSL ragged verify needs a host max query width "
+                "(spec draft_token_num or num_draft_tokens)."
+            )
+        k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
+        flydsl_forward_ragged_padded(
+            self,
+            q,
+            o,
+            layer,
+            forward_batch,
+            layout,
+            k_cache,
+            v_cache,
+            max_context=self._flydsl_capture_max_context(),
+            max_q=max_q,
+            runner=self._flydsl_runner(),
+        )
+
     def _forward_target_verify_flydsl(
         self,
         q: torch.Tensor,
@@ -4165,6 +4207,18 @@ class AiterAttnBackend(AttentionBackend):
                 q, o, layer, forward_batch, k, v, bs, max_extend
             )
             return
+        # Compact graphs replay one graph per token bucket and refresh
+        # verify_lens in place. A width-grouped launch would freeze the
+        # capture-time groups. The padded window does not.
+        layout = getattr(
+            getattr(forward_batch, "spec_info", None), "ragged_verify_layout", None
+        )
+        if layout is not None and self._flydsl_graph_bound():
+            self._forward_target_verify_flydsl_padded(
+                q, o, layer, forward_batch, layout
+            )
+            return
+        qo = md.qo_indptr
         try:
             bs = flydsl_verify_live_batch(q_rows, qlen, pool_bs)
         except ValueError as exc:
