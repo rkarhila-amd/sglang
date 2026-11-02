@@ -209,6 +209,210 @@ def _uniform_qlen(extend_seq_lens: Optional[torch.Tensor], bs: int) -> Optional[
     return first
 
 
+def draft_left_align_rows(
+    qo_indptr: torch.Tensor,
+    q_rows: int,
+    max_q: int,
+) -> torch.Tensor:
+    """Map packed query rows onto a dense ``[batch, max_q]`` window.
+
+    Token ``t`` of request ``i`` lands at ``i * max_q + t``. The draft
+    block is bidirectional: those slots are packed into the GQA group and
+    launched at query length 1, so every real query sees the whole real
+    block. This is not the causal right-align used by target verify
+    (``flydsl_ragged_dense_rows``), which would put token ``t`` at
+    ``i * max_q + (max_q - width + t)``.
+    """
+    if q_rows < 1:
+        raise ValueError(f"query rows must be positive, got {q_rows}")
+    if max_q < 1:
+        raise ValueError(f"max_q must be positive, got {max_q}")
+    bs = int(qo_indptr.shape[0]) - 1
+    if bs < 1:
+        raise ValueError(f"draft batch must be positive, got {bs}")
+    ends = qo_indptr[1 : bs + 1]
+    token_ids = torch.arange(q_rows, device=qo_indptr.device, dtype=torch.int32)
+    req = torch.searchsorted(ends, token_ids, right=True).to(torch.long)
+    starts = qo_indptr[:bs].index_select(0, req)
+    offset = token_ids.to(torch.long) - starts.to(torch.long)
+    return req * max_q + offset
+
+
+def _draft_width_buf(backend, bs: int, device) -> torch.Tensor:
+    cache = getattr(backend, "_draft_flydsl_width_bufs", None)
+    pinned = getattr(backend, "_draft_flydsl_width_pinned", None)
+    if cache is None:
+        cache = {}
+        backend._draft_flydsl_width_bufs = cache
+    if pinned is None:
+        pinned = {}
+        backend._draft_flydsl_width_pinned = pinned
+    key = (bs, str(device))
+    buf = cache.get(key)
+    if buf is None:
+        buf = torch.empty((bs,), dtype=torch.int32, device=device)
+    from sglang.srt.layers.attention.aiter_utils import flydsl_note_scratch
+
+    flydsl_note_scratch(cache, pinned, key, buf, _draft_graph_bound())
+    return buf
+
+
+def _draft_qo_buf(backend, bs: int, device) -> torch.Tensor:
+    """``bs + 1`` indptr. Allocated outside capture, filled in place."""
+    cache = getattr(backend, "_draft_flydsl_qo_bufs", None)
+    pinned = getattr(backend, "_draft_flydsl_qo_pinned", None)
+    if cache is None:
+        cache = {}
+        backend._draft_flydsl_qo_bufs = cache
+    if pinned is None:
+        pinned = {}
+        backend._draft_flydsl_qo_pinned = pinned
+    key = (bs, str(device))
+    buf = cache.get(key)
+    if buf is None:
+        buf = torch.empty((bs + 1,), dtype=torch.int32, device=device)
+    from sglang.srt.layers.attention.aiter_utils import flydsl_note_scratch
+
+    flydsl_note_scratch(cache, pinned, key, buf, _draft_graph_bound())
+    return buf
+
+
+def _draft_slot_bufs(backend, rows: int, heads: int, dim: int, like: torch.Tensor):
+    from sglang.srt.layers.attention.aiter_utils import flydsl_note_scratch
+
+    key = (rows, heads, dim, like.dtype, str(like.device))
+    cache = getattr(backend, "_draft_flydsl_slot_bufs", None)
+    pinned = getattr(backend, "_draft_flydsl_slot_pinned", None)
+    if cache is None:
+        cache = {}
+        backend._draft_flydsl_slot_bufs = cache
+    if pinned is None:
+        pinned = {}
+        backend._draft_flydsl_slot_pinned = pinned
+    bufs = cache.get(key)
+    if bufs is None:
+        bufs = (
+            torch.empty((rows, heads, dim), dtype=like.dtype, device=like.device),
+            torch.empty((rows, heads, dim), dtype=like.dtype, device=like.device),
+        )
+    flydsl_note_scratch(cache, pinned, key, bufs, _draft_graph_bound())
+    return bufs
+
+
+def _mixed_draft_widths(forward_batch, bs: int):
+    """Per-request draft widths already on the device, or None.
+
+    A ragged verify layout wins. Otherwise the staged extend lengths.
+    This does not read a length back to the host.
+    """
+    spec = getattr(forward_batch, "spec_info", None)
+    layout = getattr(spec, "ragged_verify_layout", None) if spec is not None else None
+    if layout is not None and int(layout.verify_lens.shape[0]) >= bs:
+        return layout.verify_lens[:bs], layout.qo_indptr_device
+    for name in ("extend_seq_lens",):
+        tensor = getattr(forward_batch, name, None)
+        if tensor is not None and int(tensor.shape[0]) >= bs:
+            return tensor[:bs], None
+    if spec is not None:
+        tensor = getattr(spec, "extend_seq_lens_tensor", None)
+        if tensor is not None and int(tensor.shape[0]) >= bs:
+            return tensor[:bs], None
+    return None, None
+
+
+def _launch_ragged_bidirectional(
+    backend,
+    q: torch.Tensor,
+    o: torch.Tensor,
+    layer,
+    forward_batch,
+    widths: torch.Tensor,
+    qo_indptr: Optional[torch.Tensor],
+    max_q: int,
+) -> torch.Tensor:
+    """One query-length-1 ``pa_decode`` for a mixed-width draft block.
+
+    Real tokens are left-aligned in a ``max_q`` window and packed into the
+    GQA group, the same way the uniform block becomes bidirectional.
+    Context is ``prefix + width``, not ``prefix + max_q``, so a short
+    request does not read a padding key. Padding query slots stay zero
+    and their outputs are dropped.
+    """
+    from sglang.srt.layers.attention.aiter_utils import (
+        flydsl_block_table,
+        flydsl_stream_capturing,
+    )
+
+    capturing = flydsl_stream_capturing()
+    n_q = int(layer.tp_q_head_num)
+    n_kv = int(layer.tp_k_head_num)
+    dim = int(layer.qk_head_dim)
+    q3 = q.reshape(-1, n_q, dim)
+    q_rows = int(q3.shape[0])
+    bs = int(widths.shape[0])
+    if not capturing:
+        widest = int(widths.max().item())
+        if widest > max_q or widest < 1:
+            raise RuntimeError(
+                f"draft ragged width {widest} is outside 1..{max_q}"
+            )
+        if qo_indptr is not None and int(qo_indptr[bs].item()) != q_rows:
+            raise RuntimeError(
+                f"draft qo_indptr[{bs}] != query rows {q_rows}"
+            )
+    k_cache, v_cache = _caches(backend, layer)
+    width_buf = _draft_width_buf(backend, bs, q3.device)
+    src_w = widths if widths.dtype == torch.int32 else widths.to(dtype=torch.int32)
+    width_buf.copy_(src_w)
+    if qo_indptr is None:
+        qo = _draft_qo_buf(backend, bs, q3.device)
+        # A Python scalar store syncs during stream capture. zero_ is a kernel.
+        qo.zero_()
+        torch.cumsum(width_buf, dim=0, out=qo[1 : bs + 1])
+    else:
+        qo = qo_indptr
+        if qo.dtype != torch.int32:
+            staged = _draft_qo_buf(backend, bs, q3.device)
+            staged.copy_(qo[: bs + 1].to(dtype=torch.int32))
+            qo = staged
+    prefix = forward_batch.extend_prefix_lens
+    if prefix is None:
+        prefix = forward_batch.seq_lens
+    context = _static_context_buf(backend, bs, prefix.device)
+    src_p = prefix[:bs]
+    if src_p.dtype != torch.int32:
+        src_p = src_p.to(dtype=torch.int32)
+    context.copy_(src_p)
+    context.add_(width_buf)
+    rows = draft_left_align_rows(qo, q_rows, max_q)
+    q_slot, o_slot = _draft_slot_bufs(backend, bs * max_q, n_q, dim, q3)
+    q_slot.zero_()
+    q_slot.index_copy_(0, rows, q3[:q_rows])
+    q_exp, o_exp = _expand_bufs(backend, bs, n_q * max_q, dim, q3)
+    expand_draft_queries(q_slot, max_q, n_kv, n_q, out=q_exp)
+    spec = _capture_max_context(backend)
+    req_indices = forward_batch.req_pool_indices[:bs]
+    table = flydsl_block_table(
+        backend.req_to_token, req_indices, backend.page_size, spec
+    )
+    _runner(backend).run(
+        o_exp,
+        q_exp,
+        k_cache,
+        v_cache,
+        context,
+        table,
+        float(layer.scaling),
+        1,
+        spec,
+        pin_scratch=True,
+    )
+    collapse_draft_outputs(o_exp, max_q, n_kv, n_q, dest=o_slot)
+    o_view = o.view(-1, n_q, layer.v_head_dim)
+    o_view[:q_rows].copy_(o_slot.index_select(0, rows))
+    return o
+
+
 def _caches(backend, layer):
     k_cache, v_cache = backend.kv_layers.read(layer.layer_id).kv()
     if k_cache.dim() != 5 or v_cache.dim() != 5:
@@ -521,6 +725,32 @@ def forward_draft_extend(
         and mask is None
     ):
         return _launch_uniform(backend, q, o, layer, forward_batch, qlen)
+    # Mixed short blocks. The causal verify pad does not apply: pa_decode
+    # with query length > 1 is causal, and this block is bidirectional.
+    # Pad to the host draft width, pack into the GQA group, launch at
+    # query length 1. Prefill (more rows than the cap) stays on gather.
+    spec = forward_batch.spec_info
+    max_q = getattr(spec, "draft_token_num", None) if spec is not None else None
+    max_q = int(max_q or 0)
+    widths, staged_qo = _mixed_draft_widths(forward_batch, bs)
+    if (
+        mask is None
+        and prefix is not None
+        and widths is not None
+        and 1 <= max_q <= _MAX_UNIFORM_QLEN
+        and bs <= q_rows <= bs * max_q
+        and _draft_graph_bound()
+    ):
+        return _launch_ragged_bidirectional(
+            backend,
+            q,
+            o,
+            layer,
+            forward_batch,
+            widths,
+            staged_qo,
+            max_q,
+        )
     if not getattr(backend, "_draft_flydsl_skip_logged", False):
         backend._draft_flydsl_skip_logged = True
         logger.info(
