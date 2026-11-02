@@ -1131,7 +1131,9 @@ class Envs:
     # Draft attention on FlyDSL pa_decode. Off by default. When set, the
     # draft pool is SHUFFLE 5D at page 16 and the uniform block is packed
     # into the GQA group (query length 1, bidirectional). The target pool
-    # is unchanged. Prefill gathers the prefix to NHD. Eager only.
+    # is unchanged. Prefill gathers the prefix to NHD and stays eager.
+    # The uniform block captures: plan and pack buffers are allocated in
+    # the pre-capture warmup, and max_context is a host bound.
     SGLANG_DSPARK_DRAFT_FLYDSL = EnvBool(False)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     # Send Qwen3.8's 512-expert softmax router back to aiter `fused_topk`
