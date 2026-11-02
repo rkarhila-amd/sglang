@@ -95,6 +95,8 @@ from sglang.srt.layers.attention.aiter_utils import (
     FlydslPaDecode,
     flydsl_block_table,
     flydsl_group_row_indices,
+    flydsl_stream_capturing,
+    flydsl_use_graph_bound,
     flydsl_verify_live_batch,
     flydsl_verify_width_groups,
     forward_decode_vectorized_5d,
@@ -394,6 +396,11 @@ class AiterAttnBackend(AttentionBackend):
 
     # declare here to avoid CI failure in test_aiter_fp8_q_unified_attention.py
     use_mla_auto_kv_splits: bool = False
+
+    # Uniform FlyDSL verify can be captured. Ragged widths still host-sync
+    # (qo_indptr.tolist and a fresh output per group), so this stays off
+    # until that path fills metadata in place. Block graphs do not need it.
+    supports_ragged_verify_graph: bool = False
 
     def __init__(
         self,
@@ -3765,13 +3772,60 @@ class AiterAttnBackend(AttentionBackend):
             self._flydsl_runner_obj = runner
         return runner
 
-    def _flydsl_require_eager(self) -> None:
-        from sglang.srt.model_executor.runner import get_is_capture_mode
+    def _flydsl_graph_bound(self) -> bool:
+        """Full-graph warmup and capture bake one host max-context.
 
-        if get_is_capture_mode() or torch.cuda.is_current_stream_capturing():
+        A breakable eager gap is capture-mode without stream capture. That
+        launch keeps the measured length and stays out of the graph.
+        """
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+            is_in_breakable_cuda_graph,
+        )
+
+        return flydsl_use_graph_bound(
+            stream_capturing=flydsl_stream_capturing(),
+            capture_mode=bool(get_is_capture_mode()),
+            breakable=bool(is_in_breakable_cuda_graph()),
+        )
+
+    def _flydsl_capture_max_context(self) -> int:
+        """Upper bound baked into a captured ``pa_decode``.
+
+        Replay does not re-enter Python. Every context length that will
+        run must be at most this value, and the block table cannot name
+        a column past ``req_to_token``.
+        """
+        cached = getattr(self, "_flydsl_capture_max_cached", None)
+        if cached is not None:
+            return int(cached)
+        bound = int(getattr(self, "max_context_len", 0) or 0)
+        table = getattr(self, "req_to_token", None)
+        if table is not None and getattr(table, "ndim", 0) >= 2:
+            width = int(table.shape[1])
+            bound = width if bound < 1 else min(bound, width)
+        if bound < 1:
             raise RuntimeError(
-                "SGLANG_AITER_VERIFY_FLYDSL does not capture CUDA graphs. "
-                "Launch the server with --disable-decode-cuda-graph."
+                "FlyDSL capture max_context is not positive. "
+                "The model context length has to be set before capture."
+            )
+        self._flydsl_capture_max_cached = bound
+        return bound
+
+    def _flydsl_require_eager(self) -> None:
+        """Refuse a launch that still syncs while the stream is capturing.
+
+        The session capture flag is also true in a breakable eager gap,
+        where this launch is supposed to run. Only an actual stream
+        capture is refused. Uniform verify does not call this.
+        """
+        if flydsl_stream_capturing():
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL ragged and extend paths do not "
+                "capture CUDA graphs. Uniform verify uses the capture "
+                "bound; this launch still syncs. "
+                "Launch with --disable-decode-cuda-graph, or capture the "
+                "static-width path."
             )
 
     def _flydsl_require_layer(self, layer: RadixAttention, sinks) -> None:
@@ -3862,6 +3916,7 @@ class AiterAttnBackend(AttentionBackend):
             float(layer.scaling),
             query_length,
             max_context,
+            pin_scratch=self._flydsl_graph_bound(),
         )
 
     def _forward_target_verify_flydsl(
@@ -3878,7 +3933,6 @@ class AiterAttnBackend(AttentionBackend):
         verify tokens were just written into the 5D pool at
         ``prefix .. prefix + qlen``.
         """
-        self._flydsl_require_eager()
         self._flydsl_require_layer(layer, sinks)
         if k is None or v is None:
             raise RuntimeError(
@@ -3890,6 +3944,7 @@ class AiterAttnBackend(AttentionBackend):
         qlen = int(md.max_q_len or 0)
         q_rows = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).shape[0]
         if envs.SGLANG_AITER_VERIFY_FLYDSL_EXTEND.get():
+            self._flydsl_require_eager()
             bs, max_extend = self._flydsl_extend_plan(q_rows, pool_bs)
             self._forward_target_verify_flydsl_extend(
                 q, o, layer, forward_batch, k, v, bs, max_extend
@@ -3903,6 +3958,7 @@ class AiterAttnBackend(AttentionBackend):
             # (15 requests of width 8 and one of width 7). A non-multiple of
             # the max width is ragged. Other ValueErrors stay fatal.
             if q_rows > 0 and qlen > 0 and pool_bs > 0 and q_rows % qlen != 0:
+                self._flydsl_require_eager()
                 self._forward_target_verify_flydsl_grouped(
                     q, o, layer, forward_batch, q_rows, pool_bs
                 )
@@ -3915,11 +3971,23 @@ class AiterAttnBackend(AttentionBackend):
         # qo is a uniform arange at qlen, so the prefix of a wider plan still
         # names this query. A total that divides qlen can still be ragged
         # when an earlier request is shorter; group that batch too.
-        if int(qo[bs].item()) != q_rows:
-            self._forward_target_verify_flydsl_grouped(
-                q, o, layer, forward_batch, q_rows, pool_bs
+        # ``qo[bs].item()`` syncs, so a capturing stream cannot read it.
+        # Static verify capture builds a uniform indptr; the pre-capture
+        # warmup still performs this check on the same dummy batch.
+        capturing = flydsl_stream_capturing()
+        if not capturing:
+            if int(qo[bs].item()) != q_rows:
+                self._flydsl_require_eager()
+                self._forward_target_verify_flydsl_grouped(
+                    q, o, layer, forward_batch, q_rows, pool_bs
+                )
+                return
+        elif q_rows != bs * qlen:
+            self._flydsl_require_eager()
+            raise RuntimeError(
+                "FlyDSL uniform capture expected "
+                f"q_rows {q_rows} == batch {bs} * qlen {qlen}."
             )
-            return
         if bs != pool_bs and not getattr(self, "_flydsl_trimmed_logged", False):
             logger.info(
                 "AITER_VERIFY_FLYDSL trimming pool %s to %s requests "
@@ -3932,15 +4000,27 @@ class AiterAttnBackend(AttentionBackend):
             self._flydsl_trimmed_logged = True
         step_key = (getattr(self, "_flydsl_nonce", 0), "verify", q_rows, bs)
         cached = getattr(self, "_flydsl_step", None)
-        if cached is None or cached[0] != step_key:
+        # A context tensor built before capture is not replayed. Rebuild
+        # from seq_lens on the capturing stream so the graph reads the
+        # static buffer. Later layers of this same capture reuse it.
+        cache_ok = (
+            cached is not None
+            and cached[0] == step_key
+            and len(cached) >= 5
+            and bool(cached[4]) == capturing
+        )
+        if not cache_ok:
             # GPU seq_lens is the prefix. seq_lens_cpu may already include qlen.
             context = (
                 forward_batch.seq_lens[:bs].to(dtype=torch.int32) + qlen
             ).contiguous()
-            max_context = int(context.max().item())
-            self._flydsl_step = (step_key, context, qlen, max_context)
+            if self._flydsl_graph_bound():
+                max_context = self._flydsl_capture_max_context()
+            else:
+                max_context = int(context.max().item())
+            self._flydsl_step = (step_key, context, qlen, max_context, capturing)
         else:
-            _, context, qlen, max_context = cached
+            _, context, qlen, max_context, _ = cached
         k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
         self._flydsl_launch(
             q,
@@ -3970,6 +4050,7 @@ class AiterAttnBackend(AttentionBackend):
         ``context`` is the prefix plus that width, so a short request does not
         read a KV token the verify window never wrote.
         """
+        self._flydsl_require_eager()
         nonce = getattr(self, "_flydsl_nonce", 0)
         step_key = (nonce, "verify-ragged", q_rows, pool_bs)
         cached = getattr(self, "_flydsl_ragged", None)
@@ -4221,6 +4302,7 @@ class AiterAttnBackend(AttentionBackend):
             launch_gather_shuffle_5d_to_linear,
         )
 
+        self._flydsl_require_eager()
         md = self.forward_metadata
         kv_indptr = md.kv_indptr[: bs + 1]
         total = int(kv_indptr[-1].item())
@@ -4284,18 +4366,28 @@ class AiterAttnBackend(AttentionBackend):
         v_cache: torch.Tensor,
     ) -> None:
         """qlen-1 decode. ``seq_lens`` already includes the token just written."""
-        self._flydsl_require_eager()
         self._flydsl_require_layer(layer, sinks)
+        if not self._flydsl_graph_bound():
+            self._flydsl_require_eager()
         bs = forward_batch.batch_size
-        md = self.forward_metadata
+        capturing = flydsl_stream_capturing()
         step_key = (getattr(self, "_flydsl_nonce", 0), "decode")
         cached = getattr(self, "_flydsl_step", None)
-        if cached is None or cached[0] != step_key:
+        cache_ok = (
+            cached is not None
+            and cached[0] == step_key
+            and len(cached) >= 5
+            and bool(cached[4]) == capturing
+        )
+        if not cache_ok:
             context = forward_batch.seq_lens[:bs].to(dtype=torch.int32).contiguous()
-            max_context = int(context.max().item())
-            self._flydsl_step = (step_key, context, 1, max_context)
+            if self._flydsl_graph_bound():
+                max_context = self._flydsl_capture_max_context()
+            else:
+                max_context = int(context.max().item())
+            self._flydsl_step = (step_key, context, 1, max_context, capturing)
         else:
-            _, context, _, max_context = cached
+            _, context, _, max_context, _ = cached
         self._flydsl_launch(
             q,
             o,
