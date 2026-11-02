@@ -1120,13 +1120,19 @@ class Envs:
     # Target verify and decode on FlyDSL pa_decode (gfx942, page 16, bf16 KV).
     # Off by default: the NHD split-KV path stays the server. When set, the
     # target full-attention pool is SHUFFLE 5D and the default page size is
-    # 16. The draft pool stays NHD at that page size. Do not also set
+    # 16. The draft pool stays NHD at that page size unless
+    # SGLANG_DSPARK_DRAFT_FLYDSL is set. Do not also set
     # SGLANG_AITER_KV_CACHE_LAYOUT=vectorized_5d; that env rewrites every
-    # MHA pool, including the draft. Eager only; CUDA-graph capture raises.
+    # MHA pool. Eager only; CUDA-graph capture raises.
     SGLANG_AITER_VERIFY_FLYDSL = EnvBool(False)
     # Verify with extend_attention_fwd on fresh K/V plus the SHUFFLE prefix
     # gathered to NHD. pa_decode stays the decode kernel. Off by default.
     SGLANG_AITER_VERIFY_FLYDSL_EXTEND = EnvBool(False)
+    # Draft attention on FlyDSL pa_decode. Off by default. When set, the
+    # draft pool is SHUFFLE 5D at page 16 and the uniform block is packed
+    # into the GQA group (query length 1, bidirectional). The target pool
+    # is unchanged. Prefill gathers the prefix to NHD. Eager only.
+    SGLANG_DSPARK_DRAFT_FLYDSL = EnvBool(False)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     # Send Qwen3.8's 512-expert softmax router back to aiter `fused_topk`
     # instead of `topk_gating`.
