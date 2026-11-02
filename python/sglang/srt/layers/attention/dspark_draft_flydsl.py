@@ -26,12 +26,17 @@ _MAX_UNIFORM_QLEN = 16
 
 
 def expand_draft_queries(
-    q: torch.Tensor, qlen: int, n_kv: int, n_q: int
+    q: torch.Tensor,
+    qlen: int,
+    n_kv: int,
+    n_q: int,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """``[B * qlen, n_q, D]`` to ``[B, n_q * qlen, D]``.
 
     Order inside each KV head is position, then the original group. Query
-    length 1 is the identity permutation.
+    length 1 is the identity permutation. ``out`` is a preallocated
+    destination so a CUDA graph does not allocate the pack buffer.
     """
     if qlen < 1:
         raise ValueError(f"qlen must be positive, got {qlen}")
@@ -43,14 +48,28 @@ def expand_draft_queries(
     dim = q.shape[-1]
     group = n_q // n_kv
     x = q.view(batch, qlen, n_kv, group, dim)
-    x = x.permute(0, 2, 1, 3, 4).contiguous()
-    return x.view(batch, n_kv * qlen * group, dim)
+    flat = x.permute(0, 2, 1, 3, 4).reshape(batch, n_kv * qlen * group, dim)
+    if out is None:
+        return flat.contiguous()
+    if out.shape != flat.shape:
+        raise ValueError(
+            f"expand destination {tuple(out.shape)} != {tuple(flat.shape)}"
+        )
+    out.copy_(flat)
+    return out
 
 
 def collapse_draft_outputs(
-    out: torch.Tensor, qlen: int, n_kv: int, n_q: int
+    out: torch.Tensor,
+    qlen: int,
+    n_kv: int,
+    n_q: int,
+    dest: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Inverse of :func:`expand_draft_queries`. Returns ``[B * qlen, n_q, D]``."""
+    """Inverse of :func:`expand_draft_queries`. Returns ``[B * qlen, n_q, D]``.
+
+    ``dest`` is a preallocated ``[B * qlen, n_q, D]`` buffer.
+    """
     if out.shape[1] != n_q * qlen:
         raise ValueError(
             f"expanded heads {out.shape[1]} != n_q {n_q} * qlen {qlen}"
@@ -59,8 +78,15 @@ def collapse_draft_outputs(
     dim = out.shape[-1]
     group = n_q // n_kv
     x = out.view(batch, n_kv, qlen, group, dim)
-    x = x.permute(0, 2, 1, 3, 4).contiguous()
-    return x.view(batch * qlen, n_q, dim)
+    flat = x.permute(0, 2, 1, 3, 4).reshape(batch * qlen, n_q, dim)
+    if dest is None:
+        return flat.contiguous()
+    if dest.shape != flat.shape:
+        raise ValueError(
+            f"collapse destination {tuple(dest.shape)} != {tuple(flat.shape)}"
+        )
+    dest.copy_(flat)
+    return dest
 
 
 def bucket_max_context(n: int) -> int:
@@ -74,18 +100,85 @@ def bucket_max_context(n: int) -> int:
 
 
 def _refuse_capture() -> None:
+    """Gathered prefill still syncs. The uniform block does not call this."""
+    from sglang.srt.layers.attention.aiter_utils import flydsl_stream_capturing
     from sglang.srt.model_executor.runner import get_is_capture_mode
 
-    capturing = False
-    if get_is_capture_mode():
-        capturing = True
-    elif torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-        capturing = True
-    if capturing:
+    if flydsl_stream_capturing() or get_is_capture_mode():
         raise RuntimeError(
-            "SGLANG_DSPARK_DRAFT_FLYDSL does not capture CUDA graphs. "
+            "SGLANG_DSPARK_DRAFT_FLYDSL prefill does not capture CUDA graphs. "
+            "The uniform draft block captures; this gather path still syncs. "
             "Launch with --disable-decode-cuda-graph."
         )
+
+
+def _draft_graph_bound() -> bool:
+    """True for a full-graph warmup and for the stream capture itself.
+
+    Both must specialize ``pa_decode`` on the same host max-context. A
+    breakable eager gap keeps the measured length.
+    """
+    from sglang.srt.layers.attention.aiter_utils import (
+        flydsl_stream_capturing,
+        flydsl_use_graph_bound,
+    )
+    from sglang.srt.model_executor.runner import get_is_capture_mode
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+        is_in_breakable_cuda_graph,
+    )
+
+    return flydsl_use_graph_bound(
+        stream_capturing=flydsl_stream_capturing(),
+        capture_mode=bool(get_is_capture_mode()),
+        breakable=bool(is_in_breakable_cuda_graph()),
+    )
+
+
+def _capture_max_context(backend) -> int:
+    """Host bound baked into a captured draft ``pa_decode``.
+
+    Replay does not re-enter this function. Every context length that
+    will run must be at most this value.
+    """
+    cached = getattr(backend, "_draft_flydsl_capture_max", None)
+    if cached is not None:
+        return int(cached)
+    bound = int(getattr(backend, "max_context_len", 0) or 0)
+    table = getattr(backend, "req_to_token", None)
+    if table is not None and getattr(table, "ndim", 0) >= 2:
+        width = int(table.shape[1])
+        bound = width if bound < 1 else min(bound, width)
+    if bound < 1:
+        raise RuntimeError(
+            "DSPARK draft FlyDSL capture max_context is not positive. "
+            "The model context length has to be set before capture."
+        )
+    backend._draft_flydsl_capture_max = bound
+    return bound
+
+
+def _expand_bufs(backend, batch: int, expanded_heads: int, dim: int, like: torch.Tensor):
+    """Pack and output buffers for one captured batch. Not evicted."""
+    from sglang.srt.layers.attention.aiter_utils import flydsl_note_scratch
+
+    key = (batch, expanded_heads, dim, like.dtype, like.device)
+    cache = getattr(backend, "_draft_flydsl_expand", None)
+    pinned = getattr(backend, "_draft_flydsl_expand_pinned", None)
+    if cache is None:
+        cache = {}
+        backend._draft_flydsl_expand = cache
+    if pinned is None:
+        pinned = {}
+        backend._draft_flydsl_expand_pinned = pinned
+    bufs = cache.get(key)
+    if bufs is None:
+        shape = (batch, expanded_heads, dim)
+        bufs = (
+            torch.empty(shape, dtype=like.dtype, device=like.device),
+            torch.empty(shape, dtype=like.dtype, device=like.device),
+        )
+    flydsl_note_scratch(cache, pinned, key, bufs, True)
+    return bufs
 
 
 def _nonce(backend) -> int:
@@ -137,9 +230,13 @@ def _runner(backend):
     return runner
 
 
-def _context(backend, forward_batch, bs: int, qlen: int) -> Tuple[torch.Tensor, int]:
+def _context(
+    backend, forward_batch, bs: int, qlen: int, graph_bound: bool, capturing: bool
+) -> Tuple[torch.Tensor, int]:
     # The hand-built DSPARK block stores the prefix in seq_lens and does not
     # set extend_prefix_lens. The qlen new tokens are already in the pool.
+    # A context tensor built before capture is not replayed. The key includes
+    # the capture flag so the recording rebuilds from the static seq_lens.
     prefix = forward_batch.extend_prefix_lens
     if prefix is None:
         prefix = forward_batch.seq_lens
@@ -148,17 +245,20 @@ def _context(backend, forward_batch, bs: int, qlen: int) -> Tuple[torch.Tensor, 
             "SGLANG_DSPARK_DRAFT_FLYDSL uniform block needs extend_prefix_lens "
             "or seq_lens."
         )
-    key = (_nonce(backend), bs, qlen)
+    key = (_nonce(backend), bs, qlen, bool(graph_bound), bool(capturing))
     cached = getattr(backend, "_draft_flydsl_ctx", None)
     if cached is not None and cached[0] == key:
         return cached[1], cached[2]
     context = (prefix[:bs].to(dtype=torch.int32) + qlen).contiguous()
-    true_max = int(context.max().item())
-    if true_max < qlen:
-        raise RuntimeError(
-            f"draft context {true_max} is shorter than the block {qlen}"
-        )
-    spec = bucket_max_context(true_max)
+    if graph_bound:
+        spec = _capture_max_context(backend)
+    else:
+        true_max = int(context.max().item())
+        if true_max < qlen:
+            raise RuntimeError(
+                f"draft context {true_max} is shorter than the block {qlen}"
+            )
+        spec = bucket_max_context(true_max)
     backend._draft_flydsl_ctx = (key, context, spec)
     return context, spec
 
@@ -171,9 +271,13 @@ def _launch_uniform(
     forward_batch,
     qlen: int,
 ) -> torch.Tensor:
-    from sglang.srt.layers.attention.aiter_utils import flydsl_block_table
+    from sglang.srt.layers.attention.aiter_utils import (
+        flydsl_block_table,
+        flydsl_stream_capturing,
+    )
 
-    _refuse_capture()
+    capturing = flydsl_stream_capturing()
+    graph_bound = _draft_graph_bound()
     n_q = int(layer.tp_q_head_num)
     n_kv = int(layer.tp_k_head_num)
     dim = int(layer.qk_head_dim)
@@ -185,14 +289,21 @@ def _launch_uniform(
             f"draft KV heads in the pool ({int(k_cache.shape[1])}) "
             f"!= layer tp_k_head_num {n_kv}"
         )
-    context, spec = _context(backend, forward_batch, bs, qlen)
+    context, spec = _context(
+        backend, forward_batch, bs, qlen, graph_bound, capturing
+    )
     req_indices = forward_batch.req_pool_indices[:bs]
     table = flydsl_block_table(
         backend.req_to_token, req_indices, backend.page_size, spec
     )
-    q_exp = expand_draft_queries(q3, qlen, n_kv, n_q)
-    o_exp = torch.empty_like(q_exp)
-    if not getattr(backend, "_draft_flydsl_logged", False):
+    if graph_bound:
+        # Warmup allocates these. Capture copies into the same storage.
+        q_exp, o_exp = _expand_bufs(backend, bs, n_q * qlen, dim, q3)
+        expand_draft_queries(q3, qlen, n_kv, n_q, out=q_exp)
+    else:
+        q_exp = expand_draft_queries(q3, qlen, n_kv, n_q)
+        o_exp = torch.empty_like(q_exp)
+    if not capturing and not getattr(backend, "_draft_flydsl_logged", False):
         prefix0 = int(context[0].item()) - qlen
         table_slot = int(
             backend.req_to_token[int(req_indices[0].item()), prefix0 + qlen - 1].item()
@@ -201,7 +312,7 @@ def _launch_uniform(
         logger.info(
             "DSPARK_DRAFT_FLYDSL uniform page=%s qlen=%s bs=%s q_heads=%s "
             "kv_heads=%s spec_max_context=%s prefix0=%s table_slot=%s "
-            "out_cache_tail=%s",
+            "out_cache_tail=%s graph_bound=%s",
             backend.page_size,
             qlen,
             bs,
@@ -211,6 +322,7 @@ def _launch_uniform(
             prefix0,
             table_slot,
             tail,
+            graph_bound,
         )
         backend._draft_flydsl_logged = True
     _runner(backend).run(
@@ -223,9 +335,14 @@ def _launch_uniform(
         float(layer.scaling),
         1,
         spec,
+        pin_scratch=graph_bound,
     )
-    flat = collapse_draft_outputs(o_exp, qlen, n_kv, n_q)
-    o.view(-1, n_q, layer.v_head_dim).copy_(flat)
+    o_view = o.view(-1, n_q, layer.v_head_dim)
+    if graph_bound:
+        collapse_draft_outputs(o_exp, qlen, n_kv, n_q, dest=o_view)
+    else:
+        flat = collapse_draft_outputs(o_exp, qlen, n_kv, n_q)
+        o_view.copy_(flat)
     return o
 
 
@@ -312,9 +429,14 @@ def _resolve_block_qlen(backend, forward_batch, bs: int, q_rows: int) -> Optiona
     the prefix. A prefill chunk is longer than ``_MAX_UNIFORM_QLEN`` or is
     not ``TARGET_VERIFY``, so it stays on the gather path.
     """
-    cached = _uniform_qlen_cached(backend, forward_batch, bs)
-    if cached is not None and bs > 0 and q_rows == bs * cached:
-        return cached
+    from sglang.srt.layers.attention.aiter_utils import flydsl_stream_capturing
+
+    # extend_seq_lens[0].item() syncs. A capturing stream uses the host
+    # draft_token_num on the spec info instead.
+    if not flydsl_stream_capturing():
+        cached = _uniform_qlen_cached(backend, forward_batch, bs)
+        if cached is not None and bs > 0 and q_rows == bs * cached:
+            return cached
     if bs < 1 or not forward_batch.forward_mode.is_target_verify():
         return None
     spec = forward_batch.spec_info
