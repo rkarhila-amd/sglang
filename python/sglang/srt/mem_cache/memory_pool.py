@@ -3284,6 +3284,34 @@ class MHATokenToKVPool(KVCache, MHAKVView):
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
     ):
+        # The tiled prefix kernel indexes the cache by token slot along dim 0.
+        # vectorized_5d's leading dimension is pages, so that store faults once
+        # a slot id passes the page count. Scatter through the SHUFFLE writer.
+        if self.kv_cache_layout == "vectorized_5d":
+            if self.layer_num == 0 or loc_2d.numel() == 0:
+                return
+            device = self.k_buffer[0].device
+            if loc_2d.device != device:
+                loc_2d = loc_2d.to(device=device, non_blocking=True)
+            if commit_lens.device != device:
+                commit_lens = commit_lens.to(device=device, non_blocking=True)
+            row_offsets = torch.arange(loc_2d.shape[1], device=device)
+            valid_mask = row_offsets[None, :] < commit_lens.to(torch.int64)[:, None]
+            valid_idx = torch.nonzero(valid_mask.reshape(-1), as_tuple=False).flatten()
+            if valid_idx.numel() == 0:
+                return
+            self.set_kv_buffer(
+                layer,
+                KVWriteLoc(
+                    loc_2d.reshape(-1).index_select(0, valid_idx), physical=True
+                ),
+                cache_k.index_select(0, valid_idx),
+                cache_v.index_select(0, valid_idx),
+                k_scale,
+                v_scale,
+                layer_id_override=layer_id_override,
+            )
+            return
         _set_mha_kv_buffer_prefix_valid(
             self,
             layer,
