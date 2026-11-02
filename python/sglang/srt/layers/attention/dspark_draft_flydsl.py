@@ -138,10 +138,15 @@ def _runner(backend):
 
 
 def _context(backend, forward_batch, bs: int, qlen: int) -> Tuple[torch.Tensor, int]:
+    # The hand-built DSPARK block stores the prefix in seq_lens and does not
+    # set extend_prefix_lens. The qlen new tokens are already in the pool.
     prefix = forward_batch.extend_prefix_lens
+    if prefix is None:
+        prefix = forward_batch.seq_lens
     if prefix is None or int(prefix.shape[0]) < bs:
         raise RuntimeError(
-            "SGLANG_DSPARK_DRAFT_FLYDSL uniform block needs extend_prefix_lens."
+            "SGLANG_DSPARK_DRAFT_FLYDSL uniform block needs extend_prefix_lens "
+            "or seq_lens."
         )
     key = (_nonce(backend), bs, qlen)
     cached = getattr(backend, "_draft_flydsl_ctx", None)
@@ -188,15 +193,24 @@ def _launch_uniform(
     q_exp = expand_draft_queries(q3, qlen, n_kv, n_q)
     o_exp = torch.empty_like(q_exp)
     if not getattr(backend, "_draft_flydsl_logged", False):
+        prefix0 = int(context[0].item()) - qlen
+        table_slot = int(
+            backend.req_to_token[int(req_indices[0].item()), prefix0 + qlen - 1].item()
+        )
+        tail = int(forward_batch.out_cache_loc[qlen - 1].item())
         logger.info(
             "DSPARK_DRAFT_FLYDSL uniform page=%s qlen=%s bs=%s q_heads=%s "
-            "kv_heads=%s spec_max_context=%s",
+            "kv_heads=%s spec_max_context=%s prefix0=%s table_slot=%s "
+            "out_cache_tail=%s",
             backend.page_size,
             qlen,
             bs,
             n_q * qlen,
             n_kv,
             spec,
+            prefix0,
+            table_slot,
+            tail,
         )
         backend._draft_flydsl_logged = True
     _runner(backend).run(
@@ -290,6 +304,31 @@ def _launch_gathered_extend(
     return o
 
 
+def _resolve_block_qlen(backend, forward_batch, bs: int, q_rows: int) -> Optional[int]:
+    """Width of a uniform DSPARK block, or None when this extend is prefill.
+
+    The hand-built block batch leaves ``extend_seq_lens`` empty. Its spec
+    info carries ``draft_token_num`` (7 on this model) and ``seq_lens`` is
+    the prefix. A prefill chunk is longer than ``_MAX_UNIFORM_QLEN`` or is
+    not ``TARGET_VERIFY``, so it stays on the gather path.
+    """
+    cached = _uniform_qlen_cached(backend, forward_batch, bs)
+    if cached is not None and bs > 0 and q_rows == bs * cached:
+        return cached
+    if bs < 1 or not forward_batch.forward_mode.is_target_verify():
+        return None
+    spec = forward_batch.spec_info
+    width = getattr(spec, "draft_token_num", None) if spec is not None else None
+    if width is None:
+        return None
+    width = int(width)
+    if width < 1 or width > _MAX_UNIFORM_QLEN:
+        return None
+    if q_rows != bs * width:
+        return None
+    return width
+
+
 def forward_draft_extend(
     backend,
     q: torch.Tensor,
@@ -327,15 +366,31 @@ def forward_draft_extend(
             f"got {layer.qk_head_dim} and {layer.v_head_dim}."
         )
     bs = int(forward_batch.batch_size)
-    qlen = _uniform_qlen_cached(backend, forward_batch, bs)
     q_rows = q.reshape(-1, int(layer.tp_q_head_num), int(layer.qk_head_dim)).shape[0]
+    qlen = _resolve_block_qlen(backend, forward_batch, bs, q_rows)
+    mask = backend.forward_metadata.custom_mask
+    prefix = forward_batch.extend_prefix_lens
+    if prefix is None and forward_batch.forward_mode.is_target_verify():
+        prefix = forward_batch.seq_lens
     if (
         qlen is not None
         and q_rows == bs * qlen
-        and forward_batch.extend_prefix_lens is not None
-        and backend.forward_metadata.custom_mask is None
+        and prefix is not None
+        and mask is None
     ):
         return _launch_uniform(backend, q, o, layer, forward_batch, qlen)
+    if not getattr(backend, "_draft_flydsl_skip_logged", False):
+        backend._draft_flydsl_skip_logged = True
+        logger.info(
+            "DSPARK_DRAFT_FLYDSL skip-uniform qlen=%s q_rows=%s bs=%s "
+            "has_prefix=%s mode=%s mask=%s",
+            qlen,
+            q_rows,
+            bs,
+            prefix is not None,
+            forward_batch.forward_mode,
+            mask is not None,
+        )
     return _launch_gathered_extend(
         backend, q, o, k, v, layer, forward_batch, causal
     )
