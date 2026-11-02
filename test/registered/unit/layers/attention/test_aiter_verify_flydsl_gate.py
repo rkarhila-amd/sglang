@@ -118,8 +118,10 @@ class TestAiterVerifyFlydslGate(CustomTestCase):
         with _stub_capture(False):
             _backend()._flydsl_require_eager()
 
-    def test_ragged_verify_graph_stays_off(self):
-        self.assertFalse(AiterAttnBackend.supports_ragged_verify_graph)
+    def test_ragged_verify_graph_opts_in(self):
+        # The graph path is the padded window. The grouped eager path still
+        # syncs and is not what this flag selects.
+        self.assertTrue(AiterAttnBackend.supports_ragged_verify_graph)
 
 
 class TestFlydslGraphBound(CustomTestCase):

@@ -400,10 +400,12 @@ class AiterAttnBackend(AttentionBackend):
 
     # Uniform FlyDSL verify captures. Mixed widths on a graph use
     # flydsl_forward_ragged_padded (one right-aligned window, no host
-    # sync). The grouped eager path still syncs, and this flag stays off
-    # until a mixed-width numeric compare against that path passes.
-    # HybridLinearAttnBackend ANDs this with the GDN flag.
-    supports_ragged_verify_graph: bool = False
+    # sync). A HIP 5 microbench of that window against two grouped
+    # pa_decode launches matched exactly (max abs 0). Eager mixed batches
+    # still take the grouped path. HybridLinearAttnBackend ANDs this with
+    # the GDN flag, which was already true. Compact serving gates are not
+    # this microbench.
+    supports_ragged_verify_graph: bool = True
 
     def __init__(
         self,
