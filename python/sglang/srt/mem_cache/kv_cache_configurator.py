@@ -2484,6 +2484,8 @@ class KVCacheConfigurator:
         )
 
         kv_cache_layout = self._flydsl_target_kv_layout(full_pool_class)
+        if kv_cache_layout is None:
+            kv_cache_layout = self._dspark_draft_flydsl_layout()
         qsa_profile = parse_qsa_profile(self.model_config.hf_config)
         qsa_indexer_dtype = get_model().qsa_indexer_dtype
         if qsa_indexer_dtype != "auto" and qsa_profile is None:
@@ -2555,6 +2557,34 @@ class KVCacheConfigurator:
         )
         return "vectorized_5d"
 
+    def _dspark_draft_flydsl_layout(self) -> Optional[str]:
+        """SHUFFLE 5D on the draft worker only.
+
+        Returns None on the target worker, so the target pool keeps its own
+        layout. ``SGLANG_AITER_KV_CACHE_LAYOUT`` stays unset.
+        """
+        if not self.is_draft_worker or not envs.SGLANG_DSPARK_DRAFT_FLYDSL.get():
+            return None
+        if self.use_mla_backend:
+            raise RuntimeError(
+                "SGLANG_DSPARK_DRAFT_FLYDSL does not support an MLA draft."
+            )
+        if self.pool_page_size != 16:
+            raise RuntimeError(
+                "SGLANG_DSPARK_DRAFT_FLYDSL requires page_size=16 "
+                f"(got {self.pool_page_size})."
+            )
+        if self.kv_cache_dtype != torch.bfloat16:
+            raise RuntimeError(
+                "SGLANG_DSPARK_DRAFT_FLYDSL is bf16 KV only. Do not enable FP8 KV."
+            )
+        logger.info(
+            "SGLANG_DSPARK_DRAFT_FLYDSL: draft KV is vectorized_5d at "
+            "page_size=%s. Target KV is unchanged.",
+            self.pool_page_size,
+        )
+        return "vectorized_5d"
+
     def _hybrid_full_attention_pool_class(
         self, *, mha_pool_class: type, mla_pool_class: type, dsa_pool_class: type
     ) -> type:
@@ -2616,6 +2646,14 @@ class KVCacheConfigurator:
             pool_cls = PageInterleaveMHATokenToKVPool
             pool_kwargs["shard_spec"] = self.kv_shard_spec
             pool_kwargs["shard_group"] = self.kv_shard_group
+        draft_layout = self._dspark_draft_flydsl_layout()
+        if draft_layout is not None:
+            if pool_cls is not MHATokenToKVPool:
+                raise RuntimeError(
+                    "SGLANG_DSPARK_DRAFT_FLYDSL needs the plain MHA KV pool, "
+                    f"got {pool_cls.__name__}."
+                )
+            pool_kwargs["kv_cache_layout"] = draft_layout
         token_to_kv_pool = pool_cls(
             max_total_num_tokens,
             page_size=self.pool_page_size,
