@@ -35,6 +35,12 @@ class TestDsparkDraftFlydslPack(CustomTestCase):
         self.assertEqual(expanded.shape, (batch, n_q * qlen, dim))
         collapsed = collapse_draft_outputs(expanded, qlen=qlen, n_kv=n_kv, n_q=n_q)
         self.assertTrue(torch.equal(collapsed, q))
+        packed = torch.empty_like(expanded)
+        expand_draft_queries(q, qlen=qlen, n_kv=n_kv, n_q=n_q, out=packed)
+        self.assertTrue(torch.equal(packed, expanded))
+        back = torch.empty_like(q)
+        collapse_draft_outputs(packed, qlen=qlen, n_kv=n_kv, n_q=n_q, dest=back)
+        self.assertTrue(torch.equal(back, q))
 
     def test_position_then_group_inside_each_kv_head(self):
         batch, qlen, n_kv, group, dim = 1, 2, 2, 2, 1
