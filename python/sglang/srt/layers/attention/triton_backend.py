@@ -308,9 +308,13 @@ class TritonAttnBackend(AttentionBackend):
         else:
             # Use start_layer instead of 0 to handle pipeline parallelism.
             # In PP, start_layer may be > 0, so layer 0 isn't in this stage's buffer.
-            self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(
-                model_runner.token_to_kv_pool.start_layer
-            ).shape[-1]
+            # SHUFFLE 5D stores the value head in a middle dim; the last dim
+            # is the 16-byte vector, so read the recorded head dim instead.
+            pool = model_runner.token_to_kv_pool
+            if getattr(pool, "kv_cache_layout", None) == "vectorized_5d":
+                self.v_head_dim = pool.get_v_head_dim()
+            else:
+                self.v_head_dim = pool.get_value_buffer(pool.start_layer).shape[-1]
             self.swa_v_head_dim = None
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
@@ -873,6 +877,10 @@ class TritonAttnBackend(AttentionBackend):
         if self.dllm_attention is not None:
             self.dllm_attention.graph_mode = False
         self._dense_one_shot_kv_indptr = None
+        if self.is_hip_dspark_draft and envs.SGLANG_DSPARK_DRAFT_FLYDSL.get():
+            # One bump per eager step. Layers reuse the block plan; the next
+            # step must not keep the previous context.
+            self._draft_flydsl_nonce = getattr(self, "_draft_flydsl_nonce", 0) + 1
         bs = forward_batch.batch_size
         window_kv_indptr = self.window_kv_indptr
         window_kv_indices = None
@@ -1698,6 +1706,11 @@ class TritonAttnBackend(AttentionBackend):
             o = torch.empty_like(q)
 
         if k is None and v is None:
+            if self.is_hip_dspark_draft and envs.SGLANG_DSPARK_DRAFT_FLYDSL.get():
+                raise RuntimeError(
+                    "SGLANG_DSPARK_DRAFT_FLYDSL needs K and V on this extend. "
+                    "The SHUFFLE pool is not indexed as NHD."
+                )
             cache_loc = forward_batch.out_cache_loc
             if (
                 self.use_sliding_window_kv_pool
@@ -1762,6 +1775,25 @@ class TritonAttnBackend(AttentionBackend):
             )
         ):
             causal = False
+
+        if self.is_hip_dspark_draft and envs.SGLANG_DSPARK_DRAFT_FLYDSL.get():
+            if (
+                sinks is not None
+                or score_mod is not None
+                or aux_tensors is not None
+                or self.enable_deterministic
+            ):
+                raise RuntimeError(
+                    "SGLANG_DSPARK_DRAFT_FLYDSL does not support sinks, "
+                    "score_mod, aux tensors, or deterministic inference."
+                )
+            from sglang.srt.layers.attention.dspark_draft_flydsl import (
+                forward_draft_extend,
+            )
+
+            return forward_draft_extend(
+                self, q, o, k, v, layer, forward_batch, causal
+            )
 
         # Dense one-shot MLA prefill (AttnForwardMethod.MHA_ONE_SHOT): k/v were
         # up-projected out of the latent cache and span prefix + current chunk,
@@ -2300,6 +2332,11 @@ class TritonAttnBackend(AttentionBackend):
         score_mod=None,
         aux_tensors=None,
     ):
+        if self.is_hip_dspark_draft and envs.SGLANG_DSPARK_DRAFT_FLYDSL.get():
+            raise RuntimeError(
+                "SGLANG_DSPARK_DRAFT_FLYDSL is implemented on forward_extend. "
+                "This draft step called forward_decode."
+            )
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
