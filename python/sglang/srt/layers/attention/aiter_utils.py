@@ -510,6 +510,205 @@ def flydsl_verify_live_batch(q_rows: int, qlen: int, pool_bs: int) -> int:
     return live
 
 
+def flydsl_verify_width_groups(
+    qo_vals: list[int],
+    q_rows: int,
+    pool_bs: int,
+) -> tuple[int, list[tuple[int, list[int]]]]:
+    """Live batch and ``(width, request positions)`` groups from ``qo_indptr``.
+
+    The live batch is the first index whose prefix sum equals ``q_rows``.
+    Requests that share a width are one ``pa_decode`` launch. The width is
+    the indptr delta, never rounded up to the batch max: a 7-token request
+    must not read an eighth KV token. Positions within a group stay in pool
+    order. Groups are ordered by the first request of that width.
+    """
+    if q_rows < 1:
+        raise ValueError(f"query rows must be positive, got {q_rows}")
+    if pool_bs < 1:
+        raise ValueError(f"verify pool must be positive, got {pool_bs}")
+    if len(qo_vals) < 2:
+        raise ValueError("verify qo_indptr is missing")
+    limit = min(pool_bs, len(qo_vals) - 1)
+    bs = None
+    for i in range(1, limit + 1):
+        if qo_vals[i] == q_rows:
+            bs = i
+            break
+        if qo_vals[i] > q_rows:
+            raise ValueError(
+                f"qo_indptr jumps over {q_rows} query rows at request {i} "
+                f"(qo={qo_vals[: i + 1]}, pool {pool_bs})"
+            )
+    if bs is None:
+        raise ValueError(
+            f"qo_indptr does not cover {q_rows} query rows "
+            f"(pool {pool_bs}, prefix {qo_vals[: min(8, len(qo_vals))]})"
+        )
+    buckets: dict[int, list[int]] = {}
+    order: list[int] = []
+    for i in range(bs):
+        width = qo_vals[i + 1] - qo_vals[i]
+        if width < 1:
+            raise ValueError(
+                f"verify width at request {i} is {width} (qo={qo_vals[: bs + 1]})"
+            )
+        if width not in buckets:
+            order.append(width)
+            buckets[width] = []
+        buckets[width].append(i)
+    return bs, [(width, buckets[width]) for width in order]
+
+
+def flydsl_group_row_indices(
+    qo_vals: list[int], width: int, positions: list[int]
+) -> list[int]:
+    """Query-row ids for one width group. Not a contiguous slice when a
+    different width sits between two members.
+    """
+    rows: list[int] = []
+    for i in positions:
+        start = qo_vals[i]
+        rows.extend(range(start, start + width))
+    return rows
+
+
+def flydsl_ragged_dense_rows(
+    qo_indptr: torch.Tensor,
+    verify_lens: torch.Tensor,
+    q_rows: int,
+    max_q: int,
+) -> torch.Tensor:
+    """Map packed query rows onto a dense ``[batch, max_q]`` window.
+
+    Token ``t`` of request ``i`` (width ``w``) lands at
+    ``i * max_q + (max_q - w + t)``. FlyDSL ``pa_decode`` uses dense causal
+    MTP: query index ``j`` reads through context index
+    ``context_len - max_q + j``, and the last query is the newest token.
+    Right-aligning the real tokens makes query ``max_q - w`` the first real
+    token (it reads through the prefix) and query ``max_q - 1`` the last.
+    Slots before the real tokens stay zero; their outputs are discarded.
+    """
+    if q_rows < 1:
+        raise ValueError(f"query rows must be positive, got {q_rows}")
+    if max_q < 1:
+        raise ValueError(f"max_q must be positive, got {max_q}")
+    bs = int(verify_lens.shape[0])
+    if bs < 1:
+        raise ValueError(f"verify batch must be positive, got {bs}")
+    if int(qo_indptr.shape[0]) < bs + 1:
+        raise RuntimeError(
+            f"qo_indptr length {int(qo_indptr.shape[0])} < batch {bs} + 1"
+        )
+    ends = qo_indptr[1 : bs + 1]
+    token_ids = torch.arange(q_rows, device=qo_indptr.device, dtype=torch.int32)
+    req = torch.searchsorted(ends, token_ids, right=True).to(torch.long)
+    starts = qo_indptr[:bs].index_select(0, req)
+    offset = token_ids.to(torch.long) - starts.to(torch.long)
+    widths = verify_lens.index_select(0, req).to(torch.long)
+    local = (max_q - widths) + offset
+    return req * max_q + local
+
+
+def _flydsl_ragged_static_bufs(backend, bs: int, max_q: int, heads: int, dim: int, like):
+    """Dense query, output, and context for one captured ragged shape.
+
+    Allocated on the warmup, before stream capture. A tensor created inside
+    the capturing region is not a stable replay address.
+    """
+    key = (bs, max_q, heads, dim, like.dtype, str(like.device))
+    cache = getattr(backend, "_flydsl_ragged_bufs", None)
+    if cache is None:
+        cache = {}
+        backend._flydsl_ragged_bufs = cache
+    bufs = cache.get(key)
+    if bufs is None:
+        rows = bs * max_q
+        bufs = (
+            torch.empty((rows, heads, dim), dtype=like.dtype, device=like.device),
+            torch.empty((rows, heads, dim), dtype=like.dtype, device=like.device),
+            torch.empty((bs,), dtype=torch.int32, device=like.device),
+        )
+        cache[key] = bufs
+    return bufs
+
+
+def flydsl_forward_ragged_padded(
+    backend,
+    q: torch.Tensor,
+    o: torch.Tensor,
+    layer,
+    forward_batch,
+    layout,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    *,
+    max_context: int,
+    max_q: int,
+    runner,
+) -> None:
+    """One ``pa_decode`` at a fixed ``max_q`` for a mixed-width verify batch.
+
+    ``verify_lens``, ``qo_indptr``, and ``seq_lens`` are device tensors the
+    compact runner refreshes before replay. This launch does not read a
+    length back to the host while the stream is capturing. ``max_q`` and
+    ``max_context`` are the host specialization baked into the graph.
+    """
+    bs = int(layout.verify_lens.shape[0])
+    n_q = int(layer.tp_q_head_num)
+    dim = int(layer.qk_head_dim)
+    q3 = q.reshape(-1, n_q, dim)
+    o3 = o.reshape(-1, n_q, int(layer.v_head_dim))
+    q_rows = int(q3.shape[0])
+    if int(o3.shape[0]) < q_rows:
+        raise RuntimeError(
+            f"ragged verify output rows {int(o3.shape[0])} < query rows {q_rows}"
+        )
+    if int(layer.qk_head_dim) != int(layer.v_head_dim):
+        raise RuntimeError(
+            "FlyDSL ragged verify requires qk_head_dim == v_head_dim, "
+            f"got {layer.qk_head_dim} and {layer.v_head_dim}."
+        )
+    lens = layout.verify_lens[:bs]
+    qo = layout.qo_indptr_device
+    capturing = flydsl_stream_capturing()
+    if not capturing:
+        widest = int(lens.max().item())
+        if widest > max_q or widest < 1:
+            raise RuntimeError(
+                f"FlyDSL ragged verify width {widest} is outside 1..{max_q}."
+            )
+    q_dense, o_dense, context = _flydsl_ragged_static_bufs(
+        backend, bs, max_q, n_q, dim, q3
+    )
+    prefix = forward_batch.seq_lens[:bs]
+    src = prefix if prefix.dtype == torch.int32 else prefix.to(dtype=torch.int32)
+    context.copy_(src)
+    add = lens if lens.dtype == torch.int32 else lens.to(dtype=torch.int32)
+    context.add_(add)
+    rows = flydsl_ragged_dense_rows(qo, lens, q_rows, max_q)
+    q_dense.zero_()
+    q_dense.index_copy_(0, rows, q3[:q_rows])
+    req_indices = forward_batch.req_pool_indices[:bs]
+    table = flydsl_block_table(
+        backend.req_to_token, req_indices, int(backend.page_size), int(max_context)
+    )
+    runner.run(
+        o_dense,
+        q_dense,
+        k_cache,
+        v_cache,
+        context,
+        table,
+        float(layer.scaling),
+        int(max_q),
+        int(max_context),
+        pin_scratch=True,
+    )
+    gathered = o_dense.index_select(0, rows)
+    o3[:q_rows].copy_(gathered)
+
+
 def flydsl_block_table(
     req_to_token: torch.Tensor,
     req_indices: torch.Tensor,
