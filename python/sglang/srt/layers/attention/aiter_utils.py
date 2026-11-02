@@ -606,27 +606,199 @@ def flydsl_ragged_dense_rows(
     return req * max_q + local
 
 
-def _flydsl_ragged_static_bufs(backend, bs: int, max_q: int, heads: int, dim: int, like):
-    """Dense query, output, and context for one captured ragged shape.
+def _flydsl_ragged_bufs(
+    backend,
+    *,
+    bs: int,
+    max_q: int,
+    q_rows: int,
+    n_pages: int,
+    heads: int,
+    dim: int,
+    dtype: torch.dtype,
+    device,
+    table_dtype: torch.dtype,
+    stride0: int,
+    stride1: int,
+    storage_offset: int,
+    page_size: int,
+):
+    """Static buffers for one captured ragged verify shape.
 
-    Allocated on the warmup, before stream capture. A tensor created inside
-    the capturing region is not a stable replay address.
+    Allocated on the warmup, before stream capture. Replay fills these in
+    place. A tensor created inside the capturing region is not a stable
+    address: the int32 gather in ``index_select`` / ``searchsorted`` was
+    the kernel that aborted the batch-256 long-context graph.
     """
-    key = (bs, max_q, heads, dim, like.dtype, str(like.device))
+    key = (
+        bs,
+        max_q,
+        q_rows,
+        n_pages,
+        heads,
+        dim,
+        dtype,
+        table_dtype,
+        str(device),
+        stride0,
+        stride1,
+        storage_offset,
+        page_size,
+    )
     cache = getattr(backend, "_flydsl_ragged_bufs", None)
     if cache is None:
         cache = {}
         backend._flydsl_ragged_bufs = cache
     bufs = cache.get(key)
     if bufs is None:
-        rows = bs * max_q
-        bufs = (
-            torch.empty((rows, heads, dim), dtype=like.dtype, device=like.device),
-            torch.empty((rows, heads, dim), dtype=like.dtype, device=like.device),
-            torch.empty((bs,), dtype=torch.int32, device=like.device),
-        )
+        if flydsl_stream_capturing():
+            raise RuntimeError(
+                "FlyDSL ragged verify buffers must be allocated on the "
+                "warmup, before CUDA graph capture "
+                f"(bs={bs} max_q={max_q} q_rows={q_rows} pages={n_pages})."
+            )
+        window = bs * max_q
+        # Real tokens land in ``[0, window)``. Graph-tier tail tokens past
+        # ``qo_indptr[bs]`` each get their own scratch row so ``index_copy_``
+        # does not gather with an out-of-range request index and does not
+        # alias a real row.
+        scratch = window + q_rows
+        stride = heads * dim
+        page_cols = torch.arange(n_pages, device=device, dtype=torch.long)
+        page_cols.mul_(page_size * stride1)
+        page_cols.add_(storage_offset)
+        bufs = {
+            "q_dense": torch.empty(
+                (scratch, heads, dim), dtype=dtype, device=device
+            ),
+            "o_dense": torch.empty(
+                (scratch, heads, dim), dtype=dtype, device=device
+            ),
+            "context": torch.empty((bs,), dtype=torch.int32, device=device),
+            "qo_i32": torch.empty((bs + 1,), dtype=torch.int32, device=device),
+            "lens_i32": torch.empty((bs,), dtype=torch.int32, device=device),
+            "token_i32": torch.arange(q_rows, device=device, dtype=torch.int32),
+            "token_i64": torch.arange(q_rows, device=device, dtype=torch.long),
+            "req": torch.empty((q_rows,), dtype=torch.long, device=device),
+            "starts_src": torch.empty((q_rows,), dtype=torch.int32, device=device),
+            "widths_src": torch.empty((q_rows,), dtype=torch.int32, device=device),
+            "starts": torch.empty((q_rows,), dtype=torch.long, device=device),
+            "widths": torch.empty((q_rows,), dtype=torch.long, device=device),
+            "real_rows": torch.empty((q_rows,), dtype=torch.long, device=device),
+            "ghost_rows": torch.empty((q_rows,), dtype=torch.long, device=device),
+            "rows": torch.empty((q_rows,), dtype=torch.long, device=device),
+            "valid": torch.empty((q_rows,), dtype=torch.bool, device=device),
+            "page_cols": page_cols,
+            "req_scaled": torch.empty((bs,), dtype=torch.long, device=device),
+            "lin_index": torch.empty((bs, n_pages), dtype=torch.long, device=device),
+            "slots": torch.empty((bs, n_pages), dtype=table_dtype, device=device),
+            "slots_i64": torch.empty((bs, n_pages), dtype=torch.int64, device=device),
+            "table": torch.empty((bs, n_pages), dtype=torch.int32, device=device),
+            "gathered": torch.empty((q_rows, heads, dim), dtype=dtype, device=device),
+            "gidx": torch.empty((q_rows, stride), dtype=torch.long, device=device),
+            "window": window,
+            "stride0": stride0,
+        }
         cache[key] = bufs
     return bufs
+
+
+def flydsl_fill_ragged_row_index(
+    bufs: dict,
+    qo: torch.Tensor,
+    verify_lens: torch.Tensor,
+    *,
+    bs: int,
+    max_q: int,
+    q_rows: int,
+) -> torch.Tensor:
+    """Right-aligned dense row for each packed token, written in place.
+
+    Token ``t`` of request ``i`` (width ``w``) lands at
+    ``i * max_q + (max_q - w + t)``, matching ``flydsl_ragged_dense_rows``.
+    Tokens at or past ``qo[bs]`` are the graph bucket's uncovered tail.
+    They cannot index ``qo[:bs]`` (that gather is the HSA abort) and they
+    must not share a destination, so each one is parked at
+    ``bs * max_q + token_id``, past the ``pa_decode`` window.
+    """
+    if bs < 1:
+        raise ValueError(f"verify batch must be positive, got {bs}")
+    if q_rows < 1:
+        raise ValueError(f"query rows must be positive, got {q_rows}")
+    qo_i32 = bufs["qo_i32"]
+    lens_i32 = bufs["lens_i32"]
+    qo_i32.copy_(qo[: bs + 1])
+    lens_i32.copy_(verify_lens[:bs])
+    ends = qo_i32[1 : bs + 1]
+    req = bufs["req"]
+    written = torch.searchsorted(ends, bufs["token_i32"], out=req, right=True)
+    if written.data_ptr() != req.data_ptr():
+        raise RuntimeError(
+            "searchsorted did not write the static ragged row-index buffer"
+        )
+    req.clamp_(max=bs - 1)
+    torch.gather(qo_i32[:bs], 0, req, out=bufs["starts_src"])
+    bufs["starts"].copy_(bufs["starts_src"])
+    torch.gather(lens_i32, 0, req, out=bufs["widths_src"])
+    bufs["widths"].copy_(bufs["widths_src"])
+    # local = max_q - width + (token - start); real = req * max_q + local
+    real = bufs["real_rows"]
+    real.copy_(bufs["token_i64"])
+    real.sub_(bufs["starts"])
+    real.sub_(bufs["widths"])
+    real.add_(max_q)
+    local = bufs["starts"]
+    local.copy_(real)
+    real.copy_(req)
+    real.mul_(max_q)
+    real.add_(local)
+    torch.lt(bufs["token_i32"], qo_i32[bs], out=bufs["valid"])
+    ghost = bufs["ghost_rows"]
+    ghost.copy_(bufs["token_i64"])
+    ghost.add_(bs * max_q)
+    rows = bufs["rows"]
+    torch.where(bufs["valid"], real, ghost, out=rows)
+    return rows
+
+
+def flydsl_fill_block_table_static(
+    bufs: dict,
+    req_to_token: torch.Tensor,
+    req_indices: torch.Tensor,
+    *,
+    bs: int,
+    page_size: int,
+) -> torch.Tensor:
+    """Page ids for ``[0, max_context)``, gathered into a warmup buffer.
+
+    ``req_to_token[req, p * page_size] // page_size`` is the same value as
+    ``flydsl_block_table``. The static path does not materialize the full
+    ``[batch, max_context]`` row, which was an allocating int32 gather.
+    """
+    if req_indices.device != bufs["req_scaled"].device:
+        raise RuntimeError(
+            "FlyDSL block-table indices must already be on the table device"
+        )
+    req_scaled = bufs["req_scaled"]
+    req_scaled.copy_(req_indices[:bs])
+    req_scaled.mul_(bufs["stride0"])
+    lin = bufs["lin_index"]
+    n_pages = int(lin.shape[1])
+    lin.copy_(bufs["page_cols"].view(1, n_pages).expand(bs, n_pages))
+    lin.add_(req_scaled.view(bs, 1))
+    flat = req_to_token.as_strided(
+        (req_to_token.untyped_storage().size() // req_to_token.element_size(),),
+        (1,),
+        storage_offset=0,
+    )
+    slots = bufs["slots"]
+    torch.gather(flat, 0, lin.reshape(-1), out=slots.reshape(-1))
+    slots_i64 = bufs["slots_i64"]
+    slots_i64.copy_(slots)
+    torch.div(slots_i64, page_size, rounding_mode="floor", out=slots_i64)
+    table = bufs["table"]
+    table.copy_(slots_i64)
+    return table
 
 
 def flydsl_forward_ragged_padded(
@@ -649,6 +821,7 @@ def flydsl_forward_ragged_padded(
     compact runner refreshes before replay. This launch does not read a
     length back to the host while the stream is capturing. ``max_q`` and
     ``max_context`` are the host specialization baked into the graph.
+    Row indices and the block table are warmup buffers filled in place.
     """
     bs = int(layout.verify_lens.shape[0])
     n_q = int(layer.tp_q_head_num)
@@ -674,24 +847,60 @@ def flydsl_forward_ragged_padded(
             raise RuntimeError(
                 f"FlyDSL ragged verify width {widest} is outside 1..{max_q}."
             )
-    q_dense, o_dense, context = _flydsl_ragged_static_bufs(
-        backend, bs, max_q, n_q, dim, q3
+    page_size = int(backend.page_size)
+    if page_size not in (16, 64, 128):
+        raise ValueError(f"FlyDSL page size must be 16, 64, or 128, got {page_size}")
+    if max_context < 1:
+        raise ValueError(f"max_context must be positive, got {max_context}")
+    n_pages = (int(max_context) + page_size - 1) // page_size
+    last_start = (n_pages - 1) * page_size
+    req_to_token = backend.req_to_token
+    if req_to_token.shape[1] <= last_start:
+        raise RuntimeError(
+            f"req_to_token width {req_to_token.shape[1]} has no column "
+            f"{last_start} for context {max_context} at page size {page_size}"
+        )
+    bufs = _flydsl_ragged_bufs(
+        backend,
+        bs=bs,
+        max_q=max_q,
+        q_rows=q_rows,
+        n_pages=n_pages,
+        heads=n_q,
+        dim=dim,
+        dtype=q3.dtype,
+        device=q3.device,
+        table_dtype=req_to_token.dtype,
+        stride0=int(req_to_token.stride(0)),
+        stride1=int(req_to_token.stride(1)),
+        storage_offset=int(req_to_token.storage_offset()),
+        page_size=page_size,
     )
+    context = bufs["context"]
     prefix = forward_batch.seq_lens[:bs]
-    src = prefix if prefix.dtype == torch.int32 else prefix.to(dtype=torch.int32)
-    context.copy_(src)
-    add = lens if lens.dtype == torch.int32 else lens.to(dtype=torch.int32)
-    context.add_(add)
-    rows = flydsl_ragged_dense_rows(qo, lens, q_rows, max_q)
+    context.copy_(prefix)
+    lens_i32 = bufs["lens_i32"]
+    lens_i32.copy_(lens)
+    context.add_(lens_i32)
+    rows = flydsl_fill_ragged_row_index(
+        bufs, qo, lens, bs=bs, max_q=max_q, q_rows=q_rows
+    )
+    q_dense = bufs["q_dense"]
+    o_dense = bufs["o_dense"]
     q_dense.zero_()
     q_dense.index_copy_(0, rows, q3[:q_rows])
     req_indices = forward_batch.req_pool_indices[:bs]
-    table = flydsl_block_table(
-        backend.req_to_token, req_indices, int(backend.page_size), int(max_context)
+    table = flydsl_fill_block_table_static(
+        bufs,
+        req_to_token,
+        req_indices,
+        bs=bs,
+        page_size=page_size,
     )
+    window = bufs["window"]
     runner.run(
-        o_dense,
-        q_dense,
+        o_dense[:window],
+        q_dense[:window],
         k_cache,
         v_cache,
         context,
@@ -701,7 +910,16 @@ def flydsl_forward_ragged_padded(
         int(max_context),
         pin_scratch=True,
     )
-    gathered = o_dense.index_select(0, rows)
+    gathered = bufs["gathered"]
+    stride = n_q * dim
+    gidx = bufs["gidx"]
+    gidx.copy_(rows.view(q_rows, 1).expand(q_rows, stride))
+    torch.gather(
+        o_dense.view(int(o_dense.shape[0]), stride),
+        0,
+        gidx,
+        out=gathered.view(q_rows, stride),
+    )
     o3[:q_rows].copy_(gathered)
 
 
