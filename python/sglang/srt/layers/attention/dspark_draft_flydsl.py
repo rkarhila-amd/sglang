@@ -230,13 +230,27 @@ def _runner(backend):
     return runner
 
 
+def _static_context_buf(backend, bs: int, device) -> torch.Tensor:
+    """One int32 context buffer per captured batch. Allocated outside capture."""
+    cache = getattr(backend, "_draft_flydsl_ctx_bufs", None)
+    if cache is None:
+        cache = {}
+        backend._draft_flydsl_ctx_bufs = cache
+    key = (bs, str(device))
+    buf = cache.get(key)
+    if buf is None:
+        buf = torch.empty((bs,), dtype=torch.int32, device=device)
+        cache[key] = buf
+    return buf
+
+
 def _context(
     backend, forward_batch, bs: int, qlen: int, graph_bound: bool, capturing: bool
 ) -> Tuple[torch.Tensor, int]:
     # The hand-built DSPARK block stores the prefix in seq_lens and does not
     # set extend_prefix_lens. The qlen new tokens are already in the pool.
-    # A context tensor built before capture is not replayed. The key includes
-    # the capture flag so the recording rebuilds from the static seq_lens.
+    # A tensor allocated inside capture is not a stable replay address. The
+    # graph-bound path fills a buffer created on the warmup, in place.
     prefix = forward_batch.extend_prefix_lens
     if prefix is None:
         prefix = forward_batch.seq_lens
@@ -249,10 +263,16 @@ def _context(
     cached = getattr(backend, "_draft_flydsl_ctx", None)
     if cached is not None and cached[0] == key:
         return cached[1], cached[2]
-    context = (prefix[:bs].to(dtype=torch.int32) + qlen).contiguous()
     if graph_bound:
+        context = _static_context_buf(backend, bs, prefix.device)
+        src = prefix[:bs]
+        if src.dtype != torch.int32:
+            src = src.to(dtype=torch.int32)
+        context.copy_(src)
+        context.add_(qlen)
         spec = _capture_max_context(backend)
     else:
+        context = (prefix[:bs].to(dtype=torch.int32) + qlen).contiguous()
         true_max = int(context.max().item())
         if true_max < qlen:
             raise RuntimeError(
