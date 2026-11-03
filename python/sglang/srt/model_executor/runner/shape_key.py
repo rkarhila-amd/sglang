@@ -28,3 +28,6 @@ class ShapeKey:
     variant_label: Optional[str] = None
     # Independent attention variant (DSA dense/sparse, candidate_*); None is default.
     attention_variant: Optional[str] = None
+    # Ragged verify only: slot count baked into this graph. None on every
+    # other runner. One token tier can have a wide graph and a tight one.
+    ragged_slots: Optional[int] = None
