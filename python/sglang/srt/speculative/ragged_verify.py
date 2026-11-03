@@ -58,6 +58,12 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
     # Per-row upper bound (capped padded variant); rows never exceed it, so
     # dense [bs, cap] consumers stay in bounds. None = full-coverage variant.
     cap: Optional[int] = None
+    # Token count the capped pad may assign to rows. The replay key
+    # (graph_num_tokens) can be a promoted tier so a 64-request batch
+    # hits a tight slot graph. Eager has no graph runner and keeps the
+    # natural tier, so the promotion gap must stay a ghost instead of
+    # landing on the last real request. None means "use graph_num_tokens".
+    pad_num_tokens: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.verify_lens_cpu is None:
@@ -98,6 +104,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         verify_lens_cpu: Optional[list[int]] = None,
         total_verify_tokens: Optional[int] = None,
         cap: Optional[int] = None,
+        pad_num_tokens: Optional[int] = None,
     ) -> RaggedVerifyLayout:
         from sglang.kernels.ops.speculative.ragged_verify_kernels import (
             BuildQoIndptr,
@@ -113,6 +120,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             verify_lens_cpu=verify_lens_cpu,
             total_verify_tokens=total_verify_tokens,
             cap=cap,
+            pad_num_tokens=pad_num_tokens,
         )
 
     @classmethod
@@ -138,9 +146,12 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         *,
         verify_lens: torch.Tensor,
         graph_num_tokens: int,
+        pad_num_tokens: Optional[int] = None,
     ) -> RaggedVerifyLayout:
         return cls._assemble_device(
-            verify_lens=verify_lens, graph_num_tokens=graph_num_tokens
+            verify_lens=verify_lens,
+            graph_num_tokens=graph_num_tokens,
+            pad_num_tokens=pad_num_tokens,
         )
 
     @classmethod
@@ -172,15 +183,20 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         no padding rows, the last real row) can exceed the per-request verify
         window. Dense-layout consumers (mamba/KDA) must pass cap=N: rows are
         clamped to N and the layout no longer covers the tier's leftover
-        tokens -- those collapse into the consumer's ghost slot. Real tokens
-        map identically under both variants."""
+        tokens -- those collapse into the consumer's ghost slot. A promoted
+        replay tier keeps graph_num_tokens for the graph key and assigns
+        rows only up to pad_num_tokens, the natural tier eager still uses.
+        Real tokens map identically under both variants."""
         from sglang.kernels.ops.speculative.ragged_verify_kernels import (
             PaddedToBucket,
         )
 
+        budget = self.graph_num_tokens
+        if cap is not None and self.pad_num_tokens is not None:
+            budget = min(int(self.pad_num_tokens), self.graph_num_tokens)
         padded = PaddedToBucket.execute(
             verify_lens=self.verify_lens,
-            graph_num_tokens=self.graph_num_tokens,
+            graph_num_tokens=budget,
             bs=self.bs,
             padded_bs=padded_bs,
         )
@@ -192,6 +208,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             graph_num_tokens=self.graph_num_tokens,
             total_verify_tokens=None if cap is not None else self.graph_num_tokens,
             cap=cap,
+            pad_num_tokens=self.pad_num_tokens,
         )
 
 
@@ -216,6 +233,37 @@ def build_capture_verify_lens(
     return [base + 1] * rem + [base] * (num_slots - rem)
 
 
+# Pre-pad verify widths for the breakable grouped gap, keyed by the
+# captured layout object the replay batch carries. Staging then
+# overwrites that object's tensors with the bucket fill. When the
+# batch fills the slot count, the fill lands on the last real row.
+# Exact-width launches must not read those tokens.
+_REAL_VERIFY_LENS: dict[int, tuple[torch.Tensor, int]] = {}
+
+
+def remember_real_verify_lens(cap_layout, verify_lens: torch.Tensor) -> None:
+    n = int(verify_lens.shape[0])
+    if n < 1:
+        return
+    buf, _stored = _REAL_VERIFY_LENS.get(id(cap_layout), (None, 0))
+    if buf is None or int(buf.shape[0]) < n or buf.device != verify_lens.device:
+        buf = torch.empty(n, dtype=torch.int32, device=verify_lens.device)
+    buf[:n].copy_(verify_lens[:n].to(dtype=torch.int32))
+    _REAL_VERIFY_LENS[id(cap_layout)] = (buf, n)
+
+
+def staged_real_verify_lens(cap_layout) -> Optional[torch.Tensor]:
+    if cap_layout is None:
+        return None
+    item = _REAL_VERIFY_LENS.get(id(cap_layout))
+    if item is None:
+        return None
+    buf, n = item
+    if n < 1:
+        return None
+    return buf[:n]
+
+
 def resolve_ragged_verify_layout(forward_batch) -> Optional[RaggedVerifyLayout]:
     """Layout riding the batch's spec input, or None. Tolerates the runner's
     ad-hoc replay batch views, which may not carry spec_info at all."""
@@ -223,6 +271,24 @@ def resolve_ragged_verify_layout(forward_batch) -> Optional[RaggedVerifyLayout]:
     if spec_info is None:
         return None
     return spec_info.ragged_verify_layout
+
+
+def ragged_verify_dense_scatter_indices(
+    *, query_start_loc: torch.Tensor, seq_len: int, draft_token_num: int
+) -> torch.Tensor:
+    """Map packed tokens to dense ``[request, step]`` slots.
+
+    Uncovered graph-tail tokens map to one value-irrelevant ghost slot.
+    Cherry-picked helper from sgl-project/sglang#38897 (used by GDN/KDA
+    varlen compact verify paths).
+    """
+    batch_size = query_start_loc.shape[0] - 1
+    token_pos = torch.arange(seq_len, device=query_start_loc.device, dtype=torch.int32)
+    token_slots = torch.searchsorted(query_start_loc[1:], token_pos, right=True)
+    return (
+        token_slots * draft_token_num
+        + (token_pos - query_start_loc[token_slots]).to(torch.int64)
+    ).clamp_(max=batch_size * draft_token_num)
 
 
 class RaggedTargetVerifyGeometry(msgspec.Struct):

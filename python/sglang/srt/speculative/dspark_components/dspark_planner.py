@@ -365,6 +365,13 @@ class DSparkVerifyPlanner:
             )
         )
 
+    def _forced_budget_pin_active(self) -> bool:
+        # The width profiler sets this while the SPS table is still the
+        # uninitialized sentinel. Verify-all would ignore the pin and every
+        # frac would measure the full draft window.
+        planner = self._budget_planner
+        return planner is not None and planner.forced_budget_frac is not None
+
     def schedule_layout(
         self,
         *,
@@ -378,7 +385,11 @@ class DSparkVerifyPlanner:
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
-        if self._is_verify_all and self._ragged_verify_mode is RaggedVerifyMode.COMPACT:
+        if (
+            self._is_verify_all
+            and self._ragged_verify_mode is RaggedVerifyMode.COMPACT
+            and not self._forced_budget_pin_active()
+        ):
             # Verify-all: the uniform layout (or None, past the captured grid)
             # is constant per (bs, tier); serve it from cache instead of paying
             # the per-step schedule and its host<->device round-trips.
@@ -393,6 +404,18 @@ class DSparkVerifyPlanner:
                     tier_num_reqs=global_num_reqs,
                 )
             return self._uniform_layout_cache[key]
+        if (
+            self._is_verify_all
+            and self._ragged_verify_mode is RaggedVerifyMode.COMPACT
+            and self._forced_budget_pin_active()
+            and not getattr(self, "_logged_force_budget_pin", False)
+        ):
+            self._logged_force_budget_pin = True
+            logger.info(
+                "DSpark force-budget pin is active on the verify-all path; "
+                "scheduling verify lengths from dspark_force_budget_frac "
+                "instead of the uniform full window."
+            )
         verify_lens = self._schedule_verify_lens(
             req_pool_indices=req_pool_indices,
             prefix_lens=prefix_lens,
@@ -453,7 +476,14 @@ class DSparkVerifyPlanner:
         )
         capture_num_tokens = ragged_capture_num_tokens(model_runner=self.model_runner)
         if graph_num_tokens_floor > 0 and capture_num_tokens is not None:
-            graph_num_tokens = round_up_grid(graph_num_tokens_floor, capture_num_tokens)
+            # Stay on the natural tier. Eager has no graph runner and
+            # rounds to this same grid. A taller token count, even with
+            # the row budget clamped back, moved the mix logprobs.
+            # A 64-request batch that does not fit this tier's owning
+            # bucket replays a 64-slot graph captured at this token count.
+            graph_num_tokens = round_up_grid(
+                graph_num_tokens_floor, capture_num_tokens
+            )
             return RaggedVerifyLayout.from_verify_lens_device(
                 verify_lens=verify_lens, graph_num_tokens=graph_num_tokens
             )
@@ -864,6 +894,54 @@ class VerifyBudgetDecision(msgspec.Struct):
     predicted_theta: Optional[float] = None
 
 
+def _table_is_full_window_only(sps_table: SpsCostTable, max_verify_len: int) -> bool:
+    """True when every probe sits on ``batch_size * max_verify_len``.
+
+    The 1D SPS profiler records one steps/sec point per batch size at a full
+    verify window and does not measure narrower windows. Those x-values are
+    batch size in disguise. A table that also has a probe not divisible by
+    ``max_verify_len`` was measured off that diagonal and still has a token axis.
+    A single probe is constant under either lookup, so it stays on the token axis.
+    """
+    if max_verify_len <= 1 or len(sps_table.sample_batch_tokens) < 2:
+        return False
+    return all(probe % max_verify_len == 0 for probe in sps_table.sample_batch_tokens)
+
+
+_FULL_WINDOW_SPS_LOGGED = False
+
+
+def _sps_batch_tokens_for_budgets(
+    *,
+    sps_table: SpsCostTable,
+    num_requests: int,
+    num_budgets: int,
+    max_verify_len: int,
+) -> torch.Tensor:
+    """Batch-token keys for each candidate budget.
+
+    On a full-window-only table, step rate follows the batch (and the CU
+    waves already baked into that batch's probe), not the verify width.
+    Index every budget at ``num_requests * max_verify_len``. Tables with a
+    real width axis keep ``num_requests + budget``.
+    """
+    global _FULL_WINDOW_SPS_LOGGED
+    if _table_is_full_window_only(sps_table, max_verify_len):
+        if not _FULL_WINDOW_SPS_LOGGED:
+            _FULL_WINDOW_SPS_LOGGED = True
+            logger.info(
+                "DSPARK_SPS_BATCH_WAVE full-window SPS table: indexing steps/sec "
+                "at num_requests * max_verify_len, not N+budget "
+                "(first call num_requests=%s max_verify_len=%s key=%s).",
+                num_requests,
+                max_verify_len,
+                num_requests * max_verify_len,
+            )
+        key = int(num_requests) * int(max_verify_len)
+        return torch.full((num_budgets,), key, dtype=torch.int64)
+    return num_requests + torch.arange(num_budgets, dtype=torch.int64)
+
+
 def compute_verify_token_budget(
     *,
     history_survival_probs: torch.Tensor,
@@ -891,7 +969,12 @@ def compute_verify_token_budget(
         idx = int(torch.argmax(theta))
         predicted_step_seconds = float(step_time[idx])
     else:
-        batch_tokens = num_requests + torch.arange(tau_star.numel(), dtype=torch.int64)
+        batch_tokens = _sps_batch_tokens_for_budgets(
+            sps_table=sps_table,
+            num_requests=int(num_requests),
+            num_budgets=int(tau_star.numel()),
+            max_verify_len=int(max_len),
+        )
         sps = _lookup_sps_tensor(sps_table=sps_table, batch_tokens=batch_tokens)
         theta = tau_star * sps
         idx = int(torch.argmax(theta))

@@ -42,6 +42,9 @@ class TritonGDNKernel(LinearAttnKernelBase):
 
     supports_packed_decode: bool = not is_cpu() and not is_npu()
     supports_strided_target_verify_qkv: bool = True
+    # Prefix-cache checkpoints must be the fp32 boundary state. The bf16 `h`
+    # tensor is a rounded copy; replaying a radix tail from it diverges.
+    supports_track_state_snapshot: bool = not is_cpu() and not is_npu()
 
     def packed_decode(
         self,
@@ -190,6 +193,12 @@ class TritonGDNKernel(LinearAttnKernelBase):
                 "chunk_indices": kwargs["chunk_indices"],
                 "chunk_offsets": kwargs["chunk_offsets"],
             }
+        track_args = {}
+        if self.supports_track_state_snapshot and kwargs.get("track_state") is not None:
+            track_args = {
+                "track_state": kwargs["track_state"],
+                "track_chunk_idx": kwargs["track_chunk_idx"],
+            }
         if is_cpu():
             if not inplace_update:
                 raise NotImplementedError(
@@ -220,6 +229,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             **recurrent_state_indices_args,
             **inplace_update_args,
             **graph_table_args,
+            **track_args,
         )
 
     def target_verify(
