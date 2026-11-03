@@ -4126,18 +4126,46 @@ class AiterAttnBackend(AttentionBackend):
                 tuple(k_cache.shape),
             )
             self._flydsl_logged = True
-        self._flydsl_runner().run(
-            o3,
-            q3,
-            k_cache,
-            v_cache,
-            context,
-            table,
-            float(layer.scaling),
-            query_length,
-            max_context,
-            pin_scratch=self._flydsl_graph_bound(),
-        )
+        # query_length > 1 couples sequences. A batch-4 launch with long
+        # neighbors moves sequence 0, including row 0
+        # (decode-step-batch-bisect/bisect.json, bs4_q8_ctx_long_cloneq:
+        # max abs 0.0625, 3579 elements). The compact graph path already
+        # launches one slot at a time. This is the eager uniform and
+        # width-grouped verify. query_length 1 stays one launch: decode
+        # and the uniform draft block use it on both servers, and splitting
+        # only one side would open a new gap. A short neighbor (context
+        # 128) leaves row 0 unchanged, which matches the short-mix gate.
+        runner = self._flydsl_runner()
+        pin = self._flydsl_graph_bound()
+        if query_length == 1 or bs == 1:
+            runner.run(
+                o3,
+                q3,
+                k_cache,
+                v_cache,
+                context,
+                table,
+                float(layer.scaling),
+                query_length,
+                max_context,
+                pin_scratch=pin,
+            )
+            return
+        for slot in range(bs):
+            start = slot * query_length
+            stop = start + query_length
+            runner.run(
+                o3[start:stop],
+                q3[start:stop],
+                k_cache,
+                v_cache,
+                context[slot : slot + 1],
+                table[slot : slot + 1],
+                float(layer.scaling),
+                query_length,
+                max_context,
+                pin_scratch=pin,
+            )
 
     def _forward_target_verify_flydsl_padded(
         self,
