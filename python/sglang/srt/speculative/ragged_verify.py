@@ -58,6 +58,12 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
     # Per-row upper bound (capped padded variant); rows never exceed it, so
     # dense [bs, cap] consumers stay in bounds. None = full-coverage variant.
     cap: Optional[int] = None
+    # Token count the capped pad may assign to rows. The replay key
+    # (graph_num_tokens) can be a promoted tier so a 64-request batch
+    # hits a tight slot graph. Eager has no graph runner and keeps the
+    # natural tier, so the promotion gap must stay a ghost instead of
+    # landing on the last real request. None means "use graph_num_tokens".
+    pad_num_tokens: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.verify_lens_cpu is None:
@@ -98,6 +104,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         verify_lens_cpu: Optional[list[int]] = None,
         total_verify_tokens: Optional[int] = None,
         cap: Optional[int] = None,
+        pad_num_tokens: Optional[int] = None,
     ) -> RaggedVerifyLayout:
         from sglang.kernels.ops.speculative.ragged_verify_kernels import (
             BuildQoIndptr,
@@ -113,6 +120,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             verify_lens_cpu=verify_lens_cpu,
             total_verify_tokens=total_verify_tokens,
             cap=cap,
+            pad_num_tokens=pad_num_tokens,
         )
 
     @classmethod
@@ -138,9 +146,12 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         *,
         verify_lens: torch.Tensor,
         graph_num_tokens: int,
+        pad_num_tokens: Optional[int] = None,
     ) -> RaggedVerifyLayout:
         return cls._assemble_device(
-            verify_lens=verify_lens, graph_num_tokens=graph_num_tokens
+            verify_lens=verify_lens,
+            graph_num_tokens=graph_num_tokens,
+            pad_num_tokens=pad_num_tokens,
         )
 
     @classmethod
@@ -172,15 +183,20 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         no padding rows, the last real row) can exceed the per-request verify
         window. Dense-layout consumers (mamba/KDA) must pass cap=N: rows are
         clamped to N and the layout no longer covers the tier's leftover
-        tokens -- those collapse into the consumer's ghost slot. Real tokens
-        map identically under both variants."""
+        tokens -- those collapse into the consumer's ghost slot. A promoted
+        replay tier keeps graph_num_tokens for the graph key and assigns
+        rows only up to pad_num_tokens, the natural tier eager still uses.
+        Real tokens map identically under both variants."""
         from sglang.kernels.ops.speculative.ragged_verify_kernels import (
             PadVerifyLayout,
         )
 
+        budget = self.graph_num_tokens
+        if cap is not None and self.pad_num_tokens is not None:
+            budget = min(int(self.pad_num_tokens), self.graph_num_tokens)
         padded = PadVerifyLayout.execute(
             verify_lens=self.verify_lens,
-            graph_num_tokens=self.graph_num_tokens,
+            graph_num_tokens=budget,
             padded_bs=padded_bs,
             cap=cap,
         )
@@ -191,6 +207,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             qo_indptr_device=padded.qo_indptr,
             total_verify_tokens=None if cap is not None else self.graph_num_tokens,
             cap=cap,
+            pad_num_tokens=self.pad_num_tokens,
         )
 
 
