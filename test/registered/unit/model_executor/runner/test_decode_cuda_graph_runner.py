@@ -475,6 +475,80 @@ class TestRaggedVerifyLayoutPerTier(CustomTestCase):
                 torch.testing.assert_close(layout.verify_lens, expected.verify_lens)
 
 
+class TestRaggedVerifyTightSlotKey(CustomTestCase):
+    """A token tier keeps its wide slot graph and adds a request-bucket graph.
+
+    Conc64 is floored to 64 * width tokens. That tier's tight key is 64 slots.
+    A 256-request batch on a smaller tier still takes the wide key.
+    """
+
+    def _runner(self):
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.ragged_verify_mode = True
+        runner.max_bs = 256
+        runner.captured_req_width = 8
+        runner.capture_num_tokens = [64, 256, 512, 2048]
+        runner.device = "cpu"
+        runner._captured_ragged_layouts = {}
+        return runner
+
+    def test_replay_picks_tight_only_when_the_batch_fits(self):
+        runner = self._runner()
+        cases = (
+            # conc64 floor: 512 tokens, 64 requests -> 64 slots, not 256
+            (512, 64, 64),
+            # one request over the bucket stays on the wide graph
+            (512, 65, 256),
+            # short-width conc256 on the 512-token tier
+            (512, 256, 256),
+            # max tier has one graph
+            (2048, 256, 256),
+            (2048, 64, 256),
+            # 32 requests on the 256-token tier fit the bucket
+            (256, 32, 32),
+            # 64 requests do not fit a 32-slot bucket
+            (256, 64, 256),
+            # tier whose wide count is the token count, not max_bs
+            (64, 8, 8),
+            (64, 40, 64),
+        )
+        for tokens, raw_bs, want in cases:
+            with self.subTest(tokens=tokens, raw_bs=raw_bs):
+                self.assertEqual(runner._ragged_replay_slots(tokens, raw_bs), want)
+
+    def test_capture_keeps_both_layouts(self):
+        import os
+
+        import torch
+
+        from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+
+        runner = self._runner()
+        with mock.patch.dict(
+            os.environ, {"SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE": "0"}
+        ):
+            self.assertEqual(runner._ragged_slot_counts(512), (256, 64))
+            self.assertEqual(runner._ragged_slot_counts(2048), (256,))
+            wide = runner._capture_ragged_verify_layout(512, num_slots=256)
+            tight = runner._capture_ragged_verify_layout(512, num_slots=64)
+        self.assertIsNot(wide, tight)
+        self.assertEqual(int(wide.verify_lens.shape[0]), 256)
+        self.assertEqual(int(tight.verify_lens.shape[0]), 64)
+        self.assertEqual(int(wide.verify_lens.sum()), 512)
+        self.assertEqual(int(tight.verify_lens.sum()), 512)
+
+        live = RaggedVerifyLayout.from_verify_lens_device(
+            verify_lens=torch.tensor([8] * 64, dtype=torch.int32),
+            graph_num_tokens=512,
+        )
+        runner._stage_ragged_verify_layout(live, 512, 64)
+        staged = runner._captured_ragged_layouts[(512, 64)]
+        self.assertEqual(int(staged.verify_lens.shape[0]), 64)
+        self.assertEqual(int(wide.verify_lens.sum()), 512)
+        # staging the tight graph must not rewrite the wide graph's lens
+        self.assertEqual(int(wide.verify_lens.shape[0]), 256)
+
+
 class TestPrePlannedReplayRestage(CustomTestCase):
     """A pre-planned replay may skip copying input_ids and positions again only when
     the full load copied the same tensors, unwritten since, on the same stream."""
@@ -503,7 +577,7 @@ class TestPrePlannedReplayRestage(CustomTestCase):
         runner._set_dp_real_num_tokens = lambda _: None
         runner._resolve_lora_variant = lambda _: None
         runner._resolve_attention_variant = lambda *_: None
-        runner._make_graph_key = lambda *key: key
+        runner._make_graph_key = lambda *key, **_kwargs: key
         # SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS on
         runner._restage_skip, runner._staged_inputs = True, None
         return runner
