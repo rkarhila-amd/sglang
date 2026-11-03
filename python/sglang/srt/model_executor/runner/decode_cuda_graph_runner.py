@@ -905,50 +905,45 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return self._ragged_capture_slots(num_tokens)
         return num_tokens // width
 
-    def _ragged_replay_slots(self, num_tokens: int, raw_bs: int) -> int:
-        wide = self._ragged_capture_slots(num_tokens)
-        tight = self._ragged_tight_slots(num_tokens)
-        if tight < wide and raw_bs <= tight:
-            return tight
-        return wide
+    def _ragged_fit_slots(self, num_tokens: int) -> tuple[int, ...]:
+        """Extra slot graphs at this token tier.
 
-    def promote_ragged_graph_tier(self, natural: int, raw_bs: int) -> int:
-        """Token tier whose captured slot count can hold ``raw_bs``.
-
-        Dynamic verify rounds a 64-request batch to the live token count.
-        That tier's request-bucket graph is ``tier / width`` slots, which
-        is below 64 when the cap length is about 5, so replay stays on
-        the wide graph. Climb to the smallest captured tier that has a
-        tighter slot count and still fits inside ``raw_bs * width``.
-        A 256-request batch finds no tighter graph and stays put. This
-        does not change ``_ragged_capture_slots``.
+        The owning bucket is ``tier / width``. A 64-request batch whose
+        verify tokens round to a shorter tier does not fit that bucket,
+        and once the tier reaches ``max_bs`` the wide key is 256 slots.
+        Capture 64 slots at the same token count. Do not climb
+        ``graph_num_tokens``: eager's layout is this tier, and a taller
+        key moved the mix logprobs. Tiers below ``max_bs`` tokens already
+        loop fewer than 256 slots, so they do not get a third graph.
         """
+        wide = self._ragged_capture_slots(num_tokens)
+        if wide < self.max_bs:
+            return ()
+        tight = self._ragged_tight_slots(num_tokens)
         width = self.captured_req_width
-        if width < 1 or raw_bs < 1:
-            return natural
-        limit = raw_bs * width
-        if natural > limit:
-            return natural
-        natural_wide = self._ragged_capture_slots(natural)
-        if self._ragged_tight_slots(natural) >= raw_bs:
-            return natural
-        need = raw_bs * width
-        grid = self.capture_num_tokens or []
-        for tokens in grid:
-            if tokens < natural or tokens < need or tokens > limit:
-                continue
-            slots = self._ragged_tight_slots(tokens)
-            if slots >= raw_bs and slots < natural_wide:
-                return tokens
-        return natural
+        slots = 64
+        if not (tight < slots < wide):
+            return ()
+        if slots > num_tokens or width < 1 or num_tokens > slots * width:
+            return ()
+        return (slots,)
+
+    def _ragged_replay_slots(self, num_tokens: int, raw_bs: int) -> int:
+        counts = self._ragged_slot_counts(num_tokens)
+        fitting = [slots for slots in counts if slots >= raw_bs]
+        if not fitting:
+            return counts[0]
+        return min(fitting)
 
     def _ragged_slot_counts(self, num_tokens: int) -> tuple[int, ...]:
         wide = self._ragged_capture_slots(num_tokens)
         tight = self._ragged_tight_slots(num_tokens)
-        if tight != wide:
-            # Wide first so the larger launch loop allocates the pool.
-            return (wide, tight)
-        return (wide,)
+        # Wide first so the larger launch loop allocates the pool.
+        counts: list[int] = []
+        for slots in (wide, *self._ragged_fit_slots(num_tokens), tight):
+            if slots not in counts:
+                counts.append(slots)
+        return tuple(counts)
 
     def _capture_ragged_verify_layout(
         self, num_tokens: int, num_slots: Optional[int] = None
@@ -1791,6 +1786,24 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 f"ragged capture slots {bs} (tier {graph_size_key}) < raw_bs "
                 f"{raw_bs}; the planner must reject this batch before replay"
             )
+            if (
+                bs in self._ragged_fit_slots(graph_size_key)
+                and not self.model_runner.is_draft_worker
+                and get_parallel().tp_rank == 0
+            ):
+                seen = getattr(self, "_logged_fit_slots", None)
+                if seen is None:
+                    seen = set()
+                    self._logged_fit_slots = seen
+                mark = (graph_size_key, bs, raw_bs)
+                if mark not in seen and len(seen) < 32:
+                    seen.add(mark)
+                    logger.info(
+                        "ragged verify replay tier %d slots %d for %d requests",
+                        graph_size_key,
+                        bs,
+                        raw_bs,
+                    )
             padded_num_tokens = graph_size_key
             self._stage_ragged_verify_layout(ragged_layout, graph_size_key, bs)
         else:
