@@ -170,14 +170,25 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         """Pad to the captured slot count. The full-coverage variant (cap=None)
         keeps sum(verify_lens) == graph_num_tokens, so padding rows (or, with
         no padding rows, the last real row) can exceed the per-request verify
-        window. Dense-layout consumers (mamba/KDA) must pass cap=N: rows are
-        clamped to N and the layout no longer covers the tier's leftover
-        tokens -- those collapse into the consumer's ghost slot. Real tokens
-        map identically under both variants."""
+        window. Dense-layout consumers (mamba/KDA) pass cap=N. Leftover
+        tokens go to padding rows and are then clamped. When the live batch
+        already fills the slot count, real widths stay as scheduled and the
+        tier tail is the ghost region."""
         from sglang.kernels.ops.speculative.ragged_verify_kernels import (
             PaddedToBucket,
         )
 
+        # Same slot count and a per-row cap: leftover tier tokens are the
+        # graph tail, parked by the attention ghost rows. Inflating the
+        # last real width up to ``cap`` would verify padding tokens.
+        if cap is not None and padded_bs == self.bs:
+            padded = torch.clamp(self.verify_lens, max=int(cap))
+            return RaggedVerifyLayout._assemble_device(
+                verify_lens=padded,
+                graph_num_tokens=self.graph_num_tokens,
+                total_verify_tokens=None,
+                cap=cap,
+            )
         padded = PaddedToBucket.execute(
             verify_lens=self.verify_lens,
             graph_num_tokens=self.graph_num_tokens,
