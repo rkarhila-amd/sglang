@@ -478,8 +478,9 @@ class TestRaggedVerifyLayoutPerTier(CustomTestCase):
 class TestRaggedVerifyTightSlotKey(CustomTestCase):
     """A token tier keeps its wide slot graph and adds a request-bucket graph.
 
-    Conc64 is floored to 64 * width tokens. That tier's tight key is 64 slots.
-    A 256-request batch on a smaller tier still takes the wide key.
+    The full-width tier (512 tokens) has a 64-slot key. A shorter tier that
+    a 64-request batch actually lands on also has a 64-slot key, at that
+    same token count. A 256-request batch still takes the wide key.
     """
 
     def _runner(self):
@@ -506,8 +507,10 @@ class TestRaggedVerifyTightSlotKey(CustomTestCase):
             (2048, 64, 256),
             # 32 requests on the 256-token tier fit the bucket
             (256, 32, 32),
-            # 64 requests do not fit a 32-slot bucket
-            (256, 64, 256),
+            # 64 requests at 256 tokens use the 64-slot graph, not 256
+            (256, 64, 64),
+            # one request over that key stays on the wide graph
+            (256, 65, 256),
             # tier whose wide count is the token count, not max_bs
             (64, 8, 8),
             (64, 40, 64),
@@ -516,25 +519,22 @@ class TestRaggedVerifyTightSlotKey(CustomTestCase):
             with self.subTest(tokens=tokens, raw_bs=raw_bs):
                 self.assertEqual(runner._ragged_replay_slots(tokens, raw_bs), want)
 
-    def test_dynamic_tier_climbs_to_a_slot_graph_that_fits(self):
+    def test_natural_tier_keeps_its_token_count_and_picks_64_slots(self):
         runner = self._runner()
-        runner.capture_num_tokens = [64, 256, 320, 384, 448, 512, 2048]
-        # conc64, cap len ~5: 320 tokens. Tight keys below 512 have fewer
-        # than 64 slots. The 512-token graph already has 64 slots.
-        self.assertEqual(runner.promote_ragged_graph_tier(320, 64), 512)
-        self.assertEqual(runner.promote_ragged_graph_tier(384, 64), 512)
+        # conc64, cap len ~5: about 320 tokens. The token count stays
+        # 320. The 64-slot graph is captured at that tier. 65 requests
+        # still take the wide key. A 256-request batch is unchanged.
+        self.assertEqual(runner._ragged_replay_slots(320, 64), 64)
+        self.assertEqual(runner._ragged_replay_slots(384, 64), 64)
+        self.assertEqual(runner._ragged_replay_slots(480, 63), 64)
+        self.assertEqual(runner._ragged_replay_slots(320, 65), 256)
         self.assertEqual(runner._ragged_replay_slots(512, 64), 64)
-        # the 512 tier itself is already the fitting key
-        self.assertEqual(runner.promote_ragged_graph_tier(512, 64), 512)
-        # short-width conc256 has no tighter graph inside 256*8
-        self.assertEqual(runner.promote_ragged_graph_tier(512, 256), 512)
         self.assertEqual(runner._ragged_replay_slots(512, 256), 256)
-        # full-width tier is already one graph
-        self.assertEqual(runner.promote_ragged_graph_tier(2048, 64), 2048)
-        # 63 requests cannot climb to 512 (63*8 = 504)
-        self.assertEqual(runner.promote_ragged_graph_tier(480, 63), 480)
-        # a tier whose tight key already holds the batch stays put
-        self.assertEqual(runner.promote_ragged_graph_tier(256, 32), 256)
+        self.assertEqual(runner._ragged_replay_slots(2048, 64), 256)
+        self.assertEqual(runner._ragged_replay_slots(256, 32), 32)
+        # below max_bs tokens the wide key is already the token count
+        self.assertEqual(runner._ragged_fit_slots(192), ())
+        self.assertEqual(runner._ragged_replay_slots(192, 64), 192)
 
     def test_capture_keeps_both_layouts(self):
         import os
@@ -548,14 +548,18 @@ class TestRaggedVerifyTightSlotKey(CustomTestCase):
             os.environ, {"SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE": "0"}
         ):
             self.assertEqual(runner._ragged_slot_counts(512), (256, 64))
+            self.assertEqual(runner._ragged_slot_counts(320), (256, 64, 40))
             self.assertEqual(runner._ragged_slot_counts(2048), (256,))
             wide = runner._capture_ragged_verify_layout(512, num_slots=256)
             tight = runner._capture_ragged_verify_layout(512, num_slots=64)
+            natural = runner._capture_ragged_verify_layout(320, num_slots=64)
         self.assertIsNot(wide, tight)
         self.assertEqual(int(wide.verify_lens.shape[0]), 256)
         self.assertEqual(int(tight.verify_lens.shape[0]), 64)
         self.assertEqual(int(wide.verify_lens.sum()), 512)
         self.assertEqual(int(tight.verify_lens.sum()), 512)
+        self.assertEqual(int(natural.verify_lens.shape[0]), 64)
+        self.assertEqual(int(natural.verify_lens.sum()), 320)
 
         live = RaggedVerifyLayout.from_verify_lens_device(
             verify_lens=torch.tensor([8] * 64, dtype=torch.int32),
