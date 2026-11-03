@@ -8,6 +8,7 @@ import os
 import sys
 import types
 import unittest
+import unittest.mock
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -405,6 +406,74 @@ class TestFlydslGroupedVerifyLaunch(CustomTestCase):
         flat = o[:, 0, 0]
         self.assertTrue(torch.equal(flat[:16], torch.full((16,), 8.0)))
         self.assertTrue(torch.equal(flat[16:], torch.full((8,), 4.0)))
+
+
+class TestFlydslBreakableGap(CustomTestCase):
+    def _layer6(self):
+        layer = _layer()
+        layer.tp_q_head_num = 6
+        return layer
+
+    def test_gap_method_is_a_graph_break(self):
+        fn = AiterAttnBackend._flydsl_grouped_verify_gap
+        self.assertTrue(callable(getattr(fn, "run_eager", None)))
+
+    def test_gap_outside_capture_calls_grouped(self):
+        backend = _backend()
+        seen = {}
+
+        def grouped(self, q, o, layer, forward_batch, q_rows, pool_bs):
+            seen["q_rows"] = q_rows
+            seen["pool_bs"] = pool_bs
+
+        q = torch.zeros(12, 6, 256)
+        fb = SimpleNamespace(req_pool_indices=torch.arange(3))
+        with unittest.mock.patch.object(
+            AiterAttnBackend, "_forward_target_verify_flydsl_grouped", grouped
+        ):
+            backend._flydsl_grouped_verify_gap(q, torch.zeros_like(q), self._layer6(), fb)
+        self.assertEqual(seen, {"q_rows": 12, "pool_bs": 3})
+
+    def _dispatch(self, *, breakable: bool):
+        backend = _backend()
+        backend.forward_metadata = SimpleNamespace(max_q_len=8, qo_indptr=None)
+        calls = []
+
+        def gap(self, q, o, layer, forward_batch):
+            calls.append("gap")
+
+        def padded(self, q, o, layer, forward_batch, layout):
+            calls.append("padded")
+
+        q = torch.zeros(12, 6, 256)
+        layout = SimpleNamespace()
+        fb = SimpleNamespace(
+            req_pool_indices=torch.arange(4),
+            spec_info=SimpleNamespace(draft_token_num=8, ragged_verify_layout=layout),
+        )
+        with (
+            unittest.mock.patch.object(
+                AiterAttnBackend, "_flydsl_grouped_verify_gap", gap
+            ),
+            unittest.mock.patch.object(
+                AiterAttnBackend, "_forward_target_verify_flydsl_padded", padded
+            ),
+            unittest.mock.patch(
+                "sglang.srt.layers.attention.aiter_backend.is_in_breakable_cuda_graph",
+                return_value=breakable,
+            ),
+            _stub_capture(True),
+        ):
+            backend._forward_target_verify_flydsl(
+                q, torch.zeros_like(q), self._layer6(), fb, None, torch.zeros(1), torch.zeros(1)
+            )
+        return calls
+
+    def test_breakable_layout_takes_the_grouped_gap(self):
+        self.assertEqual(self._dispatch(breakable=True), ["gap"])
+
+    def test_full_graph_layout_stays_padded(self):
+        self.assertEqual(self._dispatch(breakable=False), ["padded"])
 
 
 class TestFlydslBlockTable(CustomTestCase):
