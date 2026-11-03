@@ -232,6 +232,45 @@ def build_capture_verify_lens(
     return [base + 1] * rem + [base] * (num_slots - rem)
 
 
+# Pre-pad verify widths for the breakable grouped gap, keyed by the
+# captured layout object the replay batch carries. Staging then
+# overwrites that object's tensors with the bucket fill. When the
+# batch fills the slot count, the fill lands on the last real row.
+# Exact-width launches must not read those tokens.
+_REAL_VERIFY_LENS: dict[int, tuple[torch.Tensor, int]] = {}
+
+
+def remember_real_verify_lens(cap_layout, verify_lens: torch.Tensor) -> None:
+    n = int(verify_lens.shape[0])
+    if n < 1:
+        return
+    buf, _stored = _REAL_VERIFY_LENS.get(id(cap_layout), (None, 0))
+    if buf is None or int(buf.shape[0]) < n or buf.device != verify_lens.device:
+        buf = torch.empty(n, dtype=torch.int32, device=verify_lens.device)
+    buf[:n].copy_(verify_lens[:n].to(dtype=torch.int32))
+    _REAL_VERIFY_LENS[id(cap_layout)] = (buf, n)
+
+
+def staged_real_verify_lens(cap_layout) -> Optional[torch.Tensor]:
+    if cap_layout is None:
+        return None
+    item = _REAL_VERIFY_LENS.get(id(cap_layout))
+    if item is None:
+        return None
+    buf, n = item
+    if n < 1:
+        return None
+    return buf[:n]
+
+
+def resolve_ragged_verify_layout(forward_batch) -> Optional[RaggedVerifyLayout]:
+    """Layout riding the batch's spec input, or None. Tolerates the runner's
+    ad-hoc replay batch views, which may not carry spec_info at all."""
+    spec_info = getattr(forward_batch, "spec_info", None)
+    if spec_info is None:
+        return None
+    return spec_info.ragged_verify_layout
+
 def ragged_verify_token_rows(
     layout: RaggedVerifyLayout, num_tokens: int
 ) -> torch.Tensor:

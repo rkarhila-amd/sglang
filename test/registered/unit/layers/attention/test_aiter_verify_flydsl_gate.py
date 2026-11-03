@@ -540,6 +540,26 @@ class TestFlydslBreakableGap(CustomTestCase):
             {"q_rows": 12, "pool_bs": 3},
         )
 
+    def test_grouped_step_uses_the_real_lens_not_the_bucket_fill(self):
+        # 18faffe launched the filled last row. short-4 logprobs matched
+        # the 0fbbca3 graphs file (max abs 0.7435) and not cea4337.
+        from sglang.srt.speculative.ragged_verify import remember_real_verify_lens
+
+        backend = _backend()
+        layout = SimpleNamespace(
+            qo_indptr_device=torch.tensor([0, 5, 13, 21], dtype=torch.int32)
+        )
+        remember_real_verify_lens(layout, torch.tensor([5, 8, 6], dtype=torch.int32))
+        fb = SimpleNamespace(
+            req_pool_indices=torch.arange(3),
+            seq_lens=torch.tensor([10, 20, 30], dtype=torch.int32),
+            spec_info=SimpleNamespace(ragged_verify_layout=layout),
+        )
+        packed = backend._flydsl_grouped_step(21, 3, torch.zeros(21, 6, 256), fb)
+        sig = [(width, int(req.shape[0])) for width, _, _, _, req in packed]
+        self.assertEqual(sig, [(5, 1), (8, 1), (6, 1)])
+        self.assertEqual(packed[-1][1].tolist(), list(range(13, 19)))
+
     def test_breakable_layout_takes_the_grouped_gap(self):
         self.assertEqual(self._dispatch(breakable=True), ["gap"])
 

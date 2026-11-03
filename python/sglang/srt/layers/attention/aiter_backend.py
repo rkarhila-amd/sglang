@@ -42,6 +42,7 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner_utils.capture_mode import (
     get_capture_attention_variant,
 )
+from sglang.srt.speculative.ragged_verify import staged_real_verify_lens
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
@@ -4850,18 +4851,14 @@ class AiterAttnBackend(AttentionBackend):
         read a KV token the verify window never wrote.
         """
         self._flydsl_require_eager()
+        qo_vals, q_rows, pool_bs = self._flydsl_grouped_qo_vals(
+            forward_batch, q_rows, pool_bs
+        )
         nonce = getattr(self, "_flydsl_nonce", 0)
-        step_key = (nonce, "verify-ragged", q_rows, pool_bs)
+        step_key = (nonce, "verify-ragged", q_rows, pool_bs, tuple(qo_vals))
         cached = getattr(self, "_flydsl_ragged", None)
         if cached is not None and cached[0] == step_key:
             return cached[1]
-        qo = self._flydsl_grouped_qo(forward_batch)
-        if qo is None or int(qo.shape[0]) < 2:
-            raise RuntimeError(
-                "SGLANG_AITER_VERIFY_FLYDSL ragged verify is missing qo_indptr."
-            )
-        limit = min(pool_bs, int(qo.shape[0]) - 1)
-        qo_vals = [int(v) for v in qo[: limit + 1].tolist()]
         try:
             _bs, groups = flydsl_verify_width_groups(qo_vals, q_rows, pool_bs)
         except ValueError as exc:
@@ -4901,6 +4898,43 @@ class AiterAttnBackend(AttentionBackend):
             )
         self._flydsl_ragged = (step_key, packed)
         return packed
+
+    def _flydsl_grouped_qo_vals(
+        self, forward_batch: ForwardBatch, q_rows: int, pool_bs: int
+    ) -> tuple[list[int], int, int]:
+        """Indptr the grouped launches follow.
+
+        The captured layout's indptr includes the bucket fill. A batch
+        that fills the slot count adds that leftover to the last real
+        row, and the breakable gap used to launch it. ``0fbbca3`` did
+        the same fill and missed the short mix by the same logprobs.
+        The pre-pad lens staged next to that layout is the eager width.
+        """
+        spec = getattr(forward_batch, "spec_info", None)
+        layout = (
+            getattr(spec, "ragged_verify_layout", None) if spec is not None else None
+        )
+        real = staged_real_verify_lens(layout)
+        if real is not None:
+            widths = [int(v) for v in real.tolist()]
+            qo_vals = [0]
+            for width in widths:
+                if width < 1:
+                    break
+                qo_vals.append(qo_vals[-1] + width)
+            if len(qo_vals) < 2:
+                raise RuntimeError(
+                    "SGLANG_AITER_VERIFY_FLYDSL ragged verify has no real rows."
+                )
+            return qo_vals, qo_vals[-1], len(qo_vals) - 1
+        qo = self._flydsl_grouped_qo(forward_batch)
+        if qo is None or int(qo.shape[0]) < 2:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL ragged verify is missing qo_indptr."
+            )
+        limit = min(pool_bs, int(qo.shape[0]) - 1)
+        qo_vals = [int(v) for v in qo[: limit + 1].tolist()]
+        return qo_vals, q_rows, pool_bs
 
     def _flydsl_grouped_qo(self, forward_batch: ForwardBatch) -> Optional[torch.Tensor]:
         """Indptr the eager width groups must follow.
