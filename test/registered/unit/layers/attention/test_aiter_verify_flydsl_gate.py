@@ -493,6 +493,52 @@ class TestFlydslBreakableGap(CustomTestCase):
         got = backend._flydsl_grouped_qo(fb)
         self.assertTrue(torch.equal(got, uniform))
 
+    def _gap_q_rows(self, q_rows: int, pool_bs: int, qo):
+        backend = _backend()
+        seen = {}
+
+        def grouped(self, q, o, layer, forward_batch, rows, pool):
+            seen["q_rows"] = rows
+            seen["pool_bs"] = pool
+
+        q = torch.zeros(q_rows, 6, 256)
+        fb = SimpleNamespace(
+            req_pool_indices=torch.arange(pool_bs),
+            spec_info=SimpleNamespace(
+                ragged_verify_layout=SimpleNamespace(qo_indptr_device=qo)
+            ),
+        )
+        with unittest.mock.patch.object(
+            AiterAttnBackend, "_forward_target_verify_flydsl_grouped", grouped
+        ):
+            backend._flydsl_grouped_verify_gap(
+                q, torch.zeros_like(q), self._layer6(), fb
+            )
+        return seen
+
+    def test_gap_groups_the_staged_indptr_not_the_tier(self):
+        # 912d636 died on GSM8K p32: graph tier 256 rows, pool 32, staged
+        # prefix [0, 6, 14, ...] never reached 256. Same shape, smaller.
+        qo = torch.tensor([0, 6, 14, 21, 28], dtype=torch.int32)
+        self.assertEqual(
+            self._gap_q_rows(32, 4, qo),
+            {"q_rows": 28, "pool_bs": 4},
+        )
+
+    def test_gap_keeps_q_rows_when_the_indptr_covers_the_tier(self):
+        qo = torch.tensor([0, 8, 16, 24, 32], dtype=torch.int32)
+        self.assertEqual(
+            self._gap_q_rows(32, 4, qo),
+            {"q_rows": 32, "pool_bs": 4},
+        )
+
+    def test_gap_keeps_q_rows_when_the_indptr_runs_past_the_buffer(self):
+        qo = torch.tensor([0, 10, 20, 40], dtype=torch.int32)
+        self.assertEqual(
+            self._gap_q_rows(12, 3, qo),
+            {"q_rows": 12, "pool_bs": 3},
+        )
+
     def test_breakable_layout_takes_the_grouped_gap(self):
         self.assertEqual(self._dispatch(breakable=True), ["gap"])
 
