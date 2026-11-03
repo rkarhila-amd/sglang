@@ -4819,6 +4819,10 @@ class AiterAttnBackend(AttentionBackend):
         is capturing. At replay the runner has already copied the live
         ``seq_lens`` and ``qo_indptr`` into the static buffers this batch
         and the attention metadata share. ``o`` is the caller's buffer.
+
+        ``q`` is the whole graph tier. A 32-slot width-8 graph is 256 rows
+        even when the capped layout sums to less. Grouping must stop at
+        the staged indptr, or the ghost tail fails the coverage check.
         """
         if not getattr(self, "_flydsl_gap_logged", False):
             logger.info(
@@ -4827,6 +4831,7 @@ class AiterAttnBackend(AttentionBackend):
             self._flydsl_gap_logged = True
         pool_bs = len(forward_batch.req_pool_indices)
         q_rows = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).shape[0]
+        q_rows = self._flydsl_grouped_covered_rows(q_rows, pool_bs, forward_batch)
         self._forward_target_verify_flydsl_grouped(
             q, o, layer, forward_batch, q_rows, pool_bs
         )
@@ -4914,6 +4919,32 @@ class AiterAttnBackend(AttentionBackend):
         if qo is None:
             qo = self.forward_metadata.qo_indptr
         return qo
+
+    def _flydsl_grouped_covered_rows(
+        self, q_rows: int, pool_bs: int, forward_batch: ForwardBatch
+    ) -> int:
+        """Rows the staged layout indptr covers inside the graph buffer.
+
+        ``padded_to_bucket(..., cap=width)`` clamps each request to the
+        verify window, so a 32-request replay on the 256-row tier can end
+        at 220. ``flydsl_verify_width_groups`` requires some prefix to
+        equal ``q_rows``. Passing the buffer length raises
+        ``qo_indptr does not cover 256 query rows`` and kills the decode
+        batch. The ghost tail is padding the graph keeps; the launches
+        index only the covered rows.
+        """
+        spec = getattr(forward_batch, "spec_info", None)
+        layout = (
+            getattr(spec, "ragged_verify_layout", None) if spec is not None else None
+        )
+        qo = getattr(layout, "qo_indptr_device", None) if layout is not None else None
+        if qo is None or pool_bs < 1 or int(qo.shape[0]) < 2:
+            return q_rows
+        index = min(pool_bs, int(qo.shape[0]) - 1)
+        covered = int(qo[index].item())
+        if covered < 1 or covered > q_rows:
+            return q_rows
+        return covered
 
     def _forward_target_verify_flydsl_grouped(
         self,
