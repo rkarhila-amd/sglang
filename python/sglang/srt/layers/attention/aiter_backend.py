@@ -4814,27 +4814,50 @@ class AiterAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
     ) -> None:
-        """Exact-width verify between breakable graph segments.
+        """Padded batch-1 verify between breakable graph segments.
 
         The decorator records this call and does not run it while a segment
         is capturing. At replay the runner has already copied the live
-        ``seq_lens`` and ``qo_indptr`` into the static buffers this batch
-        and the attention metadata share. ``o`` is the caller's buffer.
+        ``seq_lens`` and the staged layout into the static buffers. ``o``
+        is the caller's buffer.
 
-        ``q`` is the whole graph tier. A 32-slot width-8 graph is 256 rows
-        even when the capped layout sums to less. Grouping must stop at
-        the staged indptr, or the ghost tail fails the coverage check.
+        ``pa_decode`` is dense causal: query ``j`` reads through
+        ``context_len - query_length + j``, and the last query is the
+        newest token. The gate that passed (``cea4337``) right-aligns each
+        request into a width-8 window and launches one slot at a time.
+        Exact-width groups on this gap reproduced the pre-``cea4337``
+        ``long-copy-1`` logprobs (max abs 0.044 at token 60) while the
+        eager server, which stays on the uniform batch-1 launch, matched
+        ``cea4337``.
+
+        ``q`` is the whole graph tier. A capped layout can end before that
+        buffer. The ghost tail is not a query row.
         """
         if not getattr(self, "_flydsl_gap_logged", False):
             logger.info(
-                "AITER_VERIFY_FLYDSL breakable eager gap: grouped exact-width verify"
+                "AITER_VERIFY_FLYDSL breakable eager gap: padded batch-1 verify"
             )
             self._flydsl_gap_logged = True
+        spec = getattr(forward_batch, "spec_info", None)
+        layout = (
+            getattr(spec, "ragged_verify_layout", None) if spec is not None else None
+        )
+        if layout is None:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL breakable verify gap is missing "
+                "ragged_verify_layout."
+            )
+        n_q = layer.tp_q_head_num
+        q3 = q.reshape(-1, n_q, layer.qk_head_dim)
+        o3 = o.reshape(-1, n_q, layer.v_head_dim)
+        q_rows = int(q3.shape[0])
         pool_bs = len(forward_batch.req_pool_indices)
-        q_rows = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).shape[0]
-        q_rows = self._flydsl_grouped_covered_rows(q_rows, pool_bs, forward_batch)
-        self._forward_target_verify_flydsl_grouped(
-            q, o, layer, forward_batch, q_rows, pool_bs
+        covered = self._flydsl_grouped_covered_rows(q_rows, pool_bs, forward_batch)
+        if covered < q_rows:
+            q3 = q3[:covered]
+            o3 = o3[:covered]
+        self._forward_target_verify_flydsl_padded(
+            q3, o3, layer, forward_batch, layout
         )
 
     def _flydsl_grouped_step(
