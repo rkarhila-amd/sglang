@@ -516,6 +516,26 @@ class TestRaggedVerifyTightSlotKey(CustomTestCase):
             with self.subTest(tokens=tokens, raw_bs=raw_bs):
                 self.assertEqual(runner._ragged_replay_slots(tokens, raw_bs), want)
 
+    def test_dynamic_tier_climbs_to_a_slot_graph_that_fits(self):
+        runner = self._runner()
+        runner.capture_num_tokens = [64, 256, 320, 384, 448, 512, 2048]
+        # conc64, cap len ~5: 320 tokens. Tight keys below 512 have fewer
+        # than 64 slots. The 512-token graph already has 64 slots.
+        self.assertEqual(runner.promote_ragged_graph_tier(320, 64), 512)
+        self.assertEqual(runner.promote_ragged_graph_tier(384, 64), 512)
+        self.assertEqual(runner._ragged_replay_slots(512, 64), 64)
+        # the 512 tier itself is already the fitting key
+        self.assertEqual(runner.promote_ragged_graph_tier(512, 64), 512)
+        # short-width conc256 has no tighter graph inside 256*8
+        self.assertEqual(runner.promote_ragged_graph_tier(512, 256), 512)
+        self.assertEqual(runner._ragged_replay_slots(512, 256), 256)
+        # full-width tier is already one graph
+        self.assertEqual(runner.promote_ragged_graph_tier(2048, 64), 2048)
+        # 63 requests cannot climb to 512 (63*8 = 504)
+        self.assertEqual(runner.promote_ragged_graph_tier(480, 63), 480)
+        # a tier whose tight key already holds the batch stays put
+        self.assertEqual(runner.promote_ragged_graph_tier(256, 32), 256)
+
     def test_capture_keeps_both_layouts(self):
         import os
 

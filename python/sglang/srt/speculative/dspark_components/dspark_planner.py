@@ -466,8 +466,9 @@ class DSparkVerifyPlanner:
             return None
         graph_num_tokens_floor = tier.graph_num_tokens_floor
         if tier.graph_num_tokens is not None:
+            graph_num_tokens = self._promote_graph_tier(tier.graph_num_tokens, bs)
             return RaggedVerifyLayout.from_verify_lens_device(
-                verify_lens=verify_lens, graph_num_tokens=tier.graph_num_tokens
+                verify_lens=verify_lens, graph_num_tokens=graph_num_tokens
             )
         verify_lens_cpu = verify_lens.to("cpu").tolist()
         grid = verify_layout_grid(
@@ -481,6 +482,24 @@ class DSparkVerifyPlanner:
             grid=grid,
             graph_num_tokens_floor=graph_num_tokens_floor,
         )
+
+    def _promote_graph_tier(self, natural: int, raw_bs: int) -> int:
+        runner = self.model_runner.decode_cuda_graph_runner
+        if runner is None or not runner.ragged_verify_mode:
+            return natural
+        promoted = runner.promote_ragged_graph_tier(natural, raw_bs)
+        if promoted == natural:
+            return natural
+        mark = (natural, promoted, raw_bs)
+        if getattr(self, "_logged_tier_promote", None) != mark:
+            self._logged_tier_promote = mark
+            logger.info(
+                "ragged verify graph tier %d -> %d so %d requests fit a tighter slot graph",
+                natural,
+                promoted,
+                raw_bs,
+            )
+        return promoted
 
     def _budget_aligned_to_graph_tier(
         self,
