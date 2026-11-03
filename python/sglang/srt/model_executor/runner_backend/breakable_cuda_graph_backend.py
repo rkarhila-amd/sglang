@@ -18,6 +18,7 @@ No torch.compile.
 
 from __future__ import annotations
 
+import dataclasses
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -161,6 +162,44 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.shape_key import ShapeKey
 
 
+def _as_logits_output(output: Any):
+    """Return ``LogitsProcessorOutput`` when ``output`` is one, else None."""
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
+    if isinstance(output, LogitsProcessorOutput):
+        return LogitsProcessorOutput
+    return None
+
+
+def _logits_row_count(output: Any) -> Optional[int]:
+    """Leading rows shared by the decode logits and the captured hidden states."""
+    for name in (
+        "next_token_logits",
+        "full_logits",
+        "hidden_states",
+        "last_hidden_states",
+    ):
+        value = getattr(output, name, None)
+        if torch.is_tensor(value) and value.ndim >= 1 and value.shape[0] > 0:
+            return int(value.shape[0])
+    return None
+
+
+def _logits_row_field_names(output: Any, rows: Optional[int]) -> set:
+    if rows is None:
+        return set()
+    names = set()
+    for field in dataclasses.fields(output):
+        value = getattr(output, field.name)
+        if (
+            torch.is_tensor(value)
+            and value.ndim >= 1
+            and int(value.shape[0]) == rows
+        ):
+            names.add(field.name)
+    return names
+
+
 class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
     """Segmented capture: graphs break at attention / mamba boundaries;
     attention metadata is recomputed at replay outside captured segments.
@@ -196,6 +235,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 self._model_runner.token_to_kv_pool
             )
         self._shared_output_buffer: Optional[Any] = None
+        # Names of LogitsProcessorOutput fields resized on dim 0. Set when
+        # the shared buffer is allocated from the first captured shape.
+        self._logits_row_fields: Optional[set] = None
         self._precarve = GraphPoolPrecarve()
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -216,6 +258,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
         self._shared_output_buffer = None
+        self._logits_row_fields = None
         self.begin_cuda_graph_capture()
         try:
             with self.replay_session():
@@ -292,10 +335,13 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._capture_inputs[shape_key] = capture_inputs
 
     def _output_rows(self, output: Any, cap: int) -> int:
-        """Leading-dim row count actually produced by the body, clamped to ``cap``.
+        """Leading-dim row count actually produced by the body.
 
         A body that shards or prunes its output along dim 0 returns fewer than
-        ``cap`` rows; everything else returns exactly ``cap``.
+        ``cap`` rows. Tensors and proxy outputs are clamped to ``cap``.
+        ``LogitsProcessorOutput`` returns its real token rows, which can
+        exceed a request-count key; the shared buffer is sized to the first
+        shape.
         """
         runner_rows = self._cuda_graph_runner.cuda_graph_output_rows(output)
         if runner_rows is not None:
@@ -305,6 +351,11 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return logits_rows
         if torch.is_tensor(output):
             return min(cap, output.shape[0])
+        if _as_logits_output(output) is not None:
+            rows = _logits_row_count(output)
+            # Token rows can exceed the request-count key. The shared buffer
+            # is sized to the first (largest) shape, so keep the real count.
+            return cap if rows is None else rows
         if isinstance(output, PPProxyTensors):
             rows = [t.shape[0] for t in output.tensors.values()]
             return min([cap, *rows])
@@ -329,8 +380,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return tuple(self._alloc_full_buffer(o, size) for o in output)
         if isinstance(output, list):
             return [self._alloc_full_buffer(o, size) for o in output]
-        if _is_logits_processor_output(output):
-            return alloc_logits_processor_output(output, size)
+        logits_cls = _as_logits_output(output)
+        if logits_cls is not None:
+            return self._alloc_logits_buffer(output, logits_cls, size)
         raise TypeError(f"Unsupported BCG output type: {type(output)}")
 
     def _slice_output(self, output: Any, num_tokens: int) -> Any:
@@ -344,8 +396,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return tuple(self._slice_output(item, num_tokens) for item in output)
         if isinstance(output, list):
             return [self._slice_output(item, num_tokens) for item in output]
-        if _is_logits_processor_output(output):
-            return slice_logits_processor_output(output, num_tokens)
+        logits_cls = _as_logits_output(output)
+        if logits_cls is not None:
+            return self._slice_logits_output(output, logits_cls, num_tokens)
         raise TypeError(f"Unsupported BCG output type: {type(output)}")
 
     def _copy_output_to_buffer(
@@ -385,13 +438,97 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             for item, buffer in zip(output, output_buffer):
                 self._copy_output_to_buffer(item, buffer, num_tokens)
             return
-        if _is_logits_processor_output(output):
-            copy_logits_processor_output(output, output_buffer, num_tokens)
+        if _as_logits_output(output) is not None and _as_logits_output(
+            output_buffer
+        ) is not None:
+            self._copy_logits_output(output, output_buffer, num_tokens)
             return
         raise TypeError(
             "Unsupported BCG output buffer pair: "
             f"{type(output)} vs {type(output_buffer)}"
         )
+
+    def _alloc_logits_buffer(self, output: Any, logits_cls: type, size: int) -> Any:
+        """One process-lifetime buffer for decode logits and hidden states.
+
+        The forward returns ``LogitsProcessorOutput``. Graph-pool tensors from
+        a segment are not stable across the next shape, so the row fields are
+        copied into this buffer during capture and replay returns views of it.
+        """
+        rows = _logits_row_count(output)
+        capacity = size if rows is None else max(size, rows)
+        row_fields = _logits_row_field_names(output, rows)
+        self._logits_row_fields = row_fields
+        kwargs = {}
+        for field in dataclasses.fields(output):
+            value = getattr(output, field.name)
+            if field.name in row_fields:
+                kwargs[field.name] = value.new_empty((capacity, *value.shape[1:]))
+            elif torch.is_tensor(value):
+                kwargs[field.name] = torch.empty_like(value)
+            elif value is None:
+                kwargs[field.name] = None
+            else:
+                raise TypeError(
+                    "Unsupported BCG logits field "
+                    f"{field.name}: {type(value)}"
+                )
+        return logits_cls(**kwargs)
+
+    def _slice_logits_output(
+        self, output: Any, logits_cls: type, num_tokens: int
+    ) -> Any:
+        row_fields = self._logits_row_fields or set()
+        kwargs = {}
+        for field in dataclasses.fields(output):
+            value = getattr(output, field.name)
+            if field.name in row_fields and torch.is_tensor(value):
+                kwargs[field.name] = value[:num_tokens]
+            else:
+                kwargs[field.name] = value
+        return logits_cls(**kwargs)
+
+    def _copy_logits_output(
+        self, output: Any, output_buffer: Any, num_tokens: int
+    ) -> None:
+        row_fields = self._logits_row_fields
+        if row_fields is None:
+            raise ValueError("BCG logits buffer was not allocated")
+        for field in dataclasses.fields(output):
+            src = getattr(output, field.name)
+            dst = getattr(output_buffer, field.name)
+            if field.name in row_fields:
+                if not (torch.is_tensor(src) and torch.is_tensor(dst)):
+                    raise TypeError(
+                        "BCG logits row field "
+                        f"{field.name} changed: {type(src)} vs {type(dst)}"
+                    )
+                if src.shape[0] < num_tokens or dst.shape[0] < num_tokens:
+                    raise ValueError(
+                        f"BCG logits field {field.name} has {tuple(src.shape)} "
+                        f"into {tuple(dst.shape)}, need {num_tokens} rows"
+                    )
+                if src.shape[1:] != dst.shape[1:]:
+                    raise ValueError(
+                        f"BCG logits field {field.name} trailing shape changed: "
+                        f"{tuple(src.shape)} vs {tuple(dst.shape)}"
+                    )
+                dst[:num_tokens].copy_(src[:num_tokens])
+                continue
+            if src is None and dst is None:
+                continue
+            if torch.is_tensor(src) and torch.is_tensor(dst):
+                if src.shape != dst.shape:
+                    raise ValueError(
+                        f"BCG logits field {field.name} shape changed: "
+                        f"{tuple(src.shape)} vs {tuple(dst.shape)}"
+                    )
+                dst.copy_(src)
+                continue
+            raise TypeError(
+                "Unsupported BCG logits field "
+                f"{field.name}: {type(src)} vs {type(dst)}"
+            )
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
@@ -420,3 +557,4 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._capture_inputs.clear()
         self._pool = None
         self._shared_output_buffer = None
+        self._logits_row_fields = None
