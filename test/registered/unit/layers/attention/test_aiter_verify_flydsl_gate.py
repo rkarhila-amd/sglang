@@ -470,6 +470,30 @@ class TestFlydslBreakableGap(CustomTestCase):
             )
         return calls
 
+    def test_grouped_qo_prefers_the_layout_indptr(self):
+        # Metadata's uniform arange is input_rows // slots. 24 rows on 4
+        # slots is width 5 and sums to 20, short of the packed query.
+        # The layout indptr is what the gap has to group on.
+        backend = _backend()
+        uniform = torch.arange(0, 25, 5)
+        layout_qo = torch.tensor([0, 8, 14, 20, 24], dtype=torch.int32)
+        backend.forward_metadata = SimpleNamespace(qo_indptr=uniform)
+        fb = SimpleNamespace(
+            spec_info=SimpleNamespace(
+                ragged_verify_layout=SimpleNamespace(qo_indptr_device=layout_qo)
+            )
+        )
+        got = backend._flydsl_grouped_qo(fb)
+        self.assertTrue(torch.equal(got, layout_qo))
+
+    def test_grouped_qo_falls_back_to_metadata(self):
+        backend = _backend()
+        uniform = torch.arange(0, 25, 5)
+        backend.forward_metadata = SimpleNamespace(qo_indptr=uniform)
+        fb = SimpleNamespace(spec_info=None)
+        got = backend._flydsl_grouped_qo(fb)
+        self.assertTrue(torch.equal(got, uniform))
+
     def test_breakable_layout_takes_the_grouped_gap(self):
         self.assertEqual(self._dispatch(breakable=True), ["gap"])
 
