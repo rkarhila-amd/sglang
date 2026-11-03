@@ -111,6 +111,10 @@ from sglang.srt.layers.attention.aiter_utils import (
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
 )
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.utils import get_bool_env_var
@@ -4243,6 +4247,12 @@ class AiterAttnBackend(AttentionBackend):
         layout = getattr(
             getattr(forward_batch, "spec_info", None), "ragged_verify_layout", None
         )
+        # A full graph cannot re-read width groups, so it stays on the padded
+        # window. A breakable decode graph ends the segment here and runs the
+        # grouped launches between segments, where the group sizes are live.
+        if layout is not None and is_in_breakable_cuda_graph():
+            self._flydsl_grouped_verify_gap(q, o, layer, forward_batch)
+            return
         if layout is not None and self._flydsl_graph_bound():
             self._forward_target_verify_flydsl_padded(
                 q, o, layer, forward_batch, layout
@@ -4334,6 +4344,32 @@ class AiterAttnBackend(AttentionBackend):
         )
         self._flydsl_debug_vs_extend(
             q, o, layer, forward_batch, k, v, bs, qlen, context
+        )
+
+    @eager_on_graph
+    def _flydsl_grouped_verify_gap(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Exact-width verify between breakable graph segments.
+
+        The decorator records this call and does not run it while a segment
+        is capturing. At replay the runner has already copied the live
+        ``seq_lens`` and ``qo_indptr`` into the static buffers this batch
+        and the attention metadata share. ``o`` is the caller's buffer.
+        """
+        if not getattr(self, "_flydsl_gap_logged", False):
+            logger.info(
+                "AITER_VERIFY_FLYDSL breakable eager gap: grouped exact-width verify"
+            )
+            self._flydsl_gap_logged = True
+        pool_bs = len(forward_batch.req_pool_indices)
+        q_rows = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).shape[0]
+        self._forward_target_verify_flydsl_grouped(
+            q, o, layer, forward_batch, q_rows, pool_bs
         )
 
     def _flydsl_grouped_step(
