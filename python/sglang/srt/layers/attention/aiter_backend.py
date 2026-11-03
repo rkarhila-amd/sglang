@@ -4202,7 +4202,7 @@ class AiterAttnBackend(AttentionBackend):
         cached = getattr(self, "_flydsl_ragged", None)
         if cached is not None and cached[0] == step_key:
             return cached[1]
-        qo = self.forward_metadata.qo_indptr
+        qo = self._flydsl_grouped_qo(forward_batch)
         if qo is None or int(qo.shape[0]) < 2:
             raise RuntimeError(
                 "SGLANG_AITER_VERIFY_FLYDSL ragged verify is missing qo_indptr."
@@ -4248,6 +4248,24 @@ class AiterAttnBackend(AttentionBackend):
             )
         self._flydsl_ragged = (step_key, packed)
         return packed
+
+    def _flydsl_grouped_qo(self, forward_batch: ForwardBatch) -> Optional[torch.Tensor]:
+        """Indptr the eager width groups must follow.
+
+        Capture metadata writes a uniform ``input_rows // slots`` arange.
+        A 1984-token tier on 256 slots becomes width 7 and sums to 1792,
+        so it does not cover the packed query. The layout indptr is the
+        mixed capture pattern. Replay copies the live lens into that same
+        tensor before this gap runs.
+        """
+        spec = getattr(forward_batch, "spec_info", None)
+        layout = (
+            getattr(spec, "ragged_verify_layout", None) if spec is not None else None
+        )
+        qo = getattr(layout, "qo_indptr_device", None) if layout is not None else None
+        if qo is None:
+            qo = self.forward_metadata.qo_indptr
+        return qo
 
     def _forward_target_verify_flydsl_grouped(
         self,
