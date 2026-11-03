@@ -895,19 +895,26 @@ def flydsl_forward_ragged_padded(
         bs=bs,
         page_size=page_size,
     )
-    window = bufs["window"]
-    runner.run(
-        o_dense[:window],
-        q_dense[:window],
-        k_cache,
-        v_cache,
-        context,
-        table,
-        float(layer.scaling),
-        int(max_q),
-        int(max_context),
-        pin_scratch=True,
-    )
+    # One batch-1 launch per padded slot. A single launch at the capture
+    # slot count changes sequence 0 by one bf16 ulp even when the other
+    # sequences have context 0 (decode-step-l27kv/repro.json). Batch 1
+    # matches the uniform eager launch. The loop bound is the captured
+    # slot count, so replay stays inside the graph.
+    for slot in range(bs):
+        start = slot * max_q
+        stop = start + max_q
+        runner.run(
+            o_dense[start:stop],
+            q_dense[start:stop],
+            k_cache,
+            v_cache,
+            context[slot : slot + 1],
+            table[slot : slot + 1],
+            float(layer.scaling),
+            int(max_q),
+            int(max_context),
+            pin_scratch=True,
+        )
     gathered = bufs["gathered"]
     stride = n_q * dim
     gidx = bufs["gidx"]
