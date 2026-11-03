@@ -28,3 +28,6 @@ class ShapeKey:
     attention_variant: Optional[str] = None
     # Target-verify logits format (vocab shards or full logits); None is the only one.
     logits_variant: Optional[str] = None
+    # Ragged verify only: slot count baked into this graph. None on every
+    # other runner. One token tier can have a wide graph and a tight one.
+    ragged_slots: Optional[int] = None
