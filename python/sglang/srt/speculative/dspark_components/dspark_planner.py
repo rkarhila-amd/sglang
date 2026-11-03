@@ -466,9 +466,16 @@ class DSparkVerifyPlanner:
             return None
         graph_num_tokens_floor = tier.graph_num_tokens_floor
         if tier.graph_num_tokens is not None:
-            graph_num_tokens = self._promote_graph_tier(tier.graph_num_tokens, bs)
+            natural = tier.graph_num_tokens
+            # Replay may climb to a tight slot graph. Row assignment stays
+            # on the natural tier: eager has no graph runner and does not
+            # climb, and dumping the gap onto the last request moved the
+            # short-mix logprobs.
+            graph_num_tokens = self._promote_graph_tier(natural, bs)
             return RaggedVerifyLayout.from_verify_lens_device(
-                verify_lens=verify_lens, graph_num_tokens=graph_num_tokens
+                verify_lens=verify_lens,
+                graph_num_tokens=graph_num_tokens,
+                pad_num_tokens=natural,
             )
         verify_lens_cpu = verify_lens.to("cpu").tolist()
         grid = verify_layout_grid(
