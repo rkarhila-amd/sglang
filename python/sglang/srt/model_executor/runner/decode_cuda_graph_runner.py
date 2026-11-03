@@ -900,6 +900,36 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return tight
         return wide
 
+    def promote_ragged_graph_tier(self, natural: int, raw_bs: int) -> int:
+        """Token tier whose captured slot count can hold ``raw_bs``.
+
+        Dynamic verify rounds a 64-request batch to the live token count.
+        That tier's request-bucket graph is ``tier / width`` slots, which
+        is below 64 when the cap length is about 5, so replay stays on
+        the wide graph. Climb to the smallest captured tier that has a
+        tighter slot count and still fits inside ``raw_bs * width``.
+        A 256-request batch finds no tighter graph and stays put. This
+        does not change ``_ragged_capture_slots``.
+        """
+        width = self.captured_req_width
+        if width < 1 or raw_bs < 1:
+            return natural
+        limit = raw_bs * width
+        if natural > limit:
+            return natural
+        natural_wide = self._ragged_capture_slots(natural)
+        if self._ragged_tight_slots(natural) >= raw_bs:
+            return natural
+        need = raw_bs * width
+        grid = self.capture_num_tokens or []
+        for tokens in grid:
+            if tokens < natural or tokens < need or tokens > limit:
+                continue
+            slots = self._ragged_tight_slots(tokens)
+            if slots >= raw_bs and slots < natural_wide:
+                return tokens
+        return natural
+
     def _ragged_slot_counts(self, num_tokens: int) -> tuple[int, ...]:
         wide = self._ragged_capture_slots(num_tokens)
         tight = self._ragged_tight_slots(num_tokens)
