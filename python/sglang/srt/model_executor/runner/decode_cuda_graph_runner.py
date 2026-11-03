@@ -119,7 +119,10 @@ from sglang.srt.model_executor.runner_utils.pool import (
 from sglang.srt.model_executor.runner_utils.shared_read_event import make_external_event
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_spec
-from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
+from sglang.srt.speculative.ragged_verify import (
+    remember_real_verify_lens,
+    resolve_ragged_verify_layout,
+)
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
@@ -927,6 +930,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         cap_layout = self._captured_ragged_layouts.get((graph_size_key, num_slots))
         if cap_layout is None:
             return
+        # Snapshot the pre-pad widths before the bucket fill overwrites
+        # the captured indptr. The breakable grouped gap launches these
+        # widths. The filled tail stays in the graph buffer and is not
+        # a query row.
+        remember_real_verify_lens(cap_layout, ragged_layout.verify_lens)
         live = ragged_layout
         if live.bs != cap_layout.bs or live.cap is None:
             live = live.padded_to_bucket(
