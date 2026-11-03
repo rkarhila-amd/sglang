@@ -97,7 +97,7 @@ class TestPaddedRaggedVerifyGeometry(CustomTestCase):
         self.assertEqual(padded.verify_lens.tolist(), [8, 1, 7])
         self.assertEqual(int(padded.qo_indptr_device[-1]), 16)
 
-    def test_capped_same_bs_keeps_real_widths(self):
+    def test_capped_same_bs_fills_then_clamps_the_last_row(self):
         raw = RaggedVerifyLayout.from_verify_lens(
             verify_lens_cpu=[5, 4, 6, 5],
             device=_DEVICE,
@@ -105,9 +105,11 @@ class TestPaddedRaggedVerifyGeometry(CustomTestCase):
             graph_num_tokens_floor=32,
         )
         self.assertEqual(raw.graph_num_tokens, 32)
+        # leftover 12 is added to the last row, then clamped to cap.
+        # Dropping that fill moved graph replay off the eager logprobs.
         padded = raw.padded_to_bucket(padded_bs=4, cap=8)
-        self.assertEqual(padded.verify_lens.tolist(), [5, 4, 6, 5])
-        self.assertEqual(padded.qo_indptr_device.tolist(), [0, 5, 9, 15, 20])
+        self.assertEqual(padded.verify_lens.tolist(), [5, 4, 6, 8])
+        self.assertEqual(padded.qo_indptr_device.tolist(), [0, 5, 9, 15, 23])
 
     def test_padded_layout_zero_len_pad_rows(self):
         raw = RaggedVerifyLayout.from_verify_lens(
