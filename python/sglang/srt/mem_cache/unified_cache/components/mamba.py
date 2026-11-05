@@ -676,6 +676,23 @@ class MambaComponent(TreeComponent):
         if cd.lock_ref == 0:
             self.tree_core._update_evictable_leaf_sets(node)
 
+    def copy_live_state(self, req: Req) -> Optional[torch.Tensor]:
+        """A new slot holding the request's live state. The request keeps its slot.
+
+        Used when a prefill chunk ends off the checkpoint grid but on a page
+        boundary: the track buffer is the last grid point, and the live slot is
+        the state after every token of the chunk.
+        """
+        if req.kv.mamba_pool_idx is None:
+            return None
+        slot = self._alloc_mamba_slot(req)
+        storage, sub_pool = self._state()
+        src = req.kv.mamba_pool_idx
+        if src.ndim == 0:
+            src = src.unsqueeze(0)
+        storage.copy_state(sub_pool, src, slot)
+        return slot
+
     def _try_alloc_mamba_slot(
         self, req: Optional[Req] = None
     ) -> Optional[torch.Tensor]:

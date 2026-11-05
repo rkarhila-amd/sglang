@@ -130,6 +130,7 @@ class RoundSettings(msgspec.Struct, frozen=True):
     min_steady_seconds: float
     round_timeout_seconds: float
     ramp_token_slack: int = 0
+    shared_prefix_len: int = 0
 
 
 class LoadInfo(msgspec.Struct, frozen=True):
@@ -172,6 +173,7 @@ def run_profile(
     repeats: int,
     local_tokenizer_path: Optional[str],
     fracs: Optional[list[float]],
+    allow_eager: bool = False,
 ) -> None:
     if get_tokenizer is None:
         raise RuntimeError(
@@ -206,10 +208,13 @@ def run_profile(
         base_url=base_url,
         local_tokenizer_path=local_tokenizer_path,
         allowed_modes=("compact", "cap-accept") if offdiag else ("static",),
+        allow_eager=allow_eager,
     )
     vocab_size = len(get_tokenizer(context.tokenizer_path))
     batch_sizes = sorted(set(batch_sizes))
-    validate_sweep_against_server(context=context, batch_sizes=batch_sizes)
+    validate_sweep_against_server(
+        context=context, batch_sizes=batch_sizes, allow_eager=allow_eager
+    )
     rng = random.Random(PROFILE_SEED)
 
     frac_sweep: list[Optional[float]] = sorted(fracs) if offdiag else [None]
@@ -349,6 +354,7 @@ def profile_all(
     local_tokenizer_path: Optional[str],
     fracs: Optional[list[float]],
     plot: bool,
+    allow_eager: bool = False,
 ) -> None:
     run_profile(
         base_url=base_url,
@@ -358,6 +364,7 @@ def profile_all(
         repeats=repeats,
         local_tokenizer_path=local_tokenizer_path,
         fracs=fracs,
+        allow_eager=allow_eager,
     )
     fit_profile(
         out=out,
@@ -412,6 +419,7 @@ def fetch_server_context(
     base_url: str,
     local_tokenizer_path: Optional[str],
     allowed_modes: tuple[str, ...] = ("static",),
+    allow_eager: bool = False,
 ) -> ServerContext:
     response = requests.get(base_url + "/server_info", timeout=DEFAULT_TIMEOUT)
     response.raise_for_status()
@@ -425,11 +433,11 @@ def fetch_server_context(
             "measured from real static-mode DSpark verify steps; relaunch with "
             "--speculative-algorithm DSPARK and SGLANG_RAGGED_VERIFY_MODE=static."
         )
-    if info.get("disable_cuda_graph"):
+    if info.get("disable_cuda_graph") and not allow_eager:
         raise ValueError(
             "The server runs with --disable-cuda-graph; an SPS table measured "
             "without cuda graphs is uselessly slow. Relaunch with cuda graphs "
-            "enabled."
+            "enabled, or pass --allow-eager when the whole sweep stays eager."
         )
 
     internal_states = info.get("internal_states") or []
@@ -531,16 +539,22 @@ def resolve_cuda_graph_max_bs(*, internal_state: dict) -> Optional[int]:
 
 
 def validate_sweep_against_server(
-    *, context: ServerContext, batch_sizes: list[int]
+    *, context: ServerContext, batch_sizes: list[int], allow_eager: bool = False
 ) -> None:
     if context.cuda_graph_max_bs is None:
+        if allow_eager:
+            logger.warning(
+                "SPS sweep is eager (--allow-eager): no captured decode graph "
+                "batch size. Every round must stay on that same eager path."
+            )
+            return
         raise ValueError(
             "Could not resolve the server's captured cuda-graph max batch size "
             "from /server_info, so the sweep cannot be confirmed to stay inside "
             "the captured decode graphs. Steps that fall back to eager silently "
             "poison the table with a different perf regime. Relaunch the server "
-            "so it reports cuda_graph_config in /server_info, or -- if you really "
-            "want to profile anyway -- delete this raise, but be careful."
+            "so it reports cuda_graph_config in /server_info, or pass "
+            "--allow-eager when FlyDSL verify refuses graph capture."
         )
     max_per_rank = max(batch_sizes)
     if max_per_rank > context.cuda_graph_max_bs:
@@ -602,6 +616,7 @@ def run_warmup_round(
         min_steady_seconds=0.0,
         round_timeout_seconds=settings.round_timeout_seconds,
         ramp_token_slack=settings.ramp_token_slack,
+        shared_prefix_len=settings.shared_prefix_len,
     )
     try:
         run_one_round(
@@ -629,11 +644,12 @@ def run_one_round(
     max_new_tokens = round_max_new_tokens(settings=settings)
     if should_skip_due_to_max_running_requests(
         batch_size, context.skip_max_running_requests_threshold
-    ) or should_skip_due_to_token_capacity(
-        batch_size,
-        settings.input_len,
-        max_new_tokens,
-        context.skip_token_capacity_threshold,
+    ) or should_skip_round_for_token_capacity(
+        batch_size=batch_size,
+        input_len=settings.input_len,
+        output_len=max_new_tokens,
+        shared_prefix_len=settings.shared_prefix_len,
+        skip_token_capacity_threshold=context.skip_token_capacity_threshold,
     ):
         return None
 
@@ -651,6 +667,7 @@ def run_one_round(
         base_url=context.base_url,
         num_requests=batch_size,
         input_len=settings.input_len,
+        shared_prefix_len=settings.shared_prefix_len,
         max_new_tokens=max_new_tokens,
         temperature=settings.temperature,
         vocab_size=vocab_size,
@@ -709,6 +726,66 @@ def run_one_round(
     )
 
 
+def should_skip_round_for_token_capacity(
+    *,
+    batch_size: int,
+    input_len: int,
+    output_len: int,
+    shared_prefix_len: int,
+    skip_token_capacity_threshold: float,
+) -> bool:
+    """KV the round needs: the shared prefix once, plus each request's suffix.
+
+    The radix cache stores the identical prefix a single time, so charging it
+    per request would skip batches that actually fit.
+    """
+    if shared_prefix_len <= 0:
+        return should_skip_due_to_token_capacity(
+            batch_size, input_len, output_len, skip_token_capacity_threshold
+        )
+    total_tokens = shared_prefix_len + batch_size * (input_len + output_len)
+    if total_tokens > skip_token_capacity_threshold:
+        logger.warning(
+            "Skip benchmark shared_prefix_len=%s + %s * (%s + %s) = %s > "
+            "skip_token_capacity_threshold=%s due to kv cache limit.",
+            shared_prefix_len,
+            batch_size,
+            input_len,
+            output_len,
+            total_tokens,
+            skip_token_capacity_threshold,
+        )
+        return True
+    return False
+
+
+def build_prompt_input_ids(
+    *,
+    num_requests: int,
+    input_len: int,
+    shared_prefix_len: int,
+    vocab_size: int,
+    rng: random.Random,
+) -> list[list[int]]:
+    """One shared leading token sequence, then a unique suffix per request.
+
+    ``input_len`` is the unique suffix. ``shared_prefix_len`` is prepended
+    identically so a radix cache keeps that prefix once per round.
+    """
+    if shared_prefix_len < 0:
+        raise ValueError(f"shared_prefix_len must be >= 0, got {shared_prefix_len}.")
+    token_high = vocab_size - RANDOM_TOKEN_HIGH_MARGIN
+    if token_high <= RANDOM_TOKEN_LOW:
+        raise ValueError(f"vocab_size={vocab_size} too small for random prompts.")
+    prefix = [
+        rng.randrange(RANDOM_TOKEN_LOW, token_high) for _ in range(shared_prefix_len)
+    ]
+    return [
+        prefix + [rng.randrange(RANDOM_TOKEN_LOW, token_high) for _ in range(input_len)]
+        for _ in range(num_requests)
+    ]
+
+
 def start_load(
     *,
     base_url: str,
@@ -718,14 +795,15 @@ def start_load(
     temperature: float,
     vocab_size: int,
     rng: random.Random,
+    shared_prefix_len: int = 0,
 ) -> threading.Thread:
-    token_high = vocab_size - RANDOM_TOKEN_HIGH_MARGIN
-    if token_high <= RANDOM_TOKEN_LOW:
-        raise ValueError(f"vocab_size={vocab_size} too small for random prompts.")
-    input_ids = [
-        [rng.randrange(RANDOM_TOKEN_LOW, token_high) for _ in range(input_len)]
-        for _ in range(num_requests)
-    ]
+    input_ids = build_prompt_input_ids(
+        num_requests=num_requests,
+        input_len=input_len,
+        shared_prefix_len=shared_prefix_len,
+        vocab_size=vocab_size,
+        rng=rng,
+    )
     payload = {
         "input_ids": input_ids,
         "sampling_params": {
@@ -931,6 +1009,48 @@ def postprocess_round(
                 aligned_verify_tokens.add(row.num_verify_tokens)
             aligned_cts.append(ct)
 
+    # Eager verify can flicker by one token on a single step (bs=12 frac=1.0
+    # died on num_verify_tokens {95, 96} with one step at 95). A CUDA-graph
+    # tier is still required to be a single value. A one-token eager miss on
+    # fewer than 10% of aligned steps is dropped, and the step time is taken
+    # from the steps that hit the pinned M.
+    if offdiag and len(aligned_verify_tokens) != 1 and aligned_cts:
+        budget = int(frac * batch_size_per_rank * (verify_num_draft_tokens - 1))
+        pinned = batch_size_per_rank + budget
+        hist: dict[int, int] = {}
+        on_pin_cts: list[int] = []
+        for ct in aligned_cts:
+            tokens = {by_ct[ct].num_verify_tokens for by_ct in by_ct_per_rank}
+            for token in tokens:
+                hist[token] = hist.get(token, 0) + 1
+            if tokens == {pinned}:
+                on_pin_cts.append(ct)
+        off_pin = len(aligned_cts) - len(on_pin_cts)
+        need = ROUND_WARMUP_STEPS + min_steady_steps
+        off_frac = off_pin / len(aligned_cts)
+        if len(on_pin_cts) >= need and off_frac <= (1.0 - MATCH_FRACTION_WARN):
+            logger.warning(
+                "Round bs=%s frac=%s: %s/%s aligned steps had num_verify_tokens "
+                "!= pinned M=%s (histogram %s). Dropping those steps and "
+                "measuring the ones that hit the pin.",
+                batch_size,
+                frac,
+                off_pin,
+                len(aligned_cts),
+                pinned,
+                dict(sorted(hist.items())),
+            )
+            aligned_cts = on_pin_cts
+            aligned_verify_tokens = {pinned}
+        else:
+            raise RuntimeError(
+                f"Round bs={batch_size} frac={frac}: aligned steps ran at "
+                f"differing num_verify_tokens {sorted(aligned_verify_tokens)} "
+                f"(histogram {dict(sorted(hist.items()))}); on-pin M={pinned} "
+                f"steps={len(on_pin_cts)} need>={need} off_frac={off_frac:.0%}. "
+                "The budget pin did not hold. Inspect the raw records."
+            )
+
     if len(aligned_cts) < ROUND_WARMUP_STEPS + min_steady_steps:
         raise RuntimeError(
             f"Round bs={batch_size} never stabilized: only {len(aligned_cts)} "
@@ -984,12 +1104,23 @@ def postprocess_round(
         graph_tier = aligned_verify_tokens.pop()
         budget = int(frac * batch_size_per_rank * (verify_num_draft_tokens - 1))
         batch_tokens = batch_size_per_rank + budget
+        full_tokens = batch_size_per_rank * verify_num_draft_tokens
         if graph_tier < batch_tokens:
             raise RuntimeError(
                 f"Round bs={batch_size} frac={frac}: replayed graph tier "
                 f"{graph_tier} is smaller than the pinned M={batch_tokens} "
                 f"(= {batch_size_per_rank} + int({frac} * {batch_size_per_rank} "
                 f"* {verify_num_draft_tokens - 1})); the budget pin did not take."
+            )
+        # CUDA-graph buckets may round the pin up by a few tokens. Measuring
+        # the entire draft window on a shorter pin means the verify-all
+        # layout ignored dspark_force_budget_frac (uninitialized SPS table).
+        if batch_tokens < full_tokens - 1 and graph_tier >= full_tokens:
+            raise RuntimeError(
+                f"Round bs={batch_size} frac={frac}: measured num_verify_tokens="
+                f"{graph_tier}, the full window {full_tokens}, while the pin "
+                f"asked for M={batch_tokens}. The compact verify-all layout "
+                "ignored dspark_force_budget_frac."
             )
     else:
         batch_tokens = expected_tokens
@@ -1408,8 +1539,17 @@ def add_run_args(parser: argparse.ArgumentParser) -> None:
         "--input-len",
         type=int,
         default=DEFAULT_INPUT_LEN,
-        help="Prompt length per request. Short: the table is conditioned on the "
-        "decode-heavy regime.",
+        help="Unique prompt suffix per request. Short: the table is conditioned "
+        "on the decode-heavy regime. With --shared-prefix-len, this is only the "
+        "per-request tail; the shared prefix is extra.",
+    )
+    parser.add_argument(
+        "--shared-prefix-len",
+        type=int,
+        default=0,
+        help="Tokens prepended identically to every request in a round. The "
+        "radix cache stores that prefix once; --input-len is the unique suffix. "
+        "0 disables it.",
     )
     parser.add_argument(
         "--temperature",
@@ -1460,6 +1600,12 @@ def add_run_args(parser: argparse.ArgumentParser) -> None:
         "steps_per_sec across repeats is taken.",
     )
     parser.add_argument(
+        "--allow-eager",
+        action="store_true",
+        help="Profile a server whose decode CUDA graphs are off. Required for "
+        "FlyDSL verify, which refuses graph capture. The whole sweep stays eager.",
+    )
+    parser.add_argument(
         "--local-tokenizer-path",
         type=str,
         default=None,
@@ -1498,6 +1644,7 @@ def run_settings(*, args: argparse.Namespace) -> RoundSettings:
         min_steady_seconds=args.min_steady_seconds,
         round_timeout_seconds=args.round_timeout,
         ramp_token_slack=args.ramp_token_slack,
+        shared_prefix_len=args.shared_prefix_len,
     )
 
 
@@ -1549,6 +1696,7 @@ def cli_main() -> None:
             repeats=args.repeats,
             local_tokenizer_path=args.local_tokenizer_path,
             fracs=args.fracs,
+            allow_eager=args.allow_eager,
         )
     elif args.command == "fit":
         fit_profile(
@@ -1569,6 +1717,7 @@ def cli_main() -> None:
             local_tokenizer_path=args.local_tokenizer_path,
             fracs=args.fracs,
             plot=args.plot,
+            allow_eager=args.allow_eager,
         )
 
 

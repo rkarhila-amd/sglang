@@ -89,7 +89,13 @@ _is_musa = is_musa()
 # through the pre-registered IPC pool instead of registering graph-pool tensors:
 # the registered path makes peers read stale data over IPC on replay (garbage
 # rows / NaN under DP attention + TP MoE on MI355X). Set to 0 to restore it.
-_AITER_CAPTURE_COPY_IN = os.environ.get("SGLANG_AITER_CAPTURE_COPY_IN", "0") == "1"
+# Default on. Image aiter 285579b records captured collective outputs into
+# the eager output map. A later graph that reuses an address skips the
+# buffer on one rank and pairs the wrong IPC handle (aiter #6819, not in
+# that image). Copy-in is the eager path and does not record those
+# outputs. Set SGLANG_AITER_CAPTURE_COPY_IN=0 only with an aiter .so that
+# contains #6819.
+_AITER_CAPTURE_COPY_IN = os.environ.get("SGLANG_AITER_CAPTURE_COPY_IN", "1") == "1"
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 

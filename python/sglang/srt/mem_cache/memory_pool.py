@@ -376,6 +376,47 @@ def _resolve_fused_scale(
     return None
 
 
+def zero_kv_cache_tensors(kv, _seen=None) -> int:
+    """Zero K/V storage reachable from a pool. Flush resets free lists only.
+
+    Nested hybrid pools keep the bytes on ``full_kv_pool`` / ``swa_kv_pool``.
+    Views that share a ``data_ptr`` are zeroed once.
+    """
+    if kv is None:
+        return 0
+    if _seen is None:
+        _seen = set()
+    ident = id(kv)
+    if ident in _seen:
+        return 0
+    _seen.add(ident)
+    n = 0
+    ptrs = set()
+    for name in ("k_buffer", "v_buffer", "kv_buffer"):
+        bufs = getattr(kv, name, None)
+        if bufs is None:
+            continue
+        if torch.is_tensor(bufs):
+            bufs = (bufs,)
+        for tensor in bufs:
+            if tensor is None or not torch.is_tensor(tensor) or tensor.numel() == 0:
+                continue
+            ptr = tensor.data_ptr()
+            if ptr in ptrs:
+                continue
+            ptrs.add(ptr)
+            # Flush runs outside the forward's inference mode. KV tensors
+            # allocated there reject inplace zero_ unless this is set.
+            with torch.inference_mode():
+                tensor.zero_()
+            n += 1
+    for name in ("full_kv_pool", "swa_kv_pool"):
+        sub = getattr(kv, name, None)
+        if sub is not None:
+            n += zero_kv_cache_tensors(sub, _seen)
+    return n
+
+
 class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
@@ -480,6 +521,11 @@ class ReqToTokenPool:
         # req_generation must stay monotonic: readers detect row reuse by
         # equality with a generation they stored, so zeroing it here can give a
         # row's next request the same generation as its previous one.
+        # The location table is not a generation. A shorter request on a
+        # recycled row must not keep the previous request's indices past its
+        # own length (flush only rewinds the free list otherwise).
+        with torch.inference_mode():
+            self.req_to_token.zero_()
         if self._aux_cache is not None:
             self._aux_cache.clear()
 
@@ -1167,6 +1213,68 @@ class MambaPool:
             (time.perf_counter() - started) * 1000,
         )
 
+    def zero_cached_state(self) -> None:
+        """Zero conv, SSM, and the speculative GDN windows.
+
+        ``flush_cache`` resets the free list and leaves these tensors.
+        The next request that reuses a slot then reads the previous
+        request's linear state. ``clear_slots`` only zeros conv and
+        temporal, so the verify windows survive a slot recycle too.
+        Graph replay does not see that leftover: capture zeros the
+        buffers and the recorded kernels keep those addresses.
+        """
+        cache = getattr(self, "mamba_cache", None)
+        if cache is None:
+            return
+        # Same inference-mode guard as the KV flush: eager warmup allocates
+        # these tensors inside inference mode, and flush runs outside it.
+        with torch.inference_mode():
+            for conv in cache.conv:
+                conv.zero_()
+            temporal = cache.temporal
+            if temporal is not None and temporal.numel() > 0:
+                temporal.zero_()
+            intermediate_ssm = getattr(cache, "intermediate_ssm", None)
+            if intermediate_ssm is not None:
+                intermediate_ssm.zero_()
+            # The speculative conv window is a strided view. Zero the physical
+            # allocation so the tail past the view does not stay dirty.
+            phys = getattr(self, "_intermediate_conv_window_phys", None)
+            if phys:
+                for window in phys:
+                    window.zero_()
+            else:
+                for window in getattr(cache, "intermediate_conv_window", None) or []:
+                    window.zero_()
+            for name in (
+                "replayssm_d",
+                "replayssm_k",
+                "replayssm_g",
+                "replayssm_rawv",
+                "replayssm_rawk",
+                "replayssm_beta",
+            ):
+                tensor = getattr(cache, name, None)
+                if tensor is not None:
+                    tensor.zero_()
+            for name in (
+                "replayssm_write_pos",
+                "replayssm_spec_write_pos",
+                "replayssm_cache_base",
+                "replayssm_is_flush",
+            ):
+                cursor = getattr(self, name, None)
+                if cursor is not None:
+                    cursor.zero_()
+            # PLE siblings ride clear_slots, not this full-pool zero. A flush
+            # rewinds the free list without clear_slots, so their rows would
+            # otherwise keep the previous request.
+            for sibling in getattr(self, "_slot_siblings", ()) or ():
+                clear = getattr(sibling, "clear", None)
+                if clear is not None:
+                    clear()
+        logger.info("zeroed mamba conv/ssm state")
+
     def clear_slots(self, indices: torch.Tensor):
         """Zero out mamba state at the given pool indices. Must run on forward stream."""
         for sibling in self._slot_siblings:
@@ -1711,9 +1819,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
         logger.info("Reset HybridReqToTokenPool")
         super().clear()
         self.state.clear()
-        self.req_index_to_mamba_index_mapping.zero_()
-        if self.enable_mamba_extra_buffer:
-            self.req_index_to_mamba_ping_pong_track_buffer_mapping.zero_()
+        # Free-list reset does not zero conv/SSM. Flush must, or the next
+        # request continues the previous request's GDN state.
+        if self.mamba_pool is not None:
+            self.mamba_pool.zero_cached_state()
+        with torch.inference_mode():
+            self.req_index_to_mamba_index_mapping.zero_()
+            if self.enable_mamba_extra_buffer:
+                self.req_index_to_mamba_ping_pong_track_buffer_mapping.zero_()
 
 
 @dataclass
@@ -2222,9 +2335,8 @@ class MHATokenToKVPool(KVCache, MHAKVView):
         self.use_native_move_kv_cache = envs.SGLANG_NATIVE_MOVE_KV_CACHE.get()
         if kv_cache_layout is not None:
             # Explicit physical-layout selector wins over the platform default.
-            # This is a label only; layouts that change buffer identity (e.g. the
-            # page-granularity envelope) live in a dedicated pool subclass
-            # (PageMajorMHATokenToKVPool) rather than in branches here.
+            # vectorized_5d changes the buffer shape (see the setup below).
+            # The page-granularity envelope still lives in PageMajorMHATokenToKVPool.
             self.use_hnd = False
             self.kv_cache_layout = kv_cache_layout
         elif self.use_hnd:
@@ -2245,17 +2357,18 @@ class MHATokenToKVPool(KVCache, MHAKVView):
                         "expected 'nhd' or 'vectorized_5d'."
                     )
                 self.kv_cache_layout = layout
-                if layout == "vectorized_5d":
-                    # X = 16 / storage itemsize: sized by the STORAGE dtype (not compute
-                    # dtype) since it tiles the 16-byte on-pool vector.
-                    self._kv_vector_x = 16 // self.store_dtype.itemsize
-                    assert (self.size + self.page_size) % self.page_size == 0
-                    assert self.page_size % self._kv_vector_x == 0, (
-                        f"page_size={self.page_size} must be divisible by "
-                        f"X={self._kv_vector_x} for vectorized_5d layout"
-                    )
-                    assert self.head_dim % self._kv_vector_x == 0
-                    assert self.v_head_dim % self._kv_vector_x == 0
+        if self.kv_cache_layout == "vectorized_5d":
+            # X = 16 / storage itemsize: sized by the STORAGE dtype (not compute
+            # dtype) since it tiles the 16-byte on-pool vector. Applies whether
+            # the layout came from the env var or from an explicit argument.
+            self._kv_vector_x = 16 // self.store_dtype.itemsize
+            assert (self.size + self.page_size) % self.page_size == 0
+            assert self.page_size % self._kv_vector_x == 0, (
+                f"page_size={self.page_size} must be divisible by "
+                f"X={self._kv_vector_x} for vectorized_5d layout"
+            )
+            assert self.head_dim % self._kv_vector_x == 0
+            assert self.v_head_dim % self._kv_vector_x == 0
 
         self.quant_method = (
             quant_method if quant_method is not None else UnquantizedKVCacheMethod()
@@ -2272,9 +2385,14 @@ class MHATokenToKVPool(KVCache, MHAKVView):
             else None
         )
 
-        if enable_kv_cache_copy and not self.use_hnd:
-            # The tiled byte copy assumes NHD slot-rows; HND uses a (page, off)
-            # gather in move_kv_cache instead, so skip the slot-row copy config.
+        if (
+            enable_kv_cache_copy
+            and not self.use_hnd
+            and self.kv_cache_layout != "vectorized_5d"
+        ):
+            # The tiled byte copy assumes NHD slot-rows. HND gathers by
+            # (page, off). SHUFFLE 5D moves a token with the shuffle
+            # writer, so neither path uses this warmup.
             self._init_kv_copy_and_warmup()
         else:
             self._kv_copy_config = None
@@ -2771,6 +2889,11 @@ class MHATokenToKVPool(KVCache, MHAKVView):
         return ptrs, lens, item_lens
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        if self.kv_cache_layout == "vectorized_5d":
+            raise NotImplementedError(
+                "CPU KV offload indexes NHD slot rows. The SHUFFLE 5D pool "
+                "used by SGLANG_AITER_VERIFY_FLYDSL stays on device."
+            )
         assert not self.use_hnd, (
             "CPU KV offload indexes by slot (NHD); HND KV cache "
             "(SGLANG_USE_HND_KVCACHE) is not supported with CPU offload yet."
@@ -2795,6 +2918,11 @@ class MHATokenToKVPool(KVCache, MHAKVView):
     def load_cpu_copy(
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
+        if self.kv_cache_layout == "vectorized_5d":
+            raise NotImplementedError(
+                "CPU KV offload indexes NHD slot rows. The SHUFFLE 5D pool "
+                "used by SGLANG_AITER_VERIFY_FLYDSL stays on device."
+            )
         assert not self.use_hnd, (
             "CPU KV offload indexes by slot (NHD); HND KV cache "
             "(SGLANG_USE_HND_KVCACHE) is not supported with CPU offload yet."
@@ -3282,6 +3410,34 @@ class MHATokenToKVPool(KVCache, MHAKVView):
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
     ):
+        # The tiled prefix kernel indexes the cache by token slot along dim 0.
+        # vectorized_5d's leading dimension is pages, so that store faults once
+        # a slot id passes the page count. Scatter through the SHUFFLE writer.
+        if self.kv_cache_layout == "vectorized_5d":
+            if self.layer_num == 0 or loc_2d.numel() == 0:
+                return
+            device = self.k_buffer[0].device
+            if loc_2d.device != device:
+                loc_2d = loc_2d.to(device=device, non_blocking=True)
+            if commit_lens.device != device:
+                commit_lens = commit_lens.to(device=device, non_blocking=True)
+            row_offsets = torch.arange(loc_2d.shape[1], device=device)
+            valid_mask = row_offsets[None, :] < commit_lens.to(torch.int64)[:, None]
+            valid_idx = torch.nonzero(valid_mask.reshape(-1), as_tuple=False).flatten()
+            if valid_idx.numel() == 0:
+                return
+            self.set_kv_buffer(
+                layer,
+                KVWriteLoc(
+                    loc_2d.reshape(-1).index_select(0, valid_idx), physical=True
+                ),
+                cache_k.index_select(0, valid_idx),
+                cache_v.index_select(0, valid_idx),
+                k_scale,
+                v_scale,
+                layer_id_override=layer_id_override,
+            )
+            return
         _set_mha_kv_buffer_prefix_valid(
             self,
             layer,
@@ -3304,6 +3460,10 @@ class MHATokenToKVPool(KVCache, MHAKVView):
         maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
         maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
 
+        if self.kv_cache_layout == "vectorized_5d":
+            self._move_kv_cache_vectorized_5d(tgt_loc, src_loc)
+            return
+
         if self.use_hnd:
             pages_t, offs_t = tgt_loc // self.page_size, tgt_loc % self.page_size
             pages_s, offs_s = src_loc // self.page_size, src_loc % self.page_size
@@ -3314,6 +3474,33 @@ class MHATokenToKVPool(KVCache, MHAKVView):
             return
 
         self._move_kv_cache_impl(tgt_loc, src_loc)
+
+    def _move_kv_cache_vectorized_5d(
+        self, tgt_loc: torch.Tensor, src_loc: torch.Tensor
+    ) -> None:
+        """Move token slots inside a SHUFFLE 5D pool.
+
+        The tiled NHD copy treats dim 0 as a token row. Here dim 0 is a page,
+        so a token is gathered to ``(T, H, D)`` and written back with the same
+        kernel that prefill and append use. The gather finishes before the
+        store, so overlapping source and target slots stay coherent.
+        """
+        if tgt_loc.numel() == 0:
+            return
+        from sglang.kernels.ops.kvcache.shuffle_5d_cache import (
+            launch_gather_shuffle_5d_to_linear,
+            launch_reshape_and_cache_shuffle_5d,
+        )
+
+        src = src_loc.reshape(-1)
+        tgt = tgt_loc.reshape(-1)
+        for key_cache, value_cache in zip(self.k_buffer, self.v_buffer):
+            key_lin, value_lin = launch_gather_shuffle_5d_to_linear(
+                key_cache, value_cache, src
+            )
+            launch_reshape_and_cache_shuffle_5d(
+                key_lin, value_lin, key_cache, value_cache, tgt
+            )
 
     def _move_kv_cache_impl(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         # Physical move strategy. Override for layouts that change buffer
@@ -4135,6 +4322,7 @@ class HybridLinearKVPool(KVCache):
         # full-attention layers instead of constructing one internally.
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
+        kv_cache_layout: Optional[str] = None,
     ):
         self.size = size
         self.dtype = dtype
@@ -4165,6 +4353,11 @@ class HybridLinearKVPool(KVCache):
             post_capture_kwargs = (
                 {"post_capture_active": True} if post_capture_active else {}
             )
+            layout_kwargs = (
+                {"kv_cache_layout": kv_cache_layout}
+                if kv_cache_layout is not None
+                else {}
+            )
             self.full_kv_pool = TokenToKVPoolClass(
                 size=size,
                 page_size=self.page_size,
@@ -4177,6 +4370,7 @@ class HybridLinearKVPool(KVCache):
                 enable_kv_cache_copy=enable_kv_cache_copy,
                 quant_method=quant_method,
                 **post_capture_kwargs,
+                **layout_kwargs,
             )
         elif use_dsa:
             # DSA sparse full-attention layers share the MLA latent layout and
@@ -4489,8 +4683,11 @@ class HybridLinearKVPool(KVCache):
             )
 
     def get_v_head_dim(self):
-        # Use start_layer to handle pipeline parallelism where layer 0
-        # may not be present in this stage's buffer.
+        # The MHA child stores v_head_dim. Reading shape[-1] is wrong for
+        # SHUFFLE 5D, whose value buffer ends in the vector width.
+        v_dim = getattr(self.full_kv_pool, "v_head_dim", None)
+        if v_dim is not None:
+            return v_dim
         return self.full_kv_pool.get_value_buffer(self.full_kv_pool.start_layer).shape[
             -1
         ]

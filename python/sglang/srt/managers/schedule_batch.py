@@ -2619,6 +2619,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_seqlen_aligned = (
                 prefix_len + (req.extend_len // checkpoint_grid) * checkpoint_grid
             )
+            # A radix page tail is not a boundary from token 0. Prefix 784
+            # plus one grid of tokens is 848, and 848 % grid is 16. The
+            # state stored at that length makes the next prefill emit EOS.
+            # Track an absolute boundary the kernel produced, or nothing.
+            if mask and mamba_track_seqlen_aligned % checkpoint_grid != 0:
+                absolute = (seq_end // checkpoint_grid) * checkpoint_grid
+                if (
+                    absolute > prefix_len
+                    and (absolute - prefix_len) % cache_chunk_size == 0
+                ):
+                    mamba_track_seqlen_aligned = absolute
+                else:
+                    mask = False
         track_position = req.kv.mamba_next_track_idx
         mamba_track_seqlen = -1
         if mask:

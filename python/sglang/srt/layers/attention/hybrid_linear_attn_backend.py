@@ -47,6 +47,7 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_exec, get_memory, get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.ragged_verify import ragged_verify_dense_scatter_indices
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import is_pin_memory_available
 
@@ -311,7 +312,17 @@ class MambaAttnBackendBase(AttentionBackend):
             elif forward_batch.forward_mode.is_target_verify():
                 ragged_layout = forward_batch.ragged_verify_layout
                 if ragged_layout is not None:
-                    # Compact ragged verify: variable per-request verify lens.
+                    # Graph replay caps this (padded_to_bucket cap=draft).
+                    # Eager used the raw indptr. With no padding rows the
+                    # bucket leftover sits on the last request, which is
+                    # short-7, and the conv window is only draft_token_num
+                    # wide. Cap here so the eager GDN path matches replay.
+                    spec = forward_batch.spec_info
+                    cap = spec.draft_token_num if spec is not None else None
+                    if ragged_layout.cap is None and cap:
+                        ragged_layout = ragged_layout.padded_to_bucket(
+                            padded_bs=ragged_layout.bs, cap=int(cap)
+                        )
                     query_start_loc = ragged_layout.qo_indptr_device
                 else:
                     query_start_loc = torch.arange(
@@ -414,6 +425,36 @@ class MambaAttnBackendBase(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self.forward_metadata = self._forward_metadata(forward_batch)
+        self.init_forward_metadata_in_graph(forward_batch)
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        """Populate compact-verify dense scatter indices (eager + graph).
+
+        Cherry-picked from sgl-project/sglang#38897. On ROCm the GDN conv path
+        densifies packed tokens via these indices (varlen Triton is CUDA-only).
+        """
+        metadata = self.forward_metadata
+        metadata.ragged_verify_dense_indices = None
+        metadata.ragged_verify_dense_gather_indices = None
+        spec_info = forward_batch.spec_info
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and spec_info is not None
+            and spec_info.ragged_verify_layout is not None
+        ):
+            metadata.ragged_verify_dense_indices = ragged_verify_dense_scatter_indices(
+                query_start_loc=metadata.query_start_loc,
+                seq_len=forward_batch.input_ids.shape[0],
+                draft_token_num=spec_info.draft_token_num,
+            )
+            num_dense_tokens = (
+                metadata.query_start_loc.shape[0] - 1
+            ) * spec_info.draft_token_num
+            metadata.ragged_verify_dense_gather_indices = torch.where(
+                metadata.ragged_verify_dense_indices < num_dense_tokens,
+                metadata.ragged_verify_dense_indices,
+                0,
+            )
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]

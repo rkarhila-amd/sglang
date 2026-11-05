@@ -41,6 +41,7 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner_utils.capture_mode import (
     get_capture_attention_variant,
 )
+from sglang.srt.speculative.ragged_verify import staged_real_verify_lens
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
@@ -97,11 +98,24 @@ from sglang.srt.layers.attention.aiter_mla_gluon import (
     prefer_mla_gluon_decode,
 )
 from sglang.srt.layers.attention.aiter_utils import (
+    FlydslPaDecode,
+    flydsl_block_table,
+    flydsl_forward_ragged_padded,
+    flydsl_group_row_indices,
+    flydsl_pack_width_group,
+    flydsl_stream_capturing,
+    flydsl_use_graph_bound,
+    flydsl_verify_live_batch,
+    flydsl_verify_width_groups,
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
 )
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
@@ -187,11 +201,17 @@ class MlaPrefillPsMetadata:
 
 
 def _kv_cache_is_vectorized_5d(pool) -> bool:
-    """Whether ``pool`` stores K/V in the SHUFFLE 5D layout. A pool with a
-    window sub-pool answers with its full view's layout, or its window view's
-    when it routes no full layers (a draft fused into the window sub-pool)."""
+    """Whether ``pool`` stores K/V in the SHUFFLE 5D layout.
+
+    A hybrid pool keeps that layout on its full-attention child, not on
+    itself. A pool with a window sub-pool answers with its full view's
+    layout, or its window view's when it routes no full layers (a draft
+    fused into the window sub-pool)."""
     router = pool.layer_router
-    if router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
+    wrapped = router.wrapped_view()
+    if wrapped is not None:
+        pool = wrapped
+    elif router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
         has_full = router.sub_pool(IdSpaceKind.FULL) is not None
         pool = router.view(IdSpaceKind.FULL if has_full else IdSpaceKind.SLIDING_WINDOW)
     return getattr(pool, "kv_cache_layout", "nhd") == "vectorized_5d"
@@ -394,6 +414,15 @@ class AiterAttnBackend(AttentionBackend):
 
     # declare here to avoid CI failure in test_aiter_fp8_q_unified_attention.py
     use_mla_auto_kv_splits: bool = False
+
+    # Uniform FlyDSL verify captures. Mixed widths on a graph use
+    # flydsl_forward_ragged_padded (one right-aligned window, no host
+    # sync). A HIP 5 microbench of that window against two grouped
+    # pa_decode launches matched exactly (max abs 0). Eager mixed batches
+    # still take the grouped path. HybridLinearAttnBackend ANDs this with
+    # the GDN flag, which was already true. Compact serving gates are not
+    # this microbench.
+    supports_ragged_verify_graph: bool = True
 
     def __init__(
         self,
@@ -2107,6 +2136,7 @@ class AiterAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        self._flydsl_note_forward()
         reset_verify_attn_plan_cache()
         seq_lens_cpu = (
             forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
@@ -2146,8 +2176,20 @@ class AiterAttnBackend(AttentionBackend):
                 :n
             ]
 
+    def _flydsl_note_forward(self) -> None:
+        """One id per attention-metadata build.
+
+        ``id(forward_metadata)`` is not a step id: CPython recycles the
+        address as soon as the previous metadata is dropped, and the
+        FlyDSL length cache would then replay the previous step's
+        ``context_lengths``. That showed up as one TP rank attending one
+        token short (max abs 0.82 vs extend on the same K/V).
+        """
+        self._flydsl_nonce = getattr(self, "_flydsl_nonce", 0) + 1
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for aiter attention backend."""
+        self._flydsl_note_forward()
         reset_verify_attn_plan_cache()
 
         bs = forward_batch.batch_size
@@ -2567,10 +2609,17 @@ class AiterAttnBackend(AttentionBackend):
                     cprr_empty_rows=cprr_empty_rows,
                 )
             else:
-                draft_num = forward_batch.input_ids.shape[0] // bs
+                # Divide by the batch size captured above, then rebind bs to
+                # the live rows. Uniform verify depends on that order.
+                packed_tokens = forward_batch.input_ids.shape[0]
+                draft_num = packed_tokens // bs
                 bs = len(forward_batch.req_pool_indices)
+                layout = getattr(spec_info, "ragged_verify_layout", None)
+                if layout is not None and layout.bs != bs:
+                    layout = layout.padded_to_bucket(padded_bs=bs)
 
                 if self._use_unified_verify:
+                    # Page-table verify still assumes one width per request.
                     page_table, qo_indptr, max_q_len, swa_page_table = (
                         self._build_verify_unified_metadata(
                             bs,
@@ -2592,13 +2641,39 @@ class AiterAttnBackend(AttentionBackend):
                         swa_out_cache_loc=swa_out_cache_loc,
                     )
                 else:
-                    qo_indptr = torch.arange(
-                        0,
-                        (1 + bs) * draft_num,
-                        step=draft_num,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
+                    if layout is None:
+                        qo_indptr = torch.arange(
+                            0,
+                            (1 + bs) * draft_num,
+                            step=draft_num,
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                        max_extend_len = draft_num
+                        seq_mask_len = draft_num * (forward_batch.seq_lens + draft_num)
+                    else:
+                        # extend_attention_fwd addresses new tokens with
+                        # qo_indptr and the cached prefix with kv_indptr.
+                        # generate_attn_arg_prefill adds verify_lens onto the
+                        # paged KV for flashinfer-style kernels; using it here
+                        # would count the extend tokens twice. Take only the
+                        # layout indptr that helper returns.
+                        qo_indptr = layout.qo_indptr_device
+                        if (
+                            qo_indptr.dtype != torch.int32
+                            or qo_indptr.device != self.device
+                        ):
+                            qo_indptr = qo_indptr.to(
+                                device=self.device, dtype=torch.int32
+                            )
+                        verify_lens = layout.verify_lens
+                        if layout.verify_lens_cpu:
+                            max_extend_len = max(layout.verify_lens_cpu)
+                        else:
+                            max_extend_len = int(verify_lens.max().item())
+                        lens = verify_lens[:bs]
+                        seq_lens_bs = forward_batch.seq_lens[:bs]
+                        seq_mask_len = lens * (seq_lens_bs + lens)
 
                     kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
                     kv_indptr = kv_indptr[: bs + 1]
@@ -2619,7 +2694,6 @@ class AiterAttnBackend(AttentionBackend):
                     )
 
                     custom_mask = spec_info.custom_mask
-                    seq_mask_len = draft_num * (forward_batch.seq_lens + draft_num)
                     mask_indptr = self.mask_indptr
                     mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
                     mask_indptr = mask_indptr[: bs + 1]
@@ -2629,11 +2703,11 @@ class AiterAttnBackend(AttentionBackend):
                         kv_indices,
                         qo_indptr,
                         None,
-                        draft_num,
+                        max_extend_len,
                         None,
                         custom_mask=custom_mask,
                         mask_indptr=mask_indptr,
-                        max_extend_len=draft_num,
+                        max_extend_len=max_extend_len,
                     )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
@@ -3438,10 +3512,20 @@ class AiterAttnBackend(AttentionBackend):
                         swa_page_table=_swa_page_table,
                     )
                 else:
+                    # DFLASH/DSPARK verify replay always passes custom_mask=None
+                    # (see resolve_dflash_verify_mask_policy). Mirror Triton:
+                    # copy only when a mask is provided; otherwise leave None so
+                    # the kernel uses its built-in causal path.
                     custom_mask = self.cuda_graph_custom_mask
-                    custom_mask[: spec_info.custom_mask.shape[0]] = (
-                        spec_info.custom_mask
-                    )
+                    if (
+                        spec_info is not None
+                        and getattr(spec_info, "custom_mask", None) is not None
+                    ):
+                        custom_mask[: spec_info.custom_mask.shape[0]] = (
+                            spec_info.custom_mask
+                        )
+                    else:
+                        custom_mask = None
                     seq_mask_len = max_q_len * (seq_lens + max_q_len)
                     mask_indptr = self.mask_indptr[: bs + 1]
                     mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
@@ -3458,15 +3542,43 @@ class AiterAttnBackend(AttentionBackend):
                         max_extend_len=max_q_len,
                     )
         elif forward_mode.is_draft_extend_v2():
-            # EAGLE V2: Fixed num_draft_tokens per batch
+            # EAGLE V2. A staged per-request length tensor is cumsum'd into
+            # the preallocated qo_indptr. That path does not call
+            # _resolve_v2_num_draft_tokens, which rejects a mixed width and
+            # syncs on torch.all. Without the tensor, the fill stays the
+            # uniform host cap.
             self._ensure_spec_v2_topk_supported()
             seq_lens = seq_lens[:bs]
-            num_tokens_per_req = self._resolve_v2_num_draft_tokens()
-            extend_lens = torch.full(
-                (bs,), num_tokens_per_req, dtype=torch.int32, device=seq_lens.device
+            staged = (
+                getattr(spec_info, "extend_seq_lens_tensor", None)
+                if spec_info is not None
+                else None
             )
+            if staged is not None and int(staged.shape[0]) >= bs:
+                extend_lens = staged[:bs]
+                if extend_lens.dtype != torch.int32:
+                    extend_lens = extend_lens.to(dtype=torch.int32)
+                cap = self.num_draft_tokens
+                if not cap and spec_info is not None:
+                    cap = getattr(spec_info, "draft_token_num", None)
+                max_q_len = int(cap or 0)
+                if max_q_len < 1:
+                    raise ValueError(
+                        "DRAFT_EXTEND_V2 ragged graph needs a host width cap "
+                        "(num_draft_tokens or draft_token_num)."
+                    )
+            else:
+                num_tokens_per_req = self._resolve_v2_num_draft_tokens()
+                extend_lens = torch.full(
+                    (bs,),
+                    num_tokens_per_req,
+                    dtype=torch.int32,
+                    device=seq_lens.device,
+                )
+                max_q_len = num_tokens_per_req
 
             qo_indptr = self.qo_indptr[: bs + 1]
+            qo_indptr[:1].zero_()
             qo_indptr[1 : bs + 1] = torch.cumsum(extend_lens, dim=0)
             kv_indptr = self.kv_indptr[: bs + 1]
             kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
@@ -3484,7 +3596,6 @@ class AiterAttnBackend(AttentionBackend):
             )
 
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
-            max_q_len = num_tokens_per_req
 
             if self.use_mla and _use_mla_ps_kernel:
                 num_kv_splits = self.max_split_per_batch
@@ -3787,6 +3898,1144 @@ class AiterAttnBackend(AttentionBackend):
                 "(SGLANG_USE_AITER_UNIFIED_ATTN=1) or select a "
                 "different attention backend."
             )
+
+    def _flydsl_runner(self) -> FlydslPaDecode:
+        runner = getattr(self, "_flydsl_runner_obj", None)
+        if runner is None:
+            runner = FlydslPaDecode()
+            self._flydsl_runner_obj = runner
+        return runner
+
+    def _flydsl_graph_bound(self) -> bool:
+        """Full-graph warmup and capture bake one host max-context.
+
+        A breakable eager gap is capture-mode without stream capture. That
+        launch keeps the measured length and stays out of the graph.
+        """
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+            is_in_breakable_cuda_graph,
+        )
+
+        return flydsl_use_graph_bound(
+            stream_capturing=flydsl_stream_capturing(),
+            capture_mode=bool(get_is_capture_mode()),
+            breakable=bool(is_in_breakable_cuda_graph()),
+        )
+
+    def _flydsl_capture_max_context(self) -> int:
+        """Upper bound baked into a captured ``pa_decode``.
+
+        Replay does not re-enter Python. Every context length that will
+        run must be at most this value, and the block table cannot name
+        a column past ``req_to_token``.
+        """
+        cached = getattr(self, "_flydsl_capture_max_cached", None)
+        if cached is not None:
+            return int(cached)
+        bound = int(getattr(self, "max_context_len", 0) or 0)
+        table = getattr(self, "req_to_token", None)
+        if table is not None and getattr(table, "ndim", 0) >= 2:
+            width = int(table.shape[1])
+            bound = width if bound < 1 else min(bound, width)
+        if bound < 1:
+            raise RuntimeError(
+                "FlyDSL capture max_context is not positive. "
+                "The model context length has to be set before capture."
+            )
+        self._flydsl_capture_max_cached = bound
+        return bound
+
+    def _flydsl_require_eager(self) -> None:
+        """Refuse a launch that still syncs while the stream is capturing.
+
+        The session capture flag is also true in a breakable eager gap,
+        where this launch is supposed to run. Only an actual stream
+        capture is refused. Uniform verify does not call this.
+        """
+        if flydsl_stream_capturing():
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL ragged and extend paths do not "
+                "capture CUDA graphs. Uniform verify uses the capture "
+                "bound; this launch still syncs. "
+                "Launch with --disable-decode-cuda-graph, or capture the "
+                "static-width path."
+            )
+
+    def _flydsl_require_layer(self, layer: RadixAttention, sinks) -> None:
+        if not self.kv_cache_is_vectorized_5d:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL requires the target full-attention "
+                "pool to be SHUFFLE 5D. The pool builder selects that layout; "
+                "do not set SGLANG_AITER_KV_CACHE_LAYOUT (it would rewrite the "
+                "draft pool too). The NHD cache is not converted per step."
+            )
+        if self.page_size != 16:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL requires page_size=16 "
+                f"(got {self.page_size}). Page 64 is slower at a 93k prefix."
+            )
+        if self.kv_cache_dtype == fp8_dtype:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL is bf16 KV only. Do not enable FP8 KV."
+            )
+        if sinks is not None or layer.logit_cap:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL does not support attention sinks "
+                "or logit cap."
+            )
+        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL does not apply a sliding window "
+                f"(layer {layer.layer_id} has "
+                f"sliding_window_size={layer.sliding_window_size})."
+            )
+        if layer.qk_head_dim != layer.v_head_dim:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL requires qk_head_dim == v_head_dim, "
+                f"got {layer.qk_head_dim} and {layer.v_head_dim}."
+            )
+
+    def _flydsl_launch(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        context: torch.Tensor,
+        query_length: int,
+        max_context: int,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        req_indices: Optional[torch.Tensor] = None,
+    ) -> None:
+        bs = context.shape[0]
+        if req_indices is None:
+            req_indices = forward_batch.req_pool_indices[:bs]
+        elif int(req_indices.shape[0]) != bs:
+            raise RuntimeError(
+                f"FlyDSL req_indices {int(req_indices.shape[0])} != batch {bs}"
+            )
+        table = flydsl_block_table(
+            self.req_to_token,
+            req_indices,
+            self.page_size,
+            max_context,
+        )
+        q3 = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        o3 = o.reshape(-1, layer.tp_q_head_num, layer.v_head_dim)
+        n_tokens = bs * query_length
+        if q3.shape[0] != n_tokens or o3.shape[0] != n_tokens:
+            raise RuntimeError(
+                "FlyDSL query/output rows must equal batch * query_length: "
+                f"q={q3.shape[0]} o={o3.shape[0]} need {n_tokens}"
+            )
+        if not getattr(self, "_flydsl_logged", False):
+            logger.info(
+                "AITER_VERIFY_FLYDSL page=%s qlen=%s bs=%s max_context=%s k_cache=%s",
+                self.page_size,
+                query_length,
+                bs,
+                max_context,
+                tuple(k_cache.shape),
+            )
+            self._flydsl_logged = True
+        # query_length > 1 couples sequences. A batch-4 launch with long
+        # neighbors moves sequence 0, including row 0
+        # (decode-step-batch-bisect/bisect.json, bs4_q8_ctx_long_cloneq:
+        # max abs 0.0625, 3579 elements). The compact graph path already
+        # launches one slot at a time. This is the eager uniform and
+        # width-grouped verify. query_length 1 stays one launch: decode
+        # and the uniform draft block use it on both servers, and splitting
+        # only one side would open a new gap. A short neighbor (context
+        # 128) leaves row 0 unchanged, which matches the short-mix gate.
+        runner = self._flydsl_runner()
+        pin = self._flydsl_graph_bound()
+        if query_length == 1 or bs == 1:
+            runner.run(
+                o3,
+                q3,
+                k_cache,
+                v_cache,
+                context,
+                table,
+                float(layer.scaling),
+                query_length,
+                max_context,
+                pin_scratch=pin,
+            )
+            return
+        for slot in range(bs):
+            start = slot * query_length
+            stop = start + query_length
+            runner.run(
+                o3[start:stop],
+                q3[start:stop],
+                k_cache,
+                v_cache,
+                context[slot : slot + 1],
+                table[slot : slot + 1],
+                float(layer.scaling),
+                query_length,
+                max_context,
+                pin_scratch=pin,
+            )
+
+    def _forward_target_verify_flydsl_padded(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        layout,
+    ) -> None:
+        """Graph path for mixed verify widths. One ``pa_decode_ragged``.
+
+        The host width is the capture cap (``draft_token_num`` on the target,
+        which is ``speculative_num_draft_tokens``). Eager ragged batches use
+        this same launch so a graphs-off compare sees the same kernel.
+        """
+        spec = getattr(forward_batch, "spec_info", None)
+        max_q = getattr(spec, "draft_token_num", None) if spec is not None else None
+        if not max_q:
+            max_q = self.num_draft_tokens
+        max_q = int(max_q or 0)
+        if max_q < 1:
+            raise RuntimeError(
+                "FlyDSL ragged verify needs a host max query width "
+                "(spec draft_token_num or num_draft_tokens)."
+            )
+        if not getattr(self, "_flydsl_ragged_logged", False):
+            logger.info(
+                "AITER_VERIFY_FLYDSL ragged single-launch pa_decode_ragged max_q=%s",
+                max_q,
+            )
+            self._flydsl_ragged_logged = True
+        # Eager only. The cached uniform layout's graph bucket can add its
+        # leftover to the last real row (no padding rows). That row is
+        # short-7. The graph replay already uses the capped capture layout.
+        if layout is not None and layout.cap is None and not self._flydsl_graph_bound():
+            layout = layout.padded_to_bucket(padded_bs=int(layout.bs), cap=max_q)
+        k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
+        flydsl_forward_ragged_padded(
+            self,
+            q,
+            o,
+            layer,
+            forward_batch,
+            layout,
+            k_cache,
+            v_cache,
+            max_context=self._flydsl_capture_max_context(),
+            max_q=max_q,
+            runner=self._flydsl_runner(),
+        )
+
+    def _forward_target_verify_flydsl(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        sinks,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> None:
+        """Uniform-width target verify. ``seq_lens`` is the prefix; the
+        verify tokens were just written into the 5D pool at
+        ``prefix .. prefix + qlen``.
+        """
+        self._flydsl_require_layer(layer, sinks)
+        if k is None or v is None:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL needs the verify tokens written "
+                "into the KV pool on this forward (k/v are None)."
+            )
+        md = self.forward_metadata
+        pool_bs = len(forward_batch.req_pool_indices)
+        qlen = int(md.max_q_len or 0)
+        q_rows = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).shape[0]
+        if envs.SGLANG_AITER_VERIFY_FLYDSL_EXTEND.get():
+            self._flydsl_require_eager()
+            bs, max_extend = self._flydsl_extend_plan(q_rows, pool_bs)
+            self._forward_target_verify_flydsl_extend(
+                q, o, layer, forward_batch, k, v, bs, max_extend
+            )
+            return
+        # Compact graphs replay one graph per token bucket and refresh
+        # verify_lens in place. A width-grouped launch would freeze the
+        # capture-time groups. The padded window does not.
+        layout = getattr(
+            getattr(forward_batch, "spec_info", None), "ragged_verify_layout", None
+        )
+        # A full graph cannot re-read width groups, so it stays on the padded
+        # window. A breakable decode graph ends the segment here and runs the
+        # grouped launches between segments, where the group sizes are live.
+        if layout is not None and is_in_breakable_cuda_graph():
+            # Log before the graph break. Capture records the gap and does
+            # not run its body, and the gate greps this line before health.
+            if not getattr(self, "_flydsl_gap_logged", False):
+                logger.info("AITER_VERIFY_FLYDSL breakable eager gap: pa_decode_ragged")
+                self._flydsl_gap_logged = True
+            self._flydsl_grouped_verify_gap(q, o, layer, forward_batch)
+            return
+        if layout is not None and self._flydsl_graph_bound():
+            self._forward_target_verify_flydsl_padded(
+                q, o, layer, forward_batch, layout
+            )
+            return
+        # Eager control for the same commit. Same single launch as the graph
+        # path, so a histogram change is a replay of device metadata.
+        if layout is not None:
+            self._forward_target_verify_flydsl_padded(
+                q, o, layer, forward_batch, layout
+            )
+            return
+        qo = md.qo_indptr
+        try:
+            bs = flydsl_verify_live_batch(q_rows, qlen, pool_bs)
+        except ValueError as exc:
+            # Book conc16 died here: 127 query rows, pool 16, max qlen 8
+            # (15 requests of width 8 and one of width 7). A non-multiple of
+            # the max width is ragged. Other ValueErrors stay fatal.
+            if q_rows > 0 and qlen > 0 and pool_bs > 0 and q_rows % qlen != 0:
+                self._flydsl_require_eager()
+                self._forward_target_verify_flydsl_grouped(
+                    q, o, layer, forward_batch, q_rows, pool_bs
+                )
+                return
+            raise RuntimeError(str(exc)) from exc
+        if qo is None or qo.shape[0] <= bs:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL is missing verify qo_indptr metadata."
+            )
+        # qo is a uniform arange at qlen, so the prefix of a wider plan still
+        # names this query. A total that divides qlen can still be ragged
+        # when an earlier request is shorter; group that batch too.
+        # ``qo[bs].item()`` syncs, so a capturing stream cannot read it.
+        # Static verify capture builds a uniform indptr; the pre-capture
+        # warmup still performs this check on the same dummy batch.
+        capturing = flydsl_stream_capturing()
+        if not capturing:
+            if int(qo[bs].item()) != q_rows:
+                self._flydsl_require_eager()
+                self._forward_target_verify_flydsl_grouped(
+                    q, o, layer, forward_batch, q_rows, pool_bs
+                )
+                return
+        elif q_rows != bs * qlen:
+            self._flydsl_require_eager()
+            raise RuntimeError(
+                "FlyDSL uniform capture expected "
+                f"q_rows {q_rows} == batch {bs} * qlen {qlen}."
+            )
+        if bs != pool_bs and not getattr(self, "_flydsl_trimmed_logged", False):
+            logger.info(
+                "AITER_VERIFY_FLYDSL trimming pool %s to %s requests "
+                "(q_rows=%s qlen=%s)",
+                pool_bs,
+                bs,
+                q_rows,
+                qlen,
+            )
+            self._flydsl_trimmed_logged = True
+        step_key = (getattr(self, "_flydsl_nonce", 0), "verify", q_rows, bs)
+        cached = getattr(self, "_flydsl_step", None)
+        # A context tensor built before capture is not replayed. Rebuild
+        # from seq_lens on the capturing stream so the graph reads the
+        # static buffer. Later layers of this same capture reuse it.
+        cache_ok = (
+            cached is not None
+            and cached[0] == step_key
+            and len(cached) >= 5
+            and bool(cached[4]) == capturing
+        )
+        if not cache_ok:
+            # GPU seq_lens is the prefix. seq_lens_cpu may already include qlen.
+            context = (
+                forward_batch.seq_lens[:bs].to(dtype=torch.int32) + qlen
+            ).contiguous()
+            if self._flydsl_graph_bound():
+                max_context = self._flydsl_capture_max_context()
+            else:
+                max_context = int(context.max().item())
+            self._flydsl_step = (step_key, context, qlen, max_context, capturing)
+        else:
+            _, context, qlen, max_context, _ = cached
+        k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
+        self._flydsl_launch(
+            q,
+            o,
+            layer,
+            forward_batch,
+            context,
+            qlen,
+            max_context,
+            k_cache,
+            v_cache,
+        )
+        self._flydsl_debug_vs_extend(
+            q, o, layer, forward_batch, k, v, bs, qlen, context
+        )
+
+    @eager_on_graph
+    def _flydsl_grouped_verify_gap(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Single-launch ragged verify between breakable graph segments.
+
+        The decorator records this call and does not run it while a segment
+        is capturing. At replay the runner has already copied the live
+        ``seq_lens`` and the staged layout into the static buffers. ``o``
+        is the caller's buffer. Widths are device ``qo_indptr`` values, so
+        a new histogram does not build new launches.
+
+        ``q`` is the whole graph tier. A capped layout can end before that
+        buffer. The ghost tail is not a query row.
+        """
+        spec = getattr(forward_batch, "spec_info", None)
+        layout = (
+            getattr(spec, "ragged_verify_layout", None) if spec is not None else None
+        )
+        self._forward_target_verify_flydsl_padded(q, o, layer, forward_batch, layout)
+
+    def _flydsl_packed_verify(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """One ``pa_decode`` per occupied width, reading packed Q and writing packed O."""
+        spec = getattr(forward_batch, "spec_info", None)
+        layout = (
+            getattr(spec, "ragged_verify_layout", None) if spec is not None else None
+        )
+        if layout is None:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL packed verify is missing "
+                "ragged_verify_layout."
+            )
+        n_q = layer.tp_q_head_num
+        q3 = q.reshape(-1, n_q, layer.qk_head_dim)
+        o3 = o.reshape(-1, n_q, layer.v_head_dim)
+        q_rows = int(q3.shape[0])
+        pool_bs = len(forward_batch.req_pool_indices)
+        covered = self._flydsl_grouped_covered_rows(q_rows, pool_bs, forward_batch)
+        if covered < q_rows:
+            q3 = q3[:covered]
+            o3 = o3[:covered]
+        self._flydsl_packed_attention(q3, o3, layer, forward_batch, layout)
+
+    def _flydsl_packed_plan(self, forward_batch: ForwardBatch, layout, pool_bs: int):
+        """Host histogram for this step. The GPU launches reuse it on every layer."""
+        nonce = getattr(self, "_flydsl_nonce", 0)
+        cached = getattr(self, "_flydsl_packed_cache", None)
+        if cached is not None and cached[0] == nonce:
+            return cached[1]
+        real = staged_real_verify_lens(layout)
+        width_src = real if real is not None else layout.verify_lens
+        n = min(int(width_src.shape[0]), pool_bs, int(forward_batch.seq_lens.shape[0]))
+        widths = [int(v) for v in width_src[:n].tolist()]
+        groups: dict[int, list[int]] = {}
+        active = 0
+        for i, width in enumerate(widths):
+            if width < 1:
+                break
+            groups.setdefault(width, []).append(i)
+            active = i + 1
+        if active < 1:
+            plan = {"active": 0, "groups": {}}
+            self._flydsl_packed_cache = (nonce, plan)
+            return plan
+        device = forward_batch.seq_lens.device
+        seq = {
+            width: torch.tensor(ix, dtype=torch.int32, device=device)
+            for width, ix in groups.items()
+        }
+        lens = width_src[:active].to(dtype=torch.int32)
+        ctx = forward_batch.seq_lens[:active].to(dtype=torch.int32) + lens
+        qo = layout.qo_indptr_device
+        if qo.dtype != torch.int32:
+            qo = qo.to(dtype=torch.int32)
+        max_context = self._flydsl_capture_max_context()
+        table = flydsl_block_table(
+            self.req_to_token,
+            forward_batch.req_pool_indices[:active],
+            int(self.page_size),
+            max_context,
+        )
+        n_pages = int(table.shape[1])
+        bufs = {}
+        for width, ids in seq.items():
+            count = int(ids.shape[0])
+            bufs[width] = {
+                "ctx": torch.empty(count, dtype=torch.int32, device=device),
+                "row": torch.empty(count, dtype=torch.int32, device=device),
+                "table": torch.empty(count, n_pages, dtype=torch.int32, device=device),
+            }
+        plan = {
+            "active": active,
+            "seq": seq,
+            "ctx": ctx,
+            "qo": qo,
+            "table": table,
+            "bufs": bufs,
+            "max_context": max_context,
+            "packed": False,
+        }
+        self._flydsl_packed_cache = (nonce, plan)
+        return plan
+
+    def _flydsl_packed_attention(
+        self,
+        q3: torch.Tensor,
+        o3: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        layout,
+    ) -> None:
+        """Timed path. Metadata compact, then one packed ``pa_decode`` per width."""
+        pool_bs = len(forward_batch.req_pool_indices)
+        plan = self._flydsl_packed_plan(forward_batch, layout, pool_bs)
+        if plan["active"] < 1:
+            return
+        if not q3.is_contiguous() or not o3.is_contiguous():
+            raise RuntimeError(
+                "packed verify needs contiguous query and output tensors"
+            )
+        if not plan["packed"]:
+            for _width, seq in plan["seq"].items():
+                buf = plan["bufs"][_width]
+                flydsl_pack_width_group(
+                    seq,
+                    plan["ctx"],
+                    plan["qo"],
+                    plan["table"],
+                    buf["ctx"],
+                    buf["row"],
+                    buf["table"],
+                )
+            plan["packed"] = True
+        k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
+        runner = self._flydsl_runner()
+        scale = float(layer.scaling)
+        for width, _seq in plan["seq"].items():
+            buf = plan["bufs"][width]
+            runner.run(
+                o3,
+                q3,
+                k_cache,
+                v_cache,
+                buf["ctx"],
+                buf["table"],
+                scale,
+                int(width),
+                int(plan["max_context"]),
+                pin_scratch=False,
+                qo_row_base=buf["row"],
+            )
+
+    def _flydsl_grouped_step(
+        self,
+        q_rows: int,
+        pool_bs: int,
+        q: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        """Per-step ragged plan: one entry per width, cached across layers.
+
+        Each entry is ``(width, row_index, context, max_context, req_indices)``.
+        ``context`` is the prefix plus that width, so a short request does not
+        read a KV token the verify window never wrote.
+        """
+        self._flydsl_require_eager()
+        qo_vals, q_rows, pool_bs = self._flydsl_grouped_qo_vals(
+            forward_batch, q_rows, pool_bs
+        )
+        nonce = getattr(self, "_flydsl_nonce", 0)
+        step_key = (nonce, "verify-ragged", q_rows, pool_bs, tuple(qo_vals))
+        cached = getattr(self, "_flydsl_ragged", None)
+        if cached is not None and cached[0] == step_key:
+            return cached[1]
+        try:
+            _bs, groups = flydsl_verify_width_groups(qo_vals, q_rows, pool_bs)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        prefix = forward_batch.seq_lens
+        pool_idx = forward_batch.req_pool_indices
+        packed = []
+        for width, positions in groups:
+            rows = flydsl_group_row_indices(qo_vals, width, positions)
+            row_index = torch.tensor(rows, dtype=torch.long, device=q.device)
+            pos = torch.tensor(positions, dtype=torch.long, device=prefix.device)
+            context = (
+                prefix.index_select(0, pos).to(dtype=torch.int32) + width
+            ).contiguous()
+            max_context = int(context.max().item())
+            if max_context < 1:
+                raise RuntimeError(
+                    f"FlyDSL ragged group width {width} has no context to read."
+                )
+            req_indices = pool_idx.index_select(
+                0, pos.to(device=pool_idx.device, dtype=torch.long)
+            )
+            packed.append((width, row_index, context, max_context, req_indices))
+        sig = tuple((width, int(req.shape[0])) for width, _, _, _, req in packed)
+        seen = getattr(self, "_flydsl_ragged_sigs", None)
+        if seen is None:
+            seen = set()
+            self._flydsl_ragged_sigs = seen
+        if sig not in seen and len(seen) < 16:
+            seen.add(sig)
+            logger.info(
+                "AITER_VERIFY_FLYDSL ragged q_rows=%s pool=%s groups=%s "
+                "(each launch uses that width; short requests are not padded)",
+                q_rows,
+                pool_bs,
+                list(sig),
+            )
+        self._flydsl_ragged = (step_key, packed)
+        return packed
+
+    def _flydsl_grouped_qo_vals(
+        self, forward_batch: ForwardBatch, q_rows: int, pool_bs: int
+    ) -> tuple[list[int], int, int]:
+        """Indptr the grouped launches follow.
+
+        The captured layout's indptr includes the bucket fill. A batch
+        that fills the slot count adds that leftover to the last real
+        row, and the breakable gap used to launch it. ``0fbbca3`` did
+        the same fill and missed the short mix by the same logprobs.
+        The pre-pad lens staged next to that layout is the eager width.
+        """
+        spec = getattr(forward_batch, "spec_info", None)
+        layout = (
+            getattr(spec, "ragged_verify_layout", None) if spec is not None else None
+        )
+        real = staged_real_verify_lens(layout)
+        if real is not None:
+            widths = [int(v) for v in real.tolist()]
+            qo_vals = [0]
+            for width in widths:
+                if width < 1:
+                    break
+                qo_vals.append(qo_vals[-1] + width)
+            if len(qo_vals) < 2:
+                raise RuntimeError(
+                    "SGLANG_AITER_VERIFY_FLYDSL ragged verify has no real rows."
+                )
+            return qo_vals, qo_vals[-1], len(qo_vals) - 1
+        qo = self._flydsl_grouped_qo(forward_batch)
+        if qo is None or int(qo.shape[0]) < 2:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL ragged verify is missing qo_indptr."
+            )
+        limit = min(pool_bs, int(qo.shape[0]) - 1)
+        qo_vals = [int(v) for v in qo[: limit + 1].tolist()]
+        return qo_vals, q_rows, pool_bs
+
+    def _flydsl_grouped_qo(self, forward_batch: ForwardBatch) -> Optional[torch.Tensor]:
+        """Indptr the eager width groups must follow.
+
+        Capture metadata writes a uniform ``input_rows // slots`` arange.
+        A 1984-token tier on 256 slots becomes width 7 and sums to 1792,
+        so it does not cover the packed query. The layout indptr is the
+        mixed capture pattern. Replay copies the live lens into that same
+        tensor before this gap runs.
+        """
+        spec = getattr(forward_batch, "spec_info", None)
+        layout = (
+            getattr(spec, "ragged_verify_layout", None) if spec is not None else None
+        )
+        qo = getattr(layout, "qo_indptr_device", None) if layout is not None else None
+        if qo is None:
+            qo = self.forward_metadata.qo_indptr
+        return qo
+
+    def _flydsl_grouped_covered_rows(
+        self, q_rows: int, pool_bs: int, forward_batch: ForwardBatch
+    ) -> int:
+        """Rows the staged layout indptr covers inside the graph buffer.
+
+        ``padded_to_bucket(..., cap=width)`` clamps each request to the
+        verify window, so a 32-request replay on the 256-row tier can end
+        at 220. ``flydsl_verify_width_groups`` requires some prefix to
+        equal ``q_rows``. Passing the buffer length raises
+        ``qo_indptr does not cover 256 query rows`` and kills the decode
+        batch. The ghost tail is padding the graph keeps; the launches
+        index only the covered rows.
+        """
+        spec = getattr(forward_batch, "spec_info", None)
+        layout = (
+            getattr(spec, "ragged_verify_layout", None) if spec is not None else None
+        )
+        qo = getattr(layout, "qo_indptr_device", None) if layout is not None else None
+        if qo is None or pool_bs < 1 or int(qo.shape[0]) < 2:
+            return q_rows
+        index = min(pool_bs, int(qo.shape[0]) - 1)
+        covered = int(qo[index].item())
+        if covered < 1 or covered > q_rows:
+            return q_rows
+        return covered
+
+    def _forward_target_verify_flydsl_grouped(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        q_rows: int,
+        pool_bs: int,
+    ) -> None:
+        packed = self._flydsl_grouped_step(q_rows, pool_bs, q, forward_batch)
+        k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
+        q3 = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        o3 = o.reshape(-1, layer.tp_q_head_num, layer.v_head_dim)
+        if not o3.is_contiguous():
+            raise RuntimeError("FlyDSL ragged verify needs a contiguous output tensor.")
+        for width, row_index, context, max_context, req_indices in packed:
+            q_g = q3.index_select(0, row_index)
+            o_g = torch.empty(q_g.shape, dtype=o3.dtype, device=o3.device)
+            self._flydsl_launch(
+                q_g,
+                o_g,
+                layer,
+                forward_batch,
+                context,
+                width,
+                max_context,
+                k_cache,
+                v_cache,
+                req_indices=req_indices,
+            )
+            o3.index_copy_(0, row_index, o_g)
+
+    def _flydsl_debug_vs_extend(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        bs: int,
+        qlen: int,
+        context: torch.Tensor,
+    ) -> None:
+        """One layer, a few steps: does ``pa_decode`` match extend-gather?
+
+        The cold spec GSM8K miss is on the cache-reading verify path. This
+        log is the same forward's fresh K/V, the slots ``pa_decode`` will
+        read, and ``extend_attention_fwd`` on those fresh K/V. Unset the env
+        and this is a no-op.
+        """
+        if os.environ.get("SGLANG_AITER_VERIFY_FLYDSL_DEBUG") != "1":
+            return
+        seen = getattr(self, "_flydsl_debug_layer", None)
+        if seen is None:
+            self._flydsl_debug_layer = layer.layer_id
+            self._flydsl_debug_left = int(
+                os.environ.get("SGLANG_AITER_VERIFY_FLYDSL_DEBUG_STEPS", "12")
+            )
+        if layer.layer_id != self._flydsl_debug_layer:
+            return
+        min_bs = int(os.environ.get("SGLANG_AITER_VERIFY_FLYDSL_DEBUG_MIN_BS", "1"))
+        if bs < min_bs:
+            return
+        min_seq = int(os.environ.get("SGLANG_AITER_VERIFY_FLYDSL_DEBUG_MIN_SEQ", "0"))
+        if min_seq and int(forward_batch.seq_lens[0].item()) < min_seq:
+            return
+        left = getattr(self, "_flydsl_debug_left", 0)
+        if left <= 0:
+            return
+        self._flydsl_debug_left = left - 1
+
+        from sglang.kernels.ops.kvcache.shuffle_5d_cache import (
+            launch_gather_shuffle_5d_to_linear,
+        )
+
+        req = int(forward_batch.req_pool_indices[0].item())
+        seq = int(forward_batch.seq_lens[0].item())
+        ctx0 = int(context[0].item())
+        cpu0 = None
+        if forward_batch.seq_lens_cpu is not None and len(forward_batch.seq_lens_cpu):
+            cpu0 = int(forward_batch.seq_lens_cpu[0])
+        n = qlen
+        locs = forward_batch.out_cache_loc
+        if locs is None or int(locs.shape[0]) < n:
+            logger.info(
+                "AITER_VERIFY_FLYDSL_DEBUG layer=%s missing out_cache_loc "
+                "(bs=%s qlen=%s seq0=%s ctx0=%s cpu0=%s)",
+                layer.layer_id,
+                bs,
+                qlen,
+                seq,
+                ctx0,
+                cpu0,
+            )
+            return
+        locs = locs[:n].to(dtype=torch.int64)
+        end = min(seq + n, int(self.req_to_token.shape[1]))
+        table = self.req_to_token[req, seq:end].to(dtype=torch.int64)
+        loc_eq = int(table.shape[0]) == n and bool(torch.equal(locs, table))
+        k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
+        k_got, v_got = launch_gather_shuffle_5d_to_linear(k_cache, v_cache, locs)
+        k3 = k.reshape(-1, layer.tp_k_head_num, layer.qk_head_dim)[:n]
+        v3 = v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim)[:n]
+        k_abs = (k_got.float() - k3.float()).abs().max().item()
+        v_abs = (v_got.float() - v3.float()).abs().max().item()
+        o_ext = torch.empty_like(o)
+        self._forward_target_verify_flydsl_extend(
+            q, o_ext, layer, forward_batch, k, v, bs, qlen
+        )
+        out_abs = (o.float() - o_ext.float()).abs()
+        n_ctx_ne_cpu = -1
+        cpu_lens = forward_batch.seq_lens_cpu
+        if cpu_lens is not None and len(cpu_lens) >= bs:
+            cpu_i = torch.as_tensor(
+                cpu_lens[:bs], device=context.device, dtype=torch.int32
+            )
+            n_ctx_ne_cpu = int((context[:bs] != cpu_i).sum().item())
+        worst_i = 0
+        worst_abs = float(out_abs.max().item())
+        rows = int(out_abs.shape[0])
+        if qlen > 0 and rows == bs * qlen:
+            per = out_abs.reshape(bs, qlen, -1).amax(dim=(1, 2))
+            worst_i = int(torch.argmax(per).item())
+            worst_abs = float(per[worst_i].item())
+        worst_seq = int(forward_batch.seq_lens[worst_i].item())
+        logger.info(
+            "AITER_VERIFY_FLYDSL_DEBUG layer=%s left=%s bs=%s qlen=%s "
+            "seq0=%s ctx0=%s cpu0=%s n_ctx_ne_cpu=%s loc_eq_table=%s "
+            "k_abs=%.3e v_abs=%.3e out_abs=%.3e out_mean=%.3e "
+            "worst_i=%s worst_abs=%.3e worst_seq=%s loc0=%s table0=%s",
+            layer.layer_id,
+            left - 1,
+            bs,
+            qlen,
+            seq,
+            ctx0,
+            cpu0,
+            n_ctx_ne_cpu,
+            loc_eq,
+            k_abs,
+            v_abs,
+            out_abs.max().item(),
+            out_abs.mean().item(),
+            worst_i,
+            worst_abs,
+            worst_seq,
+            int(locs[0].item()),
+            int(table[0].item()) if table.numel() else None,
+        )
+
+    def _flydsl_extend_plan(self, q_rows: int, pool_bs: int) -> tuple[int, int]:
+        """Live request count and max query width from the ragged qo indptr.
+
+        ``pa_decode`` needs one width. ``extend_attention_fwd`` does not, and
+        compact verify mixes widths (103 rows is not a multiple of 8).
+        """
+        qo = self.forward_metadata.qo_indptr
+        if qo is None or int(qo.shape[0]) < 2:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL_EXTEND is missing verify qo_indptr."
+            )
+        limit = min(pool_bs, int(qo.shape[0]) - 1)
+        vals = [int(v) for v in qo[: limit + 1].tolist()]
+        bs = next((i for i, v in enumerate(vals) if v == q_rows), None)
+        if bs is None or bs < 1:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL_EXTEND qo_indptr does not cover "
+                f"{q_rows} query rows (pool {pool_bs}, prefix {vals[:8]})."
+            )
+        width = max(vals[i + 1] - vals[i] for i in range(bs))
+        if width < 1:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL_EXTEND saw an empty verify window."
+            )
+        return bs, width
+
+    def _forward_target_verify_flydsl_extend(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        bs: int,
+        qlen: int,
+    ) -> None:
+        """Causal extend: prefix gathered out of the SHUFFLE pool, verify K/V fresh.
+
+        ``pa_decode`` attends by re-reading the verify window from the cache.
+        The page-16 NHD server, which keeps the short GSM8K repair, passes
+        those tokens as ``k_extend`` / ``v_extend`` and the prefix as the
+        buffer. This is that contract on the SHUFFLE pool.
+        """
+        from sglang.kernels.ops.kvcache.shuffle_5d_cache import (
+            launch_gather_shuffle_5d_to_linear,
+        )
+
+        self._flydsl_require_eager()
+        md = self.forward_metadata
+        kv_indptr = md.kv_indptr[: bs + 1]
+        total = int(kv_indptr[-1].item())
+        k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
+        if total > 0:
+            k_lin, v_lin = launch_gather_shuffle_5d_to_linear(
+                k_cache, v_cache, md.kv_indices[:total]
+            )
+            kv_indices = torch.arange(total, device=k_lin.device, dtype=torch.int64)
+        else:
+            k_lin = k_cache.new_empty((0, layer.tp_k_head_num, layer.qk_head_dim))
+            v_lin = v_cache.new_empty((0, layer.tp_v_head_num, layer.v_head_dim))
+            kv_indices = torch.empty(0, device=q.device, dtype=torch.int64)
+        if not getattr(self, "_flydsl_extend_logged", False):
+            logger.info(
+                "AITER_VERIFY_FLYDSL extend-gather page=%s qlen=%s bs=%s "
+                "prefix_tokens=%s",
+                self.page_size,
+                qlen,
+                bs,
+                total,
+            )
+            self._flydsl_extend_logged = True
+        q3 = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        k3 = k.reshape(-1, layer.tp_k_head_num, layer.qk_head_dim).contiguous()
+        v3 = v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim).contiguous()
+        o3 = o.reshape(-1, layer.tp_q_head_num, layer.v_head_dim)
+        mask_indptr = md.mask_indptr
+        if mask_indptr is not None:
+            mask_indptr = mask_indptr[: bs + 1]
+        self.extend_attention_fwd(
+            q3,
+            k3,
+            v3,
+            o3,
+            k_lin,
+            v_lin,
+            md.qo_indptr[: bs + 1],
+            kv_indptr,
+            kv_indices,
+            None,
+            True,
+            mask_indptr,
+            qlen,
+            1.0,
+            1.0,
+            layer.scaling,
+            logit_cap=layer.logit_cap,
+            page_size=1,
+            identity_kv_indices=True,
+        )
+
+    def _forward_decode_flydsl(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        sinks,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+    ) -> None:
+        """qlen-1 decode. ``seq_lens`` already includes the token just written."""
+        self._flydsl_require_layer(layer, sinks)
+        if not self._flydsl_graph_bound():
+            self._flydsl_require_eager()
+        bs = forward_batch.batch_size
+        capturing = flydsl_stream_capturing()
+        step_key = (getattr(self, "_flydsl_nonce", 0), "decode")
+        cached = getattr(self, "_flydsl_step", None)
+        cache_ok = (
+            cached is not None
+            and cached[0] == step_key
+            and len(cached) >= 5
+            and bool(cached[4]) == capturing
+        )
+        if not cache_ok:
+            context = forward_batch.seq_lens[:bs].to(dtype=torch.int32).contiguous()
+            if self._flydsl_graph_bound():
+                max_context = self._flydsl_capture_max_context()
+            else:
+                max_context = int(context.max().item())
+            self._flydsl_step = (step_key, context, 1, max_context, capturing)
+        else:
+            _, context, _, max_context, _ = cached
+        self._flydsl_launch(
+            q,
+            o,
+            layer,
+            forward_batch,
+            context,
+            1,
+            max_context,
+            k_cache,
+            v_cache,
+        )
+
+    def _verify_splitkv_eligible(self, layer: RadixAttention, sinks) -> bool:
+        """Eager causal target-verify can use aiter's split-KV paged kernel.
+
+        ``extend_attention_fwd`` launches one workgroup per sequence and head,
+        so a long prefix is latency-bound on gfx942. ``paged_attention_ragged``
+        splits KV into 256-token partitions. Its MTP tile does not pack GQA 6
+        with a verify window of 8, so each query token is its own sequence and
+        re-reads KV. CUDA-graph capture is refused: the plan allocates.
+        """
+        if not get_bool_env_var("SGLANG_AITER_VERIFY_SPLITKV", "1"):
+            return False
+        if self.use_mla or self.kv_cache_is_vectorized_5d or self.page_size != 1:
+            return False
+        if self.topk not in (None, 1):
+            return False
+        if sinks is not None or layer.logit_cap:
+            return False
+        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+            return False
+        if layer.qk_head_dim != layer.v_head_dim:
+            return False
+        md = self.forward_metadata
+        if md is None or md.qo_indptr is None or md.custom_mask is not None:
+            return False
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+
+        return not get_is_capture_mode()
+
+    def _build_verify_splitkv_plan(self, forward_batch: ForwardBatch):
+        """One paged sequence per query token. Query w sees prefix+w+1 KV."""
+        md = self.forward_metadata
+        bs = len(forward_batch.req_pool_indices)
+        qo = md.qo_indptr
+        if qo.shape[0] < bs + 1:
+            return None
+        device = qo.device
+        verify_lens = (qo[1 : bs + 1] - qo[:bs]).to(torch.int32)
+        if verify_lens.numel() == 0:
+            return None
+        n_tokens = int(qo[bs].item())
+        if n_tokens <= 0:
+            return None
+        slot = torch.arange(bs, device=device).repeat_interleave(verify_lens)
+        if slot.shape[0] != n_tokens:
+            return None
+        starts = qo[:bs].to(torch.int32)
+        pos = torch.arange(n_tokens, device=device, dtype=torch.int32) - starts[slot]
+        seq_lens = forward_batch.seq_lens[:bs].to(device=device, dtype=torch.int32)
+        kv_lens = seq_lens[slot] + pos + 1
+        kv_indptr = torch.empty(n_tokens + 1, dtype=torch.int32, device=device)
+        kv_indptr[0] = 0
+        kv_indptr[1:] = torch.cumsum(kv_lens, dim=0)
+        total = int(kv_indptr[-1].item())
+        if total <= 0:
+            return None
+        req_q = forward_batch.req_pool_indices[:bs].to(device=device)
+        req_q = req_q.repeat_interleave(verify_lens)
+        kv_indices = torch.empty(total, dtype=self.req_to_token.dtype, device=device)
+        create_flashinfer_kv_indices_triton[(n_tokens, 4)](
+            self.req_to_token,
+            req_q,
+            kv_lens,
+            kv_indptr,
+            None,
+            kv_indices,
+            self.req_to_token.stride(0),
+            TOKEN_BLOCK_PARALLEL=True,
+        )
+        if kv_indices.dtype != torch.int32:
+            kv_indices = kv_indices.to(torch.int32)
+        return n_tokens, kv_indptr, kv_indices
+
+    def _verify_splitkv_workspace(self, n_tokens: int, num_heads: int, head_size: int):
+        nparts = self.max_num_partitions
+        nbytes = (
+            n_tokens * num_heads * nparts * head_size * 4
+            + 2 * n_tokens * num_heads * nparts * 4
+        )
+        buf = getattr(self, "_verify_splitkv_workspace_buf", None)
+        if buf is None or buf.numel() < nbytes:
+            self._verify_splitkv_workspace_buf = torch.empty(
+                nbytes, dtype=torch.uint8, device=self.device
+            )
+        return self._verify_splitkv_workspace_buf
+
+    def _forward_target_verify_splitkv(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        sinks,
+    ) -> bool:
+        if not self._verify_splitkv_eligible(layer, sinks):
+            return False
+        plan = getattr(self.forward_metadata, "_splitkv_plan", None)
+        if plan is None:
+            plan = self._build_verify_splitkv_plan(forward_batch)
+            if plan is None:
+                return False
+            self.forward_metadata._splitkv_plan = plan
+            if not getattr(self, "_verify_splitkv_logged", False):
+                n_logged, kv_indptr_logged, _ = plan
+                logger.info(
+                    "AITER_VERIFY_SPLITKV n_tokens=%s index_tokens=%s partitions=%s",
+                    n_logged,
+                    int(kv_indptr_logged[-1].item()),
+                    self.max_num_partitions,
+                )
+                self._verify_splitkv_logged = True
+        n_tokens, kv_indptr, kv_indices = plan
+        q3 = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        if q3.shape[0] != n_tokens:
+            if not getattr(self, "_verify_splitkv_skip_logged", False):
+                logger.info(
+                    "AITER_VERIFY_SPLITKV skip q_tokens=%s plan_tokens=%s",
+                    int(q3.shape[0]),
+                    n_tokens,
+                )
+                self._verify_splitkv_skip_logged = True
+            return False
+        if not q3.is_contiguous():
+            q3 = q3.contiguous()
+        out3 = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+        write = out3 if out3.is_contiguous() else torch.empty_like(q3)
+        k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
+        k_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
+        v_descale = layer.v_scale if layer.v_scale is not None else self.v_scale
+        workspace = self._verify_splitkv_workspace(
+            n_tokens, layer.tp_q_head_num, layer.v_head_dim
+        )
+        paged_attention_ragged(
+            write,
+            workspace,
+            q3,
+            k_cache.view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
+            v_cache.view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
+            float(layer.scaling),
+            kv_indptr,
+            kv_indices,
+            self.kv_last_page_len,
+            1,
+            self.max_num_partitions,
+            None,
+            self._get_aiter_paged_ragged_kv_cache_dtype(),
+            "NHD",
+            0.0,
+            k_descale,
+            v_descale,
+            None,
+            _AITER_PARTITION_SIZE_ROCM,
+            1,
+        )
+        if write is not out3:
+            out3.copy_(write)
+        return True
 
     def forward_extend(
         self,
@@ -4222,6 +5471,12 @@ class AiterAttnBackend(AttentionBackend):
                 else:
                     o = torch.empty_like(q)
 
+                if envs.SGLANG_AITER_VERIFY_FLYDSL.get():
+                    self._forward_target_verify_flydsl(
+                        q, o, layer, forward_batch, sinks, k, v
+                    )
+                    return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
                 # target_verify goes through unified_attention when topk == 1
                 # (the linear draft chain gives a pure causal mask). MLA and
                 # draft_extend still use the legacy extend_attention_fwd path.
@@ -4348,6 +5603,11 @@ class AiterAttnBackend(AttentionBackend):
                     return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
                 self._reject_target_verify_cross_layer_kv(k, v)
+
+                if self._forward_target_verify_splitkv(
+                    q, o, layer, forward_batch, sinks
+                ):
+                    return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
                 # extend_attention_fwd takes the KV scales as host floats.
                 k_scale = v_scale = 1.0
@@ -4884,10 +6144,16 @@ class AiterAttnBackend(AttentionBackend):
             if self.kv_cache_is_vectorized_5d:
                 # SHUFFLE 5D pool: pa_decode_gluon for full + SWA layers
                 # (see :func:`aiter_utils.forward_decode_vectorized_5d`
-                # for the dispatch rationale).
-                forward_decode_vectorized_5d(
-                    self, q, layer, forward_batch, k_cache, v_cache, o, sinks
-                )
+                # for the dispatch rationale). FlyDSL replaces that kernel
+                # when the verify flag is on, including qlen-1 decode.
+                if envs.SGLANG_AITER_VERIFY_FLYDSL.get():
+                    self._forward_decode_flydsl(
+                        q, o, layer, forward_batch, sinks, k_cache, v_cache
+                    )
+                else:
+                    forward_decode_vectorized_5d(
+                        self, q, layer, forward_batch, k_cache, v_cache, o, sinks
+                    )
             elif self.use_triton_unified_attention:
                 bs = forward_batch.batch_size
                 window_size = (-1, -1)

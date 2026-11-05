@@ -4,6 +4,7 @@
 
 import ctypes
 import logging
+import os
 from contextlib import contextmanager
 from functools import partial
 from typing import Any, List, Optional, Union
@@ -418,8 +419,11 @@ def dispatch_custom_allreduce(
         logger.debug("[AR] All-reduce: default")
 
     # On AMD with 1-stage AR, use sglang's CustomAllreduce
-    # (AiterCustomAllreduce doesn't have deterministic_all_reduce method)
+    # (AiterCustomAllreduce doesn't have deterministic_all_reduce method).
+    # The 1-stage kernel accumulates ranks in a fixed order and ignores the
+    # registered-capture flag, so graphs and eager share one reduction.
     if _use_amd_deterministic_impl():
+        logger.info("[AR] Using sglang CustomAllreduce deterministic 1-stage kernel")
         return CustomAllreduce
 
     if get_bool_env_var("SGLANG_USE_AITER_AR", default="true"):
@@ -428,11 +432,19 @@ def dispatch_custom_allreduce(
                 CustomAllreduce as AiterCustomAllreduce,
             )
 
-            logger.info("[AR] Using AiterCustomAllreduce (AMD default)")
+            # Same default as parallel_state._AITER_CAPTURE_COPY_IN. The
+            # registered capture path on image aiter 285579b mis-pairs IPC
+            # handles across graphs (aiter #6819). Copy-in matches eager.
+            copy_in = os.environ.get("SGLANG_AITER_CAPTURE_COPY_IN", "1") == "1"
             tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+            register = (not tms_cudagraph) and (not copy_in)
+            logger.info(
+                "[AR] Using AiterCustomAllreduce (AMD default); CUDA graph capture %s",
+                "copy-in" if not register else "registered",
+            )
             return partial(
                 AiterCustomAllreduce,
-                enable_register_for_capturing=not tms_cudagraph,
+                enable_register_for_capturing=register,
             )
         except ImportError as e:
             logger.warning(

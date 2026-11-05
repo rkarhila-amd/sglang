@@ -120,6 +120,8 @@ class RequestFuncOutput:
     spec_cap_length: float = 0.0
     spec_block_accept_length: float = 0.0
     spec_cap_lens_histogram: List[int] = field(default_factory=list)
+    spec_correct_drafts_histogram: List[int] = field(default_factory=list)
+    spec_verify_ct: int = 0
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -259,6 +261,45 @@ def _extract_cache_from_sglext(data, output):
             + (details.get("storage") or 0)
         )
         output.cached_tokens_details = details
+
+
+def _extract_spec_from_response(data, output):
+    """Pull DSPARK/spec stats from OAI chat/completions responses.
+
+    With ``return_spec_tokens_details=true`` the server puts fields under
+    ``sglext.spec_tokens_details`` (streaming: often on a choices=[] chunk).
+    Native ``meta_info`` on the top-level or ``choices[0]`` is the fallback.
+    """
+    details = None
+    sglext = data.get("sglext") or {}
+    raw = sglext.get("spec_tokens_details")
+    if isinstance(raw, list):
+        details = raw[0] if raw else None
+    elif isinstance(raw, dict):
+        details = raw
+
+    if details is None:
+        details = data.get("meta_info") or {}
+        if not details:
+            choices = data.get("choices") or []
+            if choices:
+                details = choices[0].get("meta_info") or {}
+
+    if not details:
+        return
+
+    if details.get("spec_accept_length") is not None:
+        output.spec_accept_length = details["spec_accept_length"]
+    if details.get("spec_cap_length") is not None:
+        output.spec_cap_length = details["spec_cap_length"]
+    if details.get("spec_block_accept_length") is not None:
+        output.spec_block_accept_length = details["spec_block_accept_length"]
+    if details.get("spec_cap_lens_histogram"):
+        output.spec_cap_lens_histogram = details["spec_cap_lens_histogram"]
+    if details.get("spec_correct_drafts_histogram"):
+        output.spec_correct_drafts_histogram = details["spec_correct_drafts_histogram"]
+    if details.get("spec_verify_ct") is not None:
+        output.spec_verify_ct = int(details["spec_verify_ct"])
 
 
 def _record_server_prompt_len(data, output):
@@ -517,19 +558,7 @@ async def async_request_openai_chat_completions(
                             "completion_tokens", output_len
                         )
                         _record_server_prompt_len(response_json, output)
-                        _meta_info = response_json["choices"][0].get("meta_info") or {}
-                        output.spec_accept_length = (
-                            _meta_info.get("spec_accept_length", 0.0) or 0.0
-                        )
-                        output.spec_cap_length = (
-                            _meta_info.get("spec_cap_length", 0.0) or 0.0
-                        )
-                        output.spec_block_accept_length = (
-                            _meta_info.get("spec_block_accept_length", 0.0) or 0.0
-                        )
-                        output.spec_cap_lens_histogram = (
-                            _meta_info.get("spec_cap_lens_histogram", []) or []
-                        )
+                        _extract_spec_from_response(response_json, output)
                         if getattr(args, "cache_report", False):
                             _extract_cache_from_sglext(response_json, output)
                     else:
@@ -556,6 +585,10 @@ async def async_request_openai_chat_completions(
                                     _extract_cache_from_sglext(data, output)
 
                                 choices = data.get("choices") or []
+                                # sglext.spec_tokens_details often arrives on a
+                                # usage/sglext-only chunk with choices=[].
+                                _extract_spec_from_response(data, output)
+
                                 if not choices:
                                     continue
 
@@ -1949,6 +1982,16 @@ async def benchmark(
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
+        "spec_accept_lengths": [output.spec_accept_length for output in outputs],
+        "spec_cap_lengths": [output.spec_cap_length for output in outputs],
+        "spec_verify_cts": [output.spec_verify_ct for output in outputs],
+        "spec_cap_lens_histograms": [
+            output.spec_cap_lens_histogram for output in outputs
+        ],
+        "spec_correct_drafts_histograms": [
+            output.spec_correct_drafts_histogram for output in outputs
+        ],
+        "start_times": [output.start_time for output in outputs],
     }
 
     if args.cache_report:
@@ -2065,6 +2108,14 @@ def run_benchmark(args_: argparse.Namespace):
             print("WARNING: --cache-report is only supported with sglang backends.")
         elif args.backend in ("sglang-oai", "sglang-oai-chat"):
             extra_request_body["return_cached_tokens_details"] = True
+
+    # Per-request DSPARK histograms for --output-details on OAI-chat.
+    # Without this flag the server omits sglext.spec_tokens_details.
+    if getattr(args, "output_details", False) and args.backend in (
+        "sglang-oai",
+        "sglang-oai-chat",
+    ):
+        extra_request_body.setdefault("return_spec_tokens_details", True)
 
     # Inject bootstrap fields for fake decode benchmarking
     if getattr(args, "fake_prefill", False):

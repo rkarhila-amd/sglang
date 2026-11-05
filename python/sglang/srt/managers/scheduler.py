@@ -4315,7 +4315,38 @@ class Scheduler(
         if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
+            if len(self.waiting_queue) == 0:
+                self._stable_prefill_qlen = None
             return None, running_batch
+
+        # Hold an empty batch until the waiting queue length has stayed
+        # the same for 30 scheduler iterations, then calc_priority orders
+        # by a cached content hash of origin_input_ids. The count is the
+        # same on every TP rank because the queue is broadcast; a wall
+        # clock is not.
+        # Concurrent clients otherwise win the first slot by arrival.
+        if (
+            get_bool_env_var("SGLANG_STABLE_PREFILL_ORDER")
+            and self.chunked_req is None
+            and len(running_batch.reqs) == 0
+            and len(self.waiting_queue) > 0
+        ):
+            qlen = len(self.waiting_queue)
+            if qlen != getattr(self, "_stable_prefill_qlen", None):
+                self._stable_prefill_qlen = qlen
+                self._stable_prefill_iters = 0
+            else:
+                self._stable_prefill_iters = (
+                    getattr(self, "_stable_prefill_iters", 0) + 1
+                )
+            if self._stable_prefill_iters < 30:
+                if (
+                    get_parallel().pp_rank == 0
+                    and get_parallel().attn_tp_rank == 0
+                    and get_parallel().attn_cp_rank == 0
+                ):
+                    time.sleep(0.01)
+                return None, running_batch
 
         running_bs = len(running_batch.reqs)
         # Skipped during a chunked prefill: that pass must proceed regardless.
@@ -4366,6 +4397,17 @@ class Scheduler(
                 ),
             )
         )
+
+        if (
+            get_bool_env_var("SGLANG_STABLE_PREFILL_ORDER")
+            and self.chunked_req is None
+            and running_bs == 0
+        ):
+            logger.info(
+                "Stable prefill order qlen=%d lens=%s",
+                len(self.waiting_queue),
+                [len(req.origin_input_ids) for req in list(self.waiting_queue)[:16]],
+            )
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds

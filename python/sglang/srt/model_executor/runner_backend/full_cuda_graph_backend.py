@@ -158,19 +158,33 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
 
         # Two warmups so kernels are loaded and one-time setup is paid before capture.
         # post_warmup_hook lets the attention backend reset state that warmup mutated.
+        # graph_capture() has already set ca_comm._IS_CAPTURING. Aiter's custom
+        # allreduce then returns zeros for any forward that is not inside
+        # torch.cuda.graph, so these two warmups used to advance GDN conv/SSM
+        # on a zero residual. That leaves the bs=8 replay one collective phase
+        # off from an eager process that never captured. Drop the flag for the
+        # warmup only; the recording forward below still captures copy-in.
         warmup_output = None
-        for warmup_step in range(2):
-            self._device_module.synchronize()
-            self._tp_group.barrier()
-            with self._precarve.measure():
-                output = forward_fn()
-            if self._reuse_output_buffer and warmup_step == 1:
-                warmup_output = output
-            del output
-            if profiler is not None:
-                profiler.step()
-            if post_warmup_hook is not None:
-                post_warmup_hook()
+        ca_comm = getattr(self._tp_group, "ca_comm", None)
+        pause_capture = ca_comm is not None and getattr(ca_comm, "_IS_CAPTURING", False)
+        if pause_capture:
+            ca_comm._IS_CAPTURING = False
+        try:
+            for warmup_step in range(2):
+                self._device_module.synchronize()
+                self._tp_group.barrier()
+                with self._precarve.measure():
+                    output = forward_fn()
+                if self._reuse_output_buffer and warmup_step == 1:
+                    warmup_output = output
+                del output
+                if profiler is not None:
+                    profiler.step()
+                if post_warmup_hook is not None:
+                    post_warmup_hook()
+        finally:
+            if pause_capture:
+                ca_comm._IS_CAPTURING = True
 
         if self._reuse_output_buffer and self._output_buffer is None:
             # Prefill captures the largest shape first and replays one shape at
