@@ -4111,6 +4111,11 @@ class AiterAttnBackend(AttentionBackend):
                 max_q,
             )
             self._flydsl_ragged_logged = True
+        # Eager only. The cached uniform layout's graph bucket can add its
+        # leftover to the last real row (no padding rows). That row is
+        # short-7. The graph replay already uses the capped capture layout.
+        if layout is not None and layout.cap is None and not self._flydsl_graph_bound():
+            layout = layout.padded_to_bucket(padded_bs=int(layout.bs), cap=max_q)
         k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
         flydsl_forward_ragged_padded(
             self,

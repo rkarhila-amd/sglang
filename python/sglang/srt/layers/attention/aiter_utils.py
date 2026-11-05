@@ -1057,12 +1057,23 @@ def _zero_cached_value(val, ptrs: set[int]) -> int:
     return n
 
 
+# arange / page-column constants. The block-table fill reads them and does
+# not rebuild them. Zeroing them would make the next gather address page 0.
+_RAGGED_BUF_KEEP = frozenset({"token_i32", "token_i64", "page_cols", "window", "stride0"})
+
+
 def _zero_flydsl_backend(backend, ptrs: set[int]) -> int:
     n = 0
     cache = getattr(backend, "_flydsl_ragged_bufs", None) or {}
     for bufs in cache.values():
-        for key in ("q_dense", "o_dense", "gathered", "context", "table"):
-            n += _zero_tensor(bufs.get(key), ptrs)
+        # q_dense / o_dense / table were the original five. slots, lin_index,
+        # qo_i32, and the row-index scratch are the same torch.empty cache,
+        # keyed by batch, and the 8-wide after a bs=1 case never rewrites a
+        # tail the previous 8-wide left. short-7 is that last row.
+        for key, tensor in bufs.items():
+            if key in _RAGGED_BUF_KEEP:
+                continue
+            n += _zero_tensor(tensor, ptrs)
     # Draft pack, slot, width, indptr, and context buffers. Keyed by batch,
     # allocated with torch.empty, and not in the runner scratch cache.
     # bs=1 cold128 does not share the bs=8 key.
@@ -1092,6 +1103,30 @@ def _zero_flydsl_backend(backend, ptrs: set[int]) -> int:
             plans = getattr(runner, plan_name, None) or {}
             for plan in plans.values():
                 n += _zero_cached_value(plan, ptrs)
+    # Static indptrs and split-KV scratch. A shorter batch writes a prefix
+    # and the next 8-wide's last row reads the tail. The unified-decode
+    # arange and kv_last_page_len stay: those are constants, not residue.
+    for name in (
+        "workspace_buffer",
+        "_kv_indices_scratch",
+        "_verify_splitkv_workspace_buf",
+        "kv_indptr",
+        "qo_indptr",
+        "mask_indptr",
+        "mamba_track_indices_buf",
+    ):
+        n += _zero_tensor(getattr(backend, name, None), ptrs)
+    for tensor in getattr(backend, "query_start_loc_list", None) or ():
+        n += _zero_tensor(tensor, ptrs)
+    packed = getattr(backend, "_flydsl_packed_cache", None)
+    if isinstance(packed, tuple) and len(packed) == 2 and isinstance(packed[1], dict):
+        n += _zero_cached_value(packed[1].get("ctx"), ptrs)
+        n += _zero_cached_value(packed[1].get("table"), ptrs)
+        for buf in (packed[1].get("bufs") or {}).values():
+            if isinstance(buf, dict):
+                for tensor in buf.values():
+                    n += _zero_tensor(tensor, ptrs)
+        backend._flydsl_packed_cache = None
     return n
 
 

@@ -1266,6 +1266,13 @@ class MambaPool:
                 cursor = getattr(self, name, None)
                 if cursor is not None:
                     cursor.zero_()
+            # PLE siblings ride clear_slots, not this full-pool zero. A flush
+            # rewinds the free list without clear_slots, so their rows would
+            # otherwise keep the previous request.
+            for sibling in getattr(self, "_slot_siblings", ()) or ():
+                clear = getattr(sibling, "clear", None)
+                if clear is not None:
+                    clear()
         logger.info("zeroed mamba conv/ssm state")
 
     def clear_slots(self, indices: torch.Tensor):

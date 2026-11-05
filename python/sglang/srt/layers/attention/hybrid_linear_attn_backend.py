@@ -312,7 +312,17 @@ class MambaAttnBackendBase(AttentionBackend):
             elif forward_batch.forward_mode.is_target_verify():
                 ragged_layout = forward_batch.ragged_verify_layout
                 if ragged_layout is not None:
-                    # Compact ragged verify: variable per-request verify lens.
+                    # Graph replay caps this (padded_to_bucket cap=draft).
+                    # Eager used the raw indptr. With no padding rows the
+                    # bucket leftover sits on the last request, which is
+                    # short-7, and the conv window is only draft_token_num
+                    # wide. Cap here so the eager GDN path matches replay.
+                    spec = forward_batch.spec_info
+                    cap = spec.draft_token_num if spec is not None else None
+                    if ragged_layout.cap is None and cap:
+                        ragged_layout = ragged_layout.padded_to_bucket(
+                            padded_bs=ragged_layout.bs, cap=int(cap)
+                        )
                     query_start_loc = ragged_layout.qo_indptr_device
                 else:
                     query_start_loc = torch.arange(

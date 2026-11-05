@@ -382,6 +382,30 @@ class DSparkVerifyPlanner:
         planner = self._budget_planner
         return planner is not None and planner.forced_budget_frac is not None
 
+    def reset_flush_residue(self) -> None:
+        """Drop host verify state the KV / mamba flush does not own.
+
+        The uniform layout object is cached for the life of the process.
+        Graph staging copies the bucket fill into that object's indptr, and
+        with no padding rows the leftover stays on the last request. The
+        confidence carry is indexed by req-pool slot and survives the
+        generation bump only as a stale row; flush still drops it so the
+        next case cannot read it if the freshness check is skipped.
+        """
+        self._uniform_layout_cache.clear()
+        planner = self._budget_planner
+        if planner is None:
+            return
+        confidence = planner._carry_confidence
+        generation = planner._carry_generation
+        if torch.is_tensor(confidence) and confidence.numel() > 0:
+            with torch.inference_mode():
+                confidence.zero_()
+        if torch.is_tensor(generation) and generation.numel() > 0:
+            with torch.inference_mode():
+                generation.fill_(-1)
+        planner._carry_pos = 0
+
     def schedule_layout(
         self,
         *,

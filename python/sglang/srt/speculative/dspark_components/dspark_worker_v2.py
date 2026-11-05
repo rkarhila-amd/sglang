@@ -715,6 +715,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             ),
         )
 
+    def _drop_flush_residue(self) -> None:
+        planner = getattr(self, "_verify_planner", None)
+        reset = getattr(planner, "reset_flush_residue", None)
+        if reset is not None:
+            reset()
+        from sglang.srt.speculative.ragged_verify import clear_staged_real_verify_lens
+
+        clear_staged_real_verify_lens()
+
     def clear_cache_pool(self):
         if not self._hosts_draft:
             return
@@ -786,6 +795,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_runner
         )
         logger.info("zeroed flydsl ragged static (%s tensors)", n_fly)
+        # Host residue the tensor walk cannot see: the cached uniform layout
+        # (last-row bucket fill) and the staged real-width dict.
+        self._drop_flush_residue()
         if draft_kv is None or draft_kv is target_kv:
             logger.info("draft kv pool is the target pool")
             return

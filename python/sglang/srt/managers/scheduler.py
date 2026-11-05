@@ -4320,9 +4320,10 @@ class Scheduler(
             return None, running_batch
 
         # Hold an empty batch until the waiting queue length has stayed
-        # the same for 30 scheduler iterations, then calc_priority sorts
-        # by origin_input_ids. The count is the same on every TP rank
-        # because the queue is broadcast; a wall clock is not.
+        # the same for 30 scheduler iterations, then calc_priority orders
+        # by a cached content hash of origin_input_ids. The count is the
+        # same on every TP rank because the queue is broadcast; a wall
+        # clock is not.
         # Concurrent clients otherwise win the first slot by arrival.
         if (
             get_bool_env_var("SGLANG_STABLE_PREFILL_ORDER")

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+from array import array
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
@@ -23,6 +25,33 @@ from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
 
 _ROUTING_KEY_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_POLICY_DEBUG_LOG")
 logger = logging.getLogger(__name__)
+
+
+def _stable_prefill_order_key(req):
+    """Order key that does not rescan a shared prompt prefix every chunk.
+
+    ``calc_priority`` runs once per prefill chunk. Sorting by
+    ``tuple(origin_input_ids)`` walks that prefix on every comparison.
+    On this host a queue of 240 prompts, 80k shared plus a short suffix,
+    took 2.7s. The conc256 book paid that on every chunk while the
+    queue was deep, which is the gap versus the flag-off ``446762f``
+    row. A cached blake2b of the id-buffer bytes is the same value on
+    every rank. Equal buffers stay tied, and ``list.sort`` is stable,
+    same as the tuple key. The flag stays default-off.
+    """
+    ids = req.origin_input_ids
+    n = len(ids)
+    cached = getattr(req, "_stable_prefill_key", None)
+    if cached is not None and cached[0] is ids and cached[1] == n:
+        return cached[2]
+    try:
+        buf = memoryview(ids)
+    except TypeError:
+        buf = memoryview(array("q", ids))
+    digest = hashlib.blake2b(buf, digest_size=8).digest()
+    key = (n, digest)
+    req._stable_prefill_key = (ids, n, key)
+    return key
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -275,10 +304,11 @@ class SchedulePolicy:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
 
         # Ragged decode tiles share neighbors, so two arrivals of the same
-        # prompt set must decode in the same order. The gate sets this; book
-        # runs leave it unset and keep FCFS.
+        # prompt set must be admitted in the same order. The flag stays
+        # default-off. The key is a cached content hash, not the token
+        # tuple: the tuple scan dominated the conc256 prefill gap.
         if get_bool_env_var("SGLANG_STABLE_PREFILL_ORDER"):
-            waiting_queue.sort(key=lambda req: tuple(req.origin_input_ids))
+            waiting_queue.sort(key=_stable_prefill_order_key)
 
         self._touch_waiting_prefixes(policy, waiting_queue, bootstrap_queue)
         return waiting_queue

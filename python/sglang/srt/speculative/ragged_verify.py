@@ -252,6 +252,20 @@ def remember_real_verify_lens(cap_layout, verify_lens: torch.Tensor) -> None:
     _REAL_VERIFY_LENS[id(cap_layout)] = (buf, n)
 
 
+def clear_staged_real_verify_lens() -> None:
+    """Drop widths staged beside a captured layout.
+
+    The dict is keyed by ``id(layout)``. Flush frees the batch that owned
+    the object, and the next layout can reuse that id with the previous
+    last-row width still in the buffer.
+    """
+    for buf, _n in list(_REAL_VERIFY_LENS.values()):
+        if torch.is_tensor(buf) and buf.numel() > 0:
+            with torch.inference_mode():
+                buf.zero_()
+    _REAL_VERIFY_LENS.clear()
+
+
 def staged_real_verify_lens(cap_layout) -> Optional[torch.Tensor]:
     if cap_layout is None:
         return None
