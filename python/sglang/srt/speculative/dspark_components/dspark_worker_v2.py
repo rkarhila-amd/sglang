@@ -722,6 +722,75 @@ class DSparkWorkerV2(BaseSpecWorker):
         commit = self._deferred_commit()
         if commit is not None:
             commit.disarm()
+        from sglang.srt.mem_cache.memory_pool import zero_kv_cache_tensors
+
+        # Scheduler.flush_cache resets the target free lists and mamba
+        # tensors only. The draft worker keeps that allocator and builds its
+        # own token_to_kv_pool, so draft K/V bytes survive a flush.
+        target_runner = self.model_runner
+        draft_runner = self.draft_model_runner
+        target_pool = getattr(target_runner, "req_to_token_pool", None)
+        draft_pool = getattr(draft_runner, "req_to_token_pool", None)
+        target_alloc = getattr(target_runner, "token_to_kv_pool_allocator", None)
+
+        if target_alloc is not None and hasattr(target_alloc, "get_kvcache"):
+            n = zero_kv_cache_tensors(target_alloc.get_kvcache())
+            logger.info("zeroed target kv cache (%s tensors)", n)
+
+        if draft_pool is not None and draft_pool is not target_pool:
+            draft_pool.clear()
+        draft_mamba = (
+            getattr(draft_pool, "mamba_pool", None) if draft_pool is not None else None
+        )
+        target_mamba = (
+            getattr(target_pool, "mamba_pool", None)
+            if target_pool is not None
+            else None
+        )
+        # flush_cache rewinds the free list and used to leave these tensors.
+        # A later request on a recycled slot, or a shared speculative window,
+        # then reads the previous request's linear state. Graph replay does
+        # not: capture zeros the buffers. The old guard skipped the target
+        # pool, and skipped both when draft and target share one pool.
+        # The eager short-7 shift appears only after a bs=1 request, which
+        # is the case that writes a different request into that state.
+        seen_mamba = set()
+        n_mamba = 0
+        for pool in (target_mamba, draft_mamba):
+            if pool is None or id(pool) in seen_mamba:
+                continue
+            seen_mamba.add(id(pool))
+            if hasattr(pool, "zero_cached_state"):
+                pool.zero_cached_state()
+                n_mamba += 1
+        if n_mamba:
+            logger.info("zeroed mamba cached state (%s pools)", n_mamba)
+        # The draft worker reuses the target allocator object and builds a
+        # separate token_to_kv_pool (the second "KV Cache is allocated"
+        # line). Comparing allocators misses those bytes.
+        target_kv = (
+            target_alloc.get_kvcache()
+            if target_alloc is not None and hasattr(target_alloc, "get_kvcache")
+            else None
+        )
+        draft_kv = getattr(draft_runner, "token_to_kv_pool", None)
+        # Ragged q/o, split-KV scratch, uniform plans, and the draft
+        # pack/slot/context buffers are keyed by batch shape. Flush of
+        # the KV pool does not touch them, and a bs=1 cold128 does not
+        # share the bs=8 key, so the next 8-wide replays the previous
+        # case's tail. The uniform pa_decode path also zeros its scratch
+        # on each launch; only the ragged path did that before.
+        from sglang.srt.layers.attention.aiter_utils import zero_flydsl_static_state
+
+        n_fly = zero_flydsl_static_state(target_runner) + zero_flydsl_static_state(
+            draft_runner
+        )
+        logger.info("zeroed flydsl ragged static (%s tensors)", n_fly)
+        if draft_kv is None or draft_kv is target_kv:
+            logger.info("draft kv pool is the target pool")
+            return
+        n = zero_kv_cache_tensors(draft_kv)
+        logger.info("flushed draft kv pool (%s tensors)", n)
 
     def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
         if not self._hosts_draft:

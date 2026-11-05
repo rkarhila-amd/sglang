@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
@@ -16,6 +17,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     mamba_cache_chunk_size,
+    mamba_checkpoint_grid,
 )
 from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
 
@@ -271,6 +273,12 @@ class SchedulePolicy:
                     SchedulePolicy._sort_by_routing_key(waiting_queue, running_batch)
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
+
+        # Ragged decode tiles share neighbors, so two arrivals of the same
+        # prompt set must decode in the same order. The gate sets this; book
+        # runs leave it unset and keep FCFS.
+        if get_bool_env_var("SGLANG_STABLE_PREFILL_ORDER"):
+            waiting_queue.sort(key=lambda req: tuple(req.origin_input_ids))
 
         self._touch_waiting_prefixes(policy, waiting_queue, bootstrap_queue)
         return waiting_queue
@@ -1682,12 +1690,69 @@ class PrefillAdder:
             max_new_tokens = 0
             tile_tokens = extend_len
 
+        extend_len, is_chunked, max_new_tokens, tile_tokens = (
+            self._hold_back_mamba_page_tail(
+                req, prefix_len, extend_len, is_chunked, max_new_tokens, tile_tokens
+            )
+        )
+
         if (verdict := self._check_prefill_tile_budget(tile_tokens)) is not None:
             return verdict
 
         return _PrefillAdmission(
             prefix_len, extend_len, max_new_tokens, is_chunked, replay_len
         )
+
+    def _hold_back_mamba_page_tail(
+        self,
+        req: Req,
+        prefix_len: int,
+        extend_len: int,
+        is_chunked: bool,
+        max_new_tokens: int,
+        tile_tokens: int,
+    ) -> tuple[int, bool, int, int]:
+        """Stop a prompt-finishing chunk on the previous page boundary.
+
+        The live mamba state is then valid at a length the radix tree can name,
+        and the last partial page is its own extend. Identical prompts match
+        that page instead of replaying from the last checkpoint grid point.
+        """
+        if os.environ.get("SGLANG_MAMBA_EXACT_TAIL", "0") != "1":
+            return extend_len, is_chunked, max_new_tokens, tile_tokens
+        if not self.tree_cache.supports_mamba():
+            return extend_len, is_chunked, max_new_tokens, tile_tokens
+        page = self.page_size
+        if page <= 1 or len(req.output_ids) != 0:
+            return extend_len, is_chunked, max_new_tokens, tile_tokens
+        prompt_len = len(req.origin_input_ids)
+        if prefix_len + extend_len != prompt_len or extend_len <= page:
+            return extend_len, is_chunked, max_new_tokens, tile_tokens
+        aligned_end = (prompt_len // page) * page
+        if aligned_end == prompt_len:
+            aligned_end -= page
+        if aligned_end <= prefix_len:
+            return extend_len, is_chunked, max_new_tokens, tile_tokens
+        grid = mamba_checkpoint_grid(page)
+        # 784 + 64 = 848. A whole grid of tokens from an off-grid prefix ends
+        # off the absolute grid, and that extend's live state emits EOS.
+        # Stop on the next absolute checkpoint (a multiple of the page).
+        if (
+            prefix_len % grid != 0
+            and aligned_end % grid != 0
+            and (aligned_end - prefix_len) % grid == 0
+        ):
+            absolute = ((prefix_len // grid) + 1) * grid
+            if prefix_len < absolute < aligned_end:
+                aligned_end = absolute
+        extend_len = aligned_end - prefix_len
+        logger.info(
+            "MAMBA_EXACT_TAIL hold back prompt=%s prefix=%s extend=%s",
+            prompt_len,
+            prefix_len,
+            extend_len,
+        )
+        return extend_len, True, 0, extend_len
 
     def _commit_prefill_admission(
         self, req: Req, admission: _PrefillAdmission, state_slot_reserve: int

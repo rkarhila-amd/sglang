@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import logging
+import os
 import threading
 import time
 from array import array
@@ -1416,6 +1417,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # instead of forking it, and the tree frees what the request still held.
         is_finished = req.finished()
         token_ids = req.full_untruncated_fill_ids[:up_to]
+        exact_token_ids = token_ids
 
         if self.disable:
             if is_finished:
@@ -1596,6 +1598,93 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.session_refs.register_session_ref(
                     req, leaf=result.last_device_node
                 )
+
+        if not is_finished:
+            self._publish_exact_tail(req, exact_token_ids)
+
+    def _publish_exact_tail(self, req: Req, token_ids) -> None:
+        """Attach the live mamba state to a page-aligned tail past the checkpoint.
+
+        The track buffer only names multiples of the checkpoint grid, so an
+        identical prompt otherwise resumes there and replays the tail as a
+        second extend. A chunk that was cut on a page boundary has its live
+        state at that boundary. Publishing it on the tail leaf lets the next
+        request match the whole page-aligned prefix.
+        """
+        if os.environ.get("SGLANG_MAMBA_EXACT_TAIL", "0") != "1":
+            return
+        if not self.is_mamba_enabled or self.page_size <= 1:
+            return
+        mamba = self.components.get(ComponentType.MAMBA)
+        if mamba is None or req.kv.mamba_pool_idx is None:
+            return
+        page_len = (len(token_ids) // self.page_size) * self.page_size
+        published = req.kv.cache_protected_len
+        if page_len <= published:
+            return
+        slot = mamba.copy_live_state(req)
+        if slot is None:
+            return
+        row = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :page_len]
+        radix_key = RadixKey(
+            token_ids[:page_len],
+            req.extra_key,
+            is_bigram=self.tree_core.is_eagle,
+            cache_salt=req.cache_salt,
+        ).page_aligned(self.page_size)
+        values = row[: len(radix_key)].to(dtype=torch.int64, copy=True)
+        result = self.insert(
+            InsertParams(
+                key=radix_key,
+                value=values,
+                mamba_value=slot,
+                prev_prefix_len=published,
+                inserted_len=req.kv.cache_inserted_len,
+                priority=req.priority or 0,
+                session_id=req.session_id,
+                rotation_base=req.kv_rotation_base,
+            )
+        )
+        # Free the copy only when the tree did not take it. A short prefix_len
+        # can still have attached the slot to a new leaf.
+        if result.mamba_exist or result.rotation_tail_declined:
+            mamba._free_mamba_value(slot)
+            logger.info(
+                "MAMBA_EXACT_TAIL skip len=%s published=%s prefix_len=%s exist=%s declined=%s",
+                page_len,
+                published,
+                result.prefix_len,
+                result.mamba_exist,
+                result.rotation_tail_declined,
+            )
+            return
+        # InsertResult.prefix_len is the matched overlap, not the new leaf.
+        # The published length is the device path, same as checkpoint_into_tree.
+        new_last = result.last_device_node
+        new_indices = self.path_device_indices(new_last)
+        if len(new_indices) <= published:
+            logger.info(
+                "MAMBA_EXACT_TAIL short path %s prefix_len=%s want=%s",
+                len(new_indices),
+                result.prefix_len,
+                page_len,
+            )
+            return
+        self.unlock(req.lock)
+        req.lock = self.lock(new_last)
+        self.req_to_token_pool.write(
+            (req.kv.req_pool_idx, slice(published, len(new_indices))),
+            new_indices[published:],
+        )
+        req.kv.cache_protected_len = len(new_indices)
+        req.kv.cache_inserted_len = max(req.kv.cache_inserted_len, len(new_indices))
+        req.last_node = new_last
+        logger.info(
+            "MAMBA_EXACT_TAIL published %s -> %s rid=%s",
+            published,
+            page_len,
+            req.rid,
+        )
 
     @rank_consensus(same_params=["req.rid"])
     def advance_unpublished_req(self, req: Req) -> None:
