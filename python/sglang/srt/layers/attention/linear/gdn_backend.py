@@ -1310,9 +1310,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # not cover pad steps, so the next replay (another width mix,
                 # or bs=8 after bs=1) would read the previous step's QKV.
                 # KDA already zeros this scratch.
-                dense = mixed_qkv.new_zeros(
-                    num_dense_tokens + 1, mixed_qkv.shape[-1]
-                )
+                dense = mixed_qkv.new_zeros(num_dense_tokens + 1, mixed_qkv.shape[-1])
                 dense.index_copy_(0, dense_token_indices, mixed_qkv)
                 mixed_qkv_dense = dense[:num_dense_tokens].view(
                     batch_size, draft_token_num, -1

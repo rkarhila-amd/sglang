@@ -1796,9 +1796,7 @@ class TritonAttnBackend(AttentionBackend):
                 forward_draft_extend,
             )
 
-            return forward_draft_extend(
-                self, q, o, k, v, layer, forward_batch, causal
-            )
+            return forward_draft_extend(self, q, o, k, v, layer, forward_batch, causal)
 
         # Dense one-shot MLA prefill (AttnForwardMethod.MHA_ONE_SHOT): k/v were
         # up-projected out of the latent cache and span prefix + current chunk,
@@ -2436,7 +2434,6 @@ class TritonAttnBackend(AttentionBackend):
         # are known, so lean_decode_seqlen_gate uses them. Deterministic inference requires
         # the batch-invariant standard path; the SGLANG_DISABLE_LEAN_ATTENTION kill-switch
         # also forces that path. Otherwise, an explicit True/False override is respected.
-        from sglang.srt.environ import envs
         from sglang.srt.model_executor.runner_utils.capture_mode import (
             get_is_capture_mode,
         )

@@ -73,9 +73,7 @@ def collapse_draft_outputs(
     ``dest`` is a preallocated ``[B * qlen, n_q, D]`` buffer.
     """
     if out.shape[1] != n_q * qlen:
-        raise ValueError(
-            f"expanded heads {out.shape[1]} != n_q {n_q} * qlen {qlen}"
-        )
+        raise ValueError(f"expanded heads {out.shape[1]} != n_q {n_q} * qlen {qlen}")
     batch = out.shape[0]
     dim = out.shape[-1]
     group = n_q // n_kv
@@ -159,7 +157,9 @@ def _capture_max_context(backend) -> int:
     return bound
 
 
-def _expand_bufs(backend, batch: int, expanded_heads: int, dim: int, like: torch.Tensor):
+def _expand_bufs(
+    backend, batch: int, expanded_heads: int, dim: int, like: torch.Tensor
+):
     """Pack and output buffers for one captured batch. Not evicted."""
     from sglang.srt.layers.attention.aiter_utils import flydsl_note_scratch
 
@@ -355,13 +355,9 @@ def _launch_ragged_bidirectional(
     if not capturing:
         widest = int(widths.max().item())
         if widest > max_q or widest < 1:
-            raise RuntimeError(
-                f"draft ragged width {widest} is outside 1..{max_q}"
-            )
+            raise RuntimeError(f"draft ragged width {widest} is outside 1..{max_q}")
         if qo_indptr is not None and int(qo_indptr[bs].item()) != q_rows:
-            raise RuntimeError(
-                f"draft qo_indptr[{bs}] != query rows {q_rows}"
-            )
+            raise RuntimeError(f"draft qo_indptr[{bs}] != query rows {q_rows}")
     k_cache, v_cache = _caches(backend, layer)
     width_buf = _draft_width_buf(backend, bs, q3.device)
     src_w = widths if widths.dtype == torch.int32 else widths.to(dtype=torch.int32)
@@ -523,9 +519,7 @@ def _launch_uniform(
             f"draft KV heads in the pool ({int(k_cache.shape[1])}) "
             f"!= layer tp_k_head_num {n_kv}"
         )
-    context, spec = _context(
-        backend, forward_batch, bs, qlen, graph_bound, capturing
-    )
+    context, spec = _context(backend, forward_batch, bs, qlen, graph_bound, capturing)
     req_indices = forward_batch.req_pool_indices[:bs]
     table = flydsl_block_table(
         backend.req_to_token, req_indices, backend.page_size, spec
@@ -616,9 +610,7 @@ def _launch_gathered_extend(
     kv_indptr = md.kv_indptr
     kv_indices = md.kv_indices
     if kv_indptr is None or kv_indices is None:
-        raise RuntimeError(
-            "SGLANG_DSPARK_DRAFT_FLYDSL prefill is missing kv_indptr."
-        )
+        raise RuntimeError("SGLANG_DSPARK_DRAFT_FLYDSL prefill is missing kv_indptr.")
     k_lin, v_lin, idx = _gather_prefix(k_cache, v_cache, kv_indptr, kv_indices, bs)
     if not getattr(backend, "_draft_flydsl_gather_logged", False):
         logger.info(
@@ -708,9 +700,7 @@ def forward_draft_extend(
             f"sliding_window_size={layer.sliding_window_size})."
         )
     if getattr(layer, "logit_cap", 0):
-        raise RuntimeError(
-            "SGLANG_DSPARK_DRAFT_FLYDSL does not apply a logit cap."
-        )
+        raise RuntimeError("SGLANG_DSPARK_DRAFT_FLYDSL does not apply a logit cap.")
     if backend.page_size != 16:
         raise RuntimeError(
             "SGLANG_DSPARK_DRAFT_FLYDSL requires page_size=16 "
@@ -728,12 +718,7 @@ def forward_draft_extend(
     prefix = forward_batch.extend_prefix_lens
     if prefix is None and forward_batch.forward_mode.is_target_verify():
         prefix = forward_batch.seq_lens
-    if (
-        qlen is not None
-        and q_rows == bs * qlen
-        and prefix is not None
-        and mask is None
-    ):
+    if qlen is not None and q_rows == bs * qlen and prefix is not None and mask is None:
         return _launch_uniform(backend, q, o, layer, forward_batch, qlen)
     # Mixed short blocks. pa_decode with query length > 1 is causal, and
     # this block is bidirectional, so pad to the host draft width, pack
@@ -776,6 +761,4 @@ def forward_draft_extend(
             forward_batch.forward_mode,
             mask is not None,
         )
-    return _launch_gathered_extend(
-        backend, q, o, k, v, layer, forward_batch, causal
-    )
+    return _launch_gathered_extend(backend, q, o, k, v, layer, forward_batch, causal)

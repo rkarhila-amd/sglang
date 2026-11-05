@@ -233,9 +233,7 @@ class TestFlydslVerifyWidthGroups(CustomTestCase):
         self.assertEqual(bs, 16)
         self.assertEqual(groups, [(8, list(range(15))), (7, [15])])
         self.assertEqual(sum(w * len(ix) for w, ix in groups), 127)
-        self.assertEqual(
-            flydsl_group_row_indices(qo, 7, [15]), list(range(120, 127))
-        )
+        self.assertEqual(flydsl_group_row_indices(qo, 7, [15]), list(range(120, 127)))
 
     def test_middle_width_is_not_a_contiguous_slice(self):
         widths = [8, 7, 8]
@@ -278,7 +276,9 @@ class TestFlydslGroupedVerifyLaunch(CustomTestCase):
         self.heads = 2
         self.dim = 4
 
-    def _run(self, widths, q_rows, pool_bs, qlen, seq, pool_ids=None, graph_bound=False):
+    def _run(
+        self, widths, q_rows, pool_bs, qlen, seq, pool_ids=None, graph_bound=False
+    ):
         qo = _qo(widths)
         if pool_ids is None:
             pool_ids = list(range(pool_bs))
@@ -389,9 +389,7 @@ class TestFlydslGroupedVerifyLaunch(CustomTestCase):
     def test_graph_bound_keeps_lengths_and_bakes_host_max(self):
         # Eager max of this batch is 38. A captured graph has to specialize
         # on the host bound instead, without padding the per-request lengths.
-        o = self._run(
-            [8, 8, 8, 8], 24, 4, 8, [10, 20, 30, 40], graph_bound=True
-        )
+        o = self._run([8, 8, 8, 8], 24, 4, 8, [10, 20, 30, 40], graph_bound=True)
         self.assertEqual(len(self.calls), 1)
         self.assertEqual(self.calls[0]["ctx"], [18, 28, 38])
         self.assertEqual(self.calls[0]["max_context"], 4096)
@@ -419,14 +417,18 @@ class TestFlydslBreakableGap(CustomTestCase):
         fn = AiterAttnBackend._flydsl_grouped_verify_gap
         self.assertTrue(callable(getattr(fn, "run_eager", None)))
 
-    def test_gap_outside_capture_calls_packed_row_base(self):
-        # The breakable gap launches packed Q/O per occupied width.
+    def test_gap_calls_padded_single_launch(self):
+        # The breakable gap is one pa_decode_ragged through the padded
+        # window. It does not launch packed Q/O per occupied width.
         backend = _backend()
         seen = {}
 
-        def packed(self, q, o, layer, forward_batch, layout):
+        def padded(self, q, o, layer, forward_batch, layout):
             seen["rows"] = int(q.shape[0])
             seen["layout"] = layout
+
+        def packed(self, q, o, layer, forward_batch, layout):
+            seen["packed"] = True
 
         q = torch.zeros(12, 6, 256)
         layout = SimpleNamespace(
@@ -435,16 +437,22 @@ class TestFlydslBreakableGap(CustomTestCase):
         )
         fb = SimpleNamespace(
             req_pool_indices=torch.arange(3),
-            spec_info=SimpleNamespace(ragged_verify_layout=layout),
+            spec_info=SimpleNamespace(draft_token_num=8, ragged_verify_layout=layout),
         )
-        with unittest.mock.patch.object(
-            AiterAttnBackend, "_flydsl_packed_attention", packed
+        with (
+            unittest.mock.patch.object(
+                AiterAttnBackend, "_forward_target_verify_flydsl_padded", padded
+            ),
+            unittest.mock.patch.object(
+                AiterAttnBackend, "_flydsl_packed_attention", packed
+            ),
         ):
             backend._flydsl_grouped_verify_gap(
                 q, torch.zeros_like(q), self._layer6(), fb
             )
         self.assertEqual(seen["rows"], 12)
         self.assertIs(seen["layout"], layout)
+        self.assertNotIn("packed", seen)
 
     def test_packed_attention_has_no_pytorch_gather(self):
         import inspect
@@ -484,7 +492,13 @@ class TestFlydslBreakableGap(CustomTestCase):
             _stub_capture(True),
         ):
             backend._forward_target_verify_flydsl(
-                q, torch.zeros_like(q), self._layer6(), fb, None, torch.zeros(1), torch.zeros(1)
+                q,
+                torch.zeros_like(q),
+                self._layer6(),
+                fb,
+                None,
+                torch.zeros(1),
+                torch.zeros(1),
             )
         return calls
 
@@ -512,54 +526,53 @@ class TestFlydslBreakableGap(CustomTestCase):
         got = backend._flydsl_grouped_qo(fb)
         self.assertTrue(torch.equal(got, uniform))
 
-    def _gap_q_rows(self, q_rows: int, pool_bs: int, qo):
+    def _gap_padded_rows(self, q_rows: int, pool_bs: int, qo):
         backend = _backend()
         seen = {}
 
-        def packed(self, q, o, layer, forward_batch, layout):
+        def padded(self, q, o, layer, forward_batch, layout):
             seen["q_rows"] = int(q.shape[0])
-            seen["pool_bs"] = pool_bs
+            seen["qo_end"] = int(layout.qo_indptr_device[-1])
 
         q = torch.zeros(q_rows, 6, 256)
+        layout = SimpleNamespace(
+            qo_indptr_device=qo,
+            verify_lens=torch.ones(pool_bs, dtype=torch.int32),
+        )
         fb = SimpleNamespace(
             req_pool_indices=torch.arange(pool_bs),
-            spec_info=SimpleNamespace(
-                ragged_verify_layout=SimpleNamespace(
-                    qo_indptr_device=qo,
-                    verify_lens=torch.ones(pool_bs, dtype=torch.int32),
-                )
-            ),
+            spec_info=SimpleNamespace(draft_token_num=8, ragged_verify_layout=layout),
         )
         with unittest.mock.patch.object(
-            AiterAttnBackend, "_flydsl_packed_attention", packed
+            AiterAttnBackend, "_forward_target_verify_flydsl_padded", padded
         ):
             backend._flydsl_grouped_verify_gap(
                 q, torch.zeros_like(q), self._layer6(), fb
             )
         return seen
 
-    def test_gap_slices_to_the_staged_indptr_not_the_tier(self):
-        # 912d636 died on GSM8K p32: graph tier 256 rows, pool 32, staged
-        # prefix [0, 6, 14, ...] never reached 256. The padded window must
-        # see only the covered rows, or searchsorted walks into the ghost tail.
+    def test_gap_forwards_the_tier_when_the_indptr_ends_early(self):
+        # 912d636 died when a host slice searchsorted into the ghost tail.
+        # The padded launch keeps the whole tier. qo_indptr names the live
+        # prefix, and rows at or past qo[bs] are parked past the window.
         qo = torch.tensor([0, 6, 14, 21, 28], dtype=torch.int32)
         self.assertEqual(
-            self._gap_q_rows(32, 4, qo),
-            {"q_rows": 28, "pool_bs": 4},
+            self._gap_padded_rows(32, 4, qo),
+            {"q_rows": 32, "qo_end": 28},
         )
 
-    def test_gap_keeps_q_rows_when_the_indptr_covers_the_tier(self):
+    def test_gap_forwards_the_tier_when_the_indptr_covers_it(self):
         qo = torch.tensor([0, 8, 16, 24, 32], dtype=torch.int32)
         self.assertEqual(
-            self._gap_q_rows(32, 4, qo),
-            {"q_rows": 32, "pool_bs": 4},
+            self._gap_padded_rows(32, 4, qo),
+            {"q_rows": 32, "qo_end": 32},
         )
 
-    def test_gap_keeps_q_rows_when_the_indptr_runs_past_the_buffer(self):
+    def test_gap_forwards_the_buffer_when_the_indptr_runs_past_it(self):
         qo = torch.tensor([0, 10, 20, 40], dtype=torch.int32)
         self.assertEqual(
-            self._gap_q_rows(12, 3, qo),
-            {"q_rows": 12, "pool_bs": 3},
+            self._gap_padded_rows(12, 3, qo),
+            {"q_rows": 12, "qo_end": 40},
         )
 
     def test_grouped_step_uses_the_real_lens_not_the_bucket_fill(self):
@@ -588,7 +601,9 @@ class TestFlydslBreakableGap(CustomTestCase):
     def test_full_graph_layout_stays_padded(self):
         self.assertEqual(self._dispatch(breakable=False), ["padded"])
 
-    def test_eager_layout_uses_packed(self):
+    def test_eager_layout_uses_padded(self):
+        # Eager with a layout uses the same single-launch padded path as
+        # the graph. The retired per-width packed call is not the control.
         backend = _backend()
         backend.forward_metadata = SimpleNamespace(max_q_len=8, qo_indptr=None)
         calls = []
@@ -627,7 +642,7 @@ class TestFlydslBreakableGap(CustomTestCase):
                 torch.zeros(1),
                 torch.zeros(1),
             )
-        self.assertEqual(calls, ["packed"])
+        self.assertEqual(calls, ["padded"])
 
 
 class TestFlydslBlockTable(CustomTestCase):

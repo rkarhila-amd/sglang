@@ -47,9 +47,7 @@ def flydsl_use_graph_bound(
     return bool(stream_capturing or capture_mode)
 
 
-def flydsl_note_scratch(
-    cache: dict, pinned: dict, key, value, pin: bool
-) -> None:
+def flydsl_note_scratch(cache: dict, pinned: dict, key, value, pin: bool) -> None:
     """Remember scratch, and keep any entry a captured graph still holds.
 
     The eager cache stays at 16 keys. Pinned entries are the tensors
@@ -412,9 +410,7 @@ class FlydslPaDecode:
         packed = qo_row_base is not None
         if packed:
             if qo_row_base.dtype != torch.int32 or int(qo_row_base.shape[0]) != batch:
-                raise ValueError(
-                    "qo_row_base must be int32 and one entry per sequence"
-                )
+                raise ValueError("qo_row_base must be int32 and one entry per sequence")
             if not qo_row_base.is_contiguous():
                 raise ValueError("qo_row_base must be contiguous")
             if query.shape != output.shape:
@@ -637,9 +633,7 @@ class FlydslPaDecode:
             cached = (
                 exp_sums,
                 torch.empty_like(exp_sums),
-                torch.empty(
-                    *scalar, head_dim, dtype=query.dtype, device=query.device
-                ),
+                torch.empty(*scalar, head_dim, dtype=query.dtype, device=query.device),
             )
         flydsl_note_scratch(
             self._scratch_cache,
@@ -864,12 +858,8 @@ def _flydsl_ragged_bufs(
         page_cols.mul_(page_size * stride1)
         page_cols.add_(storage_offset)
         bufs = {
-            "q_dense": torch.empty(
-                (scratch, heads, dim), dtype=dtype, device=device
-            ),
-            "o_dense": torch.empty(
-                (scratch, heads, dim), dtype=dtype, device=device
-            ),
+            "q_dense": torch.empty((scratch, heads, dim), dtype=dtype, device=device),
+            "o_dense": torch.empty((scratch, heads, dim), dtype=dtype, device=device),
             "context": torch.empty((bs,), dtype=torch.int32, device=device),
             "qo_i32": torch.empty((bs + 1,), dtype=torch.int32, device=device),
             "lens_i32": torch.empty((bs,), dtype=torch.int32, device=device),
@@ -1059,7 +1049,9 @@ def _zero_cached_value(val, ptrs: set[int]) -> int:
 
 # arange / page-column constants. The block-table fill reads them and does
 # not rebuild them. Zeroing them would make the next gather address page 0.
-_RAGGED_BUF_KEEP = frozenset({"token_i32", "token_i64", "page_cols", "window", "stride0"})
+_RAGGED_BUF_KEEP = frozenset(
+    {"token_i32", "token_i64", "page_cols", "window", "stride0"}
+)
 
 
 def _zero_flydsl_backend(backend, ptrs: set[int]) -> int:
@@ -1247,9 +1239,7 @@ def flydsl_forward_ragged_padded(
                 )
             q_in = q_in.contiguous()
         if not o3.is_contiguous() and flydsl_stream_capturing():
-            raise RuntimeError(
-                "ragged verify output must be contiguous before capture"
-            )
+            raise RuntimeError("ragged verify output must be contiguous before capture")
         q_k = bufs["q_dense"][:cap_rows]
         o_k = bufs["o_dense"][:cap_rows]
         q_k[:q_rows].copy_(q_in[:q_rows])

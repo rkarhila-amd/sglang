@@ -423,9 +423,7 @@ def dispatch_custom_allreduce(
     # The 1-stage kernel accumulates ranks in a fixed order and ignores the
     # registered-capture flag, so graphs and eager share one reduction.
     if _use_amd_deterministic_impl():
-        logger.info(
-            "[AR] Using sglang CustomAllreduce deterministic 1-stage kernel"
-        )
+        logger.info("[AR] Using sglang CustomAllreduce deterministic 1-stage kernel")
         return CustomAllreduce
 
     if get_bool_env_var("SGLANG_USE_AITER_AR", default="true"):
@@ -441,8 +439,7 @@ def dispatch_custom_allreduce(
             tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
             register = (not tms_cudagraph) and (not copy_in)
             logger.info(
-                "[AR] Using AiterCustomAllreduce (AMD default); "
-                "CUDA graph capture %s",
+                "[AR] Using AiterCustomAllreduce (AMD default); CUDA graph capture %s",
                 "copy-in" if not register else "registered",
             )
             return partial(

@@ -92,11 +92,7 @@ def _logits_row_field_names(output: Any, rows: Optional[int]) -> set:
     names = set()
     for field in dataclasses.fields(output):
         value = getattr(output, field.name)
-        if (
-            torch.is_tensor(value)
-            and value.ndim >= 1
-            and int(value.shape[0]) == rows
-        ):
+        if torch.is_tensor(value) and value.ndim >= 1 and int(value.shape[0]) == rows:
             names.add(field.name)
     return names
 
@@ -336,9 +332,10 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             for item, buffer in zip(output, output_buffer):
                 self._copy_output_to_buffer(item, buffer, num_tokens)
             return
-        if _as_logits_output(output) is not None and _as_logits_output(
-            output_buffer
-        ) is not None:
+        if (
+            _as_logits_output(output) is not None
+            and _as_logits_output(output_buffer) is not None
+        ):
             self._copy_logits_output(output, output_buffer, num_tokens)
             return
         raise TypeError(
@@ -368,8 +365,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 kwargs[field.name] = None
             else:
                 raise TypeError(
-                    "Unsupported BCG logits field "
-                    f"{field.name}: {type(value)}"
+                    f"Unsupported BCG logits field {field.name}: {type(value)}"
                 )
         return logits_cls(**kwargs)
 
@@ -424,8 +420,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 dst.copy_(src)
                 continue
             raise TypeError(
-                "Unsupported BCG logits field "
-                f"{field.name}: {type(src)} vs {type(dst)}"
+                f"Unsupported BCG logits field {field.name}: {type(src)} vs {type(dst)}"
             )
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:

@@ -297,9 +297,7 @@ def _extract_spec_from_response(data, output):
     if details.get("spec_cap_lens_histogram"):
         output.spec_cap_lens_histogram = details["spec_cap_lens_histogram"]
     if details.get("spec_correct_drafts_histogram"):
-        output.spec_correct_drafts_histogram = details[
-            "spec_correct_drafts_histogram"
-        ]
+        output.spec_correct_drafts_histogram = details["spec_correct_drafts_histogram"]
     if details.get("spec_verify_ct") is not None:
         output.spec_verify_ct = int(details["spec_verify_ct"])
 

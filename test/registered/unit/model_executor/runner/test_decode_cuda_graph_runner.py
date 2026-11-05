@@ -419,8 +419,9 @@ class TestAttentionVariantSizes(CustomTestCase):
                 runner.attention_variant_sizes = sizes
                 captured = {}
 
-                def capture_one_shape(bs, forward, lora, label):
-                    # the label a capture runs under, and what the model reads
+                def capture_one_shape(bs, forward, lora, label, num_slots=None):
+                    # the label a capture runs under, and what the model reads.
+                    # _capture_one_stream passes num_slots for ragged verify.
                     seen = (label, get_capture_attention_variant())
                     captured.setdefault(bs, []).append(seen)
 

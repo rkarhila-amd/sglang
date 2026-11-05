@@ -1645,9 +1645,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     f"stale ragged raw_num_token {self.raw_num_token} != "
                     f"{ragged_layout.graph_num_tokens}"
                 )
-                self._stage_ragged_verify_layout(
-                    ragged_layout, graph_size_key, self.bs
-                )
+                self._stage_ragged_verify_layout(ragged_layout, graph_size_key, self.bs)
             self._set_dp_real_num_tokens(self.raw_num_token)
             self._copy_replay_inputs(forward_batch)
             if (

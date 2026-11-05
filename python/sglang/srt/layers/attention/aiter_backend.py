@@ -110,12 +110,12 @@ from sglang.srt.layers.attention.aiter_utils import (
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
 )
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
     is_in_breakable_cuda_graph,
 )
-from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
@@ -4175,9 +4175,7 @@ class AiterAttnBackend(AttentionBackend):
             # Log before the graph break. Capture records the gap and does
             # not run its body, and the gate greps this line before health.
             if not getattr(self, "_flydsl_gap_logged", False):
-                logger.info(
-                    "AITER_VERIFY_FLYDSL breakable eager gap: pa_decode_ragged"
-                )
+                logger.info("AITER_VERIFY_FLYDSL breakable eager gap: pa_decode_ragged")
                 self._flydsl_gap_logged = True
             self._flydsl_grouped_verify_gap(q, o, layer, forward_batch)
             return
@@ -4303,9 +4301,7 @@ class AiterAttnBackend(AttentionBackend):
         layout = (
             getattr(spec, "ragged_verify_layout", None) if spec is not None else None
         )
-        self._forward_target_verify_flydsl_padded(
-            q, o, layer, forward_batch, layout
-        )
+        self._forward_target_verify_flydsl_padded(q, o, layer, forward_batch, layout)
 
     def _flydsl_packed_verify(
         self,
@@ -4380,9 +4376,7 @@ class AiterAttnBackend(AttentionBackend):
             bufs[width] = {
                 "ctx": torch.empty(count, dtype=torch.int32, device=device),
                 "row": torch.empty(count, dtype=torch.int32, device=device),
-                "table": torch.empty(
-                    count, n_pages, dtype=torch.int32, device=device
-                ),
+                "table": torch.empty(count, n_pages, dtype=torch.int32, device=device),
             }
         plan = {
             "active": active,
@@ -4603,9 +4597,7 @@ class AiterAttnBackend(AttentionBackend):
         q3 = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
         o3 = o.reshape(-1, layer.tp_q_head_num, layer.v_head_dim)
         if not o3.is_contiguous():
-            raise RuntimeError(
-                "FlyDSL ragged verify needs a contiguous output tensor."
-            )
+            raise RuntimeError("FlyDSL ragged verify needs a contiguous output tensor.")
         for width, row_index, context, max_context, req_indices in packed:
             q_g = q3.index_select(0, row_index)
             o_g = torch.empty(q_g.shape, dtype=o3.dtype, device=o3.device)
@@ -4705,7 +4697,9 @@ class AiterAttnBackend(AttentionBackend):
         n_ctx_ne_cpu = -1
         cpu_lens = forward_batch.seq_lens_cpu
         if cpu_lens is not None and len(cpu_lens) >= bs:
-            cpu_i = torch.as_tensor(cpu_lens[:bs], device=context.device, dtype=torch.int32)
+            cpu_i = torch.as_tensor(
+                cpu_lens[:bs], device=context.device, dtype=torch.int32
+            )
             n_ctx_ne_cpu = int((context[:bs] != cpu_i).sum().item())
         worst_i = 0
         worst_abs = float(out_abs.max().item())

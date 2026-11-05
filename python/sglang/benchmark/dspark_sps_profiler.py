@@ -773,9 +773,7 @@ def build_prompt_input_ids(
     identically so a radix cache keeps that prefix once per round.
     """
     if shared_prefix_len < 0:
-        raise ValueError(
-            f"shared_prefix_len must be >= 0, got {shared_prefix_len}."
-        )
+        raise ValueError(f"shared_prefix_len must be >= 0, got {shared_prefix_len}.")
     token_high = vocab_size - RANDOM_TOKEN_HIGH_MARGIN
     if token_high <= RANDOM_TOKEN_LOW:
         raise ValueError(f"vocab_size={vocab_size} too small for random prompts.")
@@ -783,8 +781,7 @@ def build_prompt_input_ids(
         rng.randrange(RANDOM_TOKEN_LOW, token_high) for _ in range(shared_prefix_len)
     ]
     return [
-        prefix
-        + [rng.randrange(RANDOM_TOKEN_LOW, token_high) for _ in range(input_len)]
+        prefix + [rng.randrange(RANDOM_TOKEN_LOW, token_high) for _ in range(input_len)]
         for _ in range(num_requests)
     ]
 
