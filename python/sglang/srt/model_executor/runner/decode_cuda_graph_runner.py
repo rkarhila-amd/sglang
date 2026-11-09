@@ -1606,7 +1606,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     ),
                     get_capture_logits_variant(),
                 )
-                )
                 # Adaptive runners may own a different backend than model_runner.
                 post_warmup_hook = getattr(
                     attn_backend,
@@ -1731,7 +1730,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     ),
                 ),
             )
-            )
             return
 
         buffers = self.buffers
@@ -1854,7 +1852,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     raw_bs=raw_bs, bs=bs, is_ragged=is_ragged
                 ),
             ),
-        )
         )
 
     def _staged_signature(self, forward_batch: ForwardBatch) -> Optional[tuple]:
