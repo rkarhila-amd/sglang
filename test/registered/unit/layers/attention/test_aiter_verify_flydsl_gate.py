@@ -418,10 +418,9 @@ class TestFlydslBreakableGap(CustomTestCase):
         fn = AiterAttnBackend._flydsl_grouped_verify_gap
         self.assertTrue(callable(getattr(fn, "run_eager", None)))
 
-    def test_gap_outside_capture_calls_padded_batch1(self):
-        # Grouped exact-width on this gap matched the pre-cea4337
-        # long-copy-1 logprobs. The passing gate used the right-aligned
-        # batch-1 window.
+    def test_gap_calls_padded_single_launch(self):
+        # The breakable gap is one pa_decode_ragged through the padded
+        # window (flydsl_forward_ragged_padded -> run_ragged).
         backend = _backend()
         seen = {}
 
@@ -436,7 +435,7 @@ class TestFlydslBreakableGap(CustomTestCase):
         )
         fb = SimpleNamespace(
             req_pool_indices=torch.arange(3),
-            spec_info=SimpleNamespace(ragged_verify_layout=layout),
+            spec_info=SimpleNamespace(draft_token_num=8, ragged_verify_layout=layout),
         )
         with unittest.mock.patch.object(
             AiterAttnBackend, "_forward_target_verify_flydsl_padded", padded
