@@ -276,6 +276,12 @@ class TritonAttnBackend(AttentionBackend):
             self.use_mla,
             self.use_verify_splitkv,
         )
+        # TODO: this logic should be fixed in non-hip platform
+        self.is_hip_dspark_draft = (
+            _is_hip
+            and model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_dspark()
+        )
         # gfx1151 verify attention reads full-space slot ids straight from req_to_token
         self.use_verify_gfx115 = (
             use_gfx115_kernels()
