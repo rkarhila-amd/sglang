@@ -1284,11 +1284,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             global_dp_buffer_len = None
 
+        # Always materialize the capture layout local: ForwardBatch below
+        # still takes ragged_verify_layout=, and get_spec_info may also
+        # embed it. bs is the capture slot count under ragged verify.
+        capture_ragged_verify_layout = self._capture_ragged_verify_layout(
+            num_tokens, num_slots=bs if self.ragged_verify_mode else None
+        )
         if self.ragged_verify_mode:
-            # bs here is the capture slot count, not the request bucket.
-            spec_info = self.get_spec_info(num_tokens, num_slots=bs)
+            spec_info = self.get_spec_info(
+                num_tokens,
+                ragged_verify_layout=capture_ragged_verify_layout,
+                num_slots=bs,
+            )
         else:
-            capture_ragged_verify_layout = self._capture_ragged_verify_layout(num_tokens)
             spec_info = self.get_spec_info(
                 num_tokens, ragged_verify_layout=capture_ragged_verify_layout
             )
