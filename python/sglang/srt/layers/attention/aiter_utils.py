@@ -14,7 +14,7 @@ needing to be a method on the class.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -355,6 +355,12 @@ def forward_decode_vectorized_5d(
     )
 
 
+# mix-A minimum: graph replay 3.516 ms at batch 64 (budget 320) and 13.616 ms
+# at batch 256 (budget 1280). The default 2*CU plan is coarser and lost to
+# packed_direct. Pass it only when the plan is created; refresh omits it.
+RAGGED_TASKS_PER_SEQ = 5
+
+
 class FlydslPaDecode:
     """FlyDSL ``pa_decode`` on a SHUFFLE 5D cache, plans reused per batch size.
 
@@ -366,6 +372,7 @@ class FlydslPaDecode:
 
     def __init__(self):
         self._plans: dict = {}
+        self._ragged_plans: dict = {}
         # One scratch set per (heads, capacity, query rows). A ragged verify
         # step launches two widths; swapping a single buffer would allocate
         # on every layer.
@@ -385,6 +392,7 @@ class FlydslPaDecode:
         query_length: int,
         max_context_length: int,
         pin_scratch: bool = False,
+        qo_row_base: Optional[torch.Tensor] = None,
     ) -> None:
         from aiter.ops.flydsl.pa_decode import pa_decode, plan_pa_decode
 
@@ -397,6 +405,17 @@ class FlydslPaDecode:
         batch = int(context_lengths.shape[0])
         if batch < 1:
             raise ValueError("FlyDSL pa_decode needs at least one sequence")
+        packed = qo_row_base is not None
+        if packed:
+            if qo_row_base.dtype != torch.int32 or int(qo_row_base.shape[0]) != batch:
+                raise ValueError("qo_row_base must be int32 and one entry per sequence")
+            if not qo_row_base.is_contiguous():
+                raise ValueError("qo_row_base must be contiguous")
+            if query.shape != output.shape:
+                raise ValueError(
+                    f"packed pa_decode output {tuple(output.shape)} "
+                    f"!= query {tuple(query.shape)}"
+                )
         if key_cache.dim() != 5 or value_cache.dim() != 5:
             raise ValueError(
                 "FlyDSL pa_decode expects 5D K/V caches, "
@@ -410,7 +429,7 @@ class FlydslPaDecode:
                 f"num_q_heads {num_q_heads} must be divisible by "
                 f"num_kv_heads {num_kv_heads}"
             )
-        if query.shape[0] != batch * query_length:
+        if not packed and query.shape[0] != batch * query_length:
             raise ValueError(
                 f"query rows {query.shape[0]} != batch {batch} * "
                 f"query_length {query_length}"
@@ -440,10 +459,11 @@ class FlydslPaDecode:
             query.dtype,
             query.device,
         )
-        if self._scratch_key != scratch_key:
+        cached = self._scratch_cache.get(scratch_key)
+        if cached is None:
             scalar = (num_kv_heads, int(plan.capacity), rows)
             exp_sums = torch.empty(scalar, dtype=torch.float32, device=query.device)
-            self._scratch = (
+            cached = (
                 exp_sums,
                 torch.empty_like(exp_sums),
                 torch.empty(*scalar, head_dim, dtype=query.dtype, device=query.device),
@@ -456,6 +476,16 @@ class FlydslPaDecode:
             pin_scratch,
         )
         exp_sums, max_logits, temporary = cached
+        # torch.empty, reused across steps. The draft launches this once per
+        # sequence (batch 1) into a scratch key the bs=1 cold128 uniform
+        # block does not share with the expanded-head ragged block. A later
+        # step with fewer KV splits still reduces the whole buffer, so the
+        # previous step's partials leak into the next 8-wide. run_ragged
+        # already zeros; this path did not.
+        with torch.inference_mode():
+            exp_sums.zero_()
+            max_logits.zero_()
+            temporary.zero_()
 
         pa_decode(
             out,
@@ -471,9 +501,169 @@ class FlydslPaDecode:
             max_logits=max_logits,
             temporary_output=temporary,
             max_context_length=int(max_context_length),
+            qo_row_base=qo_row_base if packed else None,
         )
         if out is not output:
             output.copy_(out)
+
+    def run_ragged(
+        self,
+        output: torch.Tensor,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        context_lengths: torch.Tensor,
+        block_tables: torch.Tensor,
+        softmax_scale: float,
+        qo_indptr: torch.Tensor,
+        max_query_length: int,
+        max_context_length: int,
+        pin_scratch: bool = False,
+    ) -> None:
+        """One ``pa_decode_ragged`` launch. Widths come from ``qo_indptr``.
+
+        The plan budget is ``RAGGED_TASKS_PER_SEQ * batch`` and is fixed when
+        the plan is created. Query and output are the same shape and must
+        hold ``batch * max_query_length`` rows: live rows are packed at
+        ``qo_indptr[s] + j``, and rows past a width are stored in the tail.
+        """
+        from aiter.ops.flydsl.pa_decode import pa_decode_ragged, plan_pa_decode
+
+        if max_query_length < 1:
+            raise ValueError(
+                f"max_query_length must be positive, got {max_query_length}"
+            )
+        capturing = flydsl_stream_capturing()
+        if context_lengths.dtype != torch.int32 or not context_lengths.is_contiguous():
+            if capturing:
+                raise RuntimeError(
+                    "ragged context_lengths must be contiguous int32 before capture"
+                )
+            context_lengths = context_lengths.to(dtype=torch.int32).contiguous()
+        if block_tables.dtype != torch.int32 or not block_tables.is_contiguous():
+            if capturing:
+                raise RuntimeError(
+                    "ragged block_tables must be contiguous int32 before capture"
+                )
+            block_tables = block_tables.to(dtype=torch.int32).contiguous()
+        if qo_indptr.dtype != torch.int32 or not qo_indptr.is_contiguous():
+            if capturing:
+                raise RuntimeError(
+                    "ragged qo_indptr must be contiguous int32 before capture"
+                )
+            qo_indptr = qo_indptr.to(dtype=torch.int32).contiguous()
+        batch = int(context_lengths.shape[0])
+        if batch < 1:
+            raise ValueError("ragged pa_decode needs at least one sequence")
+        if int(qo_indptr.shape[0]) != batch + 1:
+            raise ValueError(
+                f"qo_indptr length {int(qo_indptr.shape[0])} != batch+1 ({batch + 1})"
+            )
+        if query.shape != output.shape:
+            raise ValueError(
+                f"ragged output {tuple(output.shape)} != query {tuple(query.shape)}"
+            )
+        if int(query.shape[0]) < batch * max_query_length:
+            raise ValueError(
+                f"ragged query rows {int(query.shape[0])} < "
+                f"batch {batch} * max_query_length {max_query_length}"
+            )
+        if key_cache.dim() != 5 or value_cache.dim() != 5:
+            raise ValueError(
+                "ragged pa_decode expects 5D K/V caches, "
+                f"got K {tuple(key_cache.shape)} V {tuple(value_cache.shape)}"
+            )
+        num_kv_heads = int(key_cache.shape[1])
+        num_q_heads = int(query.shape[1])
+        head_dim = int(query.shape[-1])
+        if num_kv_heads < 1 or num_q_heads % num_kv_heads != 0:
+            raise ValueError(
+                f"num_q_heads {num_q_heads} must be divisible by "
+                f"num_kv_heads {num_kv_heads}"
+            )
+        if not query.is_contiguous() or not output.is_contiguous():
+            raise RuntimeError("ragged query and output must be contiguous")
+
+        budget = RAGGED_TASKS_PER_SEQ * batch
+        key = (
+            "ragged",
+            batch,
+            num_kv_heads,
+            int(max_query_length),
+            str(query.device),
+        )
+        plan = self._ragged_plans.get(key)
+        if plan is None and capturing:
+            raise RuntimeError(
+                "ragged pa_decode plan must be allocated before CUDA graph capture "
+                f"(batch {batch}, budget {budget})"
+            )
+        plan = plan_pa_decode(
+            context_lengths,
+            num_kv_heads,
+            query_length=1,
+            sliding_window=0,
+            plan=plan,
+            workgroup_budget=None if plan is not None else budget,
+        )
+        self._ragged_plans[key] = plan
+        self.last_ragged_budget = budget
+        self.last_ragged_capacity = int(plan.capacity)
+
+        rows = int(max_query_length) * (num_q_heads // num_kv_heads)
+        scratch_key = (
+            "ragged",
+            num_kv_heads,
+            int(plan.capacity),
+            rows,
+            head_dim,
+            query.dtype,
+            str(query.device),
+        )
+        cached = self._scratch_cache.get(scratch_key)
+        if cached is None:
+            if capturing:
+                raise RuntimeError(
+                    "ragged pa_decode scratch must be allocated before CUDA graph capture"
+                )
+            scalar = (num_kv_heads, int(plan.capacity), rows)
+            exp_sums = torch.empty(scalar, dtype=torch.float32, device=query.device)
+            cached = (
+                exp_sums,
+                torch.empty_like(exp_sums),
+                torch.empty(*scalar, head_dim, dtype=query.dtype, device=query.device),
+            )
+        flydsl_note_scratch(
+            self._scratch_cache,
+            self._scratch_pinned,
+            scratch_key,
+            cached,
+            pin_scratch,
+        )
+        exp_sums, max_logits, temporary = cached
+        # torch.empty, reused for this (heads, capacity, query rows). A later
+        # step with fewer KV splits still reduces the whole buffer, and a
+        # bs=1 request does not share this key, so flush plus cold128 leaves
+        # the previous 8-wide partials in place.
+        exp_sums.zero_()
+        max_logits.zero_()
+        temporary.zero_()
+        pa_decode_ragged(
+            output,
+            query,
+            key_cache,
+            value_cache,
+            context_lengths,
+            block_tables,
+            float(softmax_scale),
+            qo_indptr,
+            max_query_length=int(max_query_length),
+            work_plan=plan,
+            max_context_length=int(max_context_length),
+            exp_sums=exp_sums,
+            max_logits=max_logits,
+            temporary_output=temporary,
+        )
 
 
 def flydsl_verify_live_batch(q_rows: int, qlen: int, pool_bs: int) -> int:
@@ -799,6 +989,111 @@ def flydsl_fill_block_table_static(
     return table
 
 
+def _zero_tensor(tensor, ptrs: set[int]) -> int:
+    if not torch.is_tensor(tensor) or tensor.numel() == 0:
+        return 0
+    ptr = tensor.data_ptr()
+    if ptr in ptrs:
+        return 0
+    ptrs.add(ptr)
+    # Eager warmup allocates these under inference mode. Flush runs outside
+    # that mode, and zero_ on an inference tensor raises. The context allows
+    # the inplace on both inference tensors and ordinary ones.
+    with torch.inference_mode():
+        tensor.zero_()
+    return 1
+
+
+def _zero_cached_value(val, ptrs: set[int]) -> int:
+    if torch.is_tensor(val):
+        return _zero_tensor(val, ptrs)
+    n = 0
+    if isinstance(val, (tuple, list)):
+        for item in val:
+            n += _zero_cached_value(item, ptrs)
+        return n
+    for name in ("work_info", "reduce_info"):
+        tensor = getattr(val, name, None)
+        if torch.is_tensor(tensor):
+            n += _zero_tensor(tensor, ptrs)
+    return n
+
+
+# arange / page-column constants. The block-table fill reads them and does
+# not rebuild them. Zeroing them would make the next gather address page 0.
+_RAGGED_BUF_KEEP = frozenset(
+    {"token_i32", "token_i64", "page_cols", "window", "stride0"}
+)
+
+
+def _zero_flydsl_backend(backend, ptrs: set[int]) -> int:
+    n = 0
+    cache = getattr(backend, "_flydsl_ragged_bufs", None) or {}
+    for bufs in cache.values():
+        # q_dense / o_dense / table were the original five. slots, lin_index,
+        # qo_i32, and the row-index scratch are the same torch.empty cache,
+        # keyed by batch, and the 8-wide after a bs=1 case never rewrites a
+        # tail the previous 8-wide left. short-7 is that last row.
+        for key, tensor in bufs.items():
+            if key in _RAGGED_BUF_KEEP:
+                continue
+            n += _zero_tensor(tensor, ptrs)
+    # Draft pack, slot, width, indptr, and context buffers. Keyed by batch,
+    # allocated with torch.empty, and not in the runner scratch cache.
+    # bs=1 cold128 does not share the bs=8 key.
+    for attr in (
+        "_draft_flydsl_expand",
+        "_draft_flydsl_expand_pinned",
+        "_draft_flydsl_slot_bufs",
+        "_draft_flydsl_slot_pinned",
+        "_draft_flydsl_width_bufs",
+        "_draft_flydsl_width_pinned",
+        "_draft_flydsl_qo_bufs",
+        "_draft_flydsl_qo_pinned",
+        "_draft_flydsl_ctx_bufs",
+    ):
+        draft_cache = getattr(backend, attr, None) or {}
+        for val in draft_cache.values():
+            n += _zero_cached_value(val, ptrs)
+    for attr in ("_flydsl_runner_obj", "_draft_flydsl_runner"):
+        runner = getattr(backend, attr, None)
+        if runner is None:
+            continue
+        for scratch_name in ("_scratch_cache", "_scratch_pinned"):
+            scratch = getattr(runner, scratch_name, None) or {}
+            for val in scratch.values():
+                n += _zero_cached_value(val, ptrs)
+        for plan_name in ("_plans", "_ragged_plans"):
+            plans = getattr(runner, plan_name, None) or {}
+            for plan in plans.values():
+                n += _zero_cached_value(plan, ptrs)
+    # Static indptrs and split-KV scratch. A shorter batch writes a prefix
+    # and the next 8-wide's last row reads the tail. The unified-decode
+    # arange and kv_last_page_len stay: those are constants, not residue.
+    for name in (
+        "workspace_buffer",
+        "_kv_indices_scratch",
+        "_verify_splitkv_workspace_buf",
+        "kv_indptr",
+        "qo_indptr",
+        "mask_indptr",
+        "mamba_track_indices_buf",
+    ):
+        n += _zero_tensor(getattr(backend, name, None), ptrs)
+    for tensor in getattr(backend, "query_start_loc_list", None) or ():
+        n += _zero_tensor(tensor, ptrs)
+    packed = getattr(backend, "_flydsl_packed_cache", None)
+    if isinstance(packed, tuple) and len(packed) == 2 and isinstance(packed[1], dict):
+        n += _zero_cached_value(packed[1].get("ctx"), ptrs)
+        n += _zero_cached_value(packed[1].get("table"), ptrs)
+        for buf in (packed[1].get("bufs") or {}).values():
+            if isinstance(buf, dict):
+                for tensor in buf.values():
+                    n += _zero_tensor(tensor, ptrs)
+        backend._flydsl_packed_cache = None
+    return n
+
+
 def flydsl_forward_ragged_padded(
     backend,
     q: torch.Tensor,
@@ -813,13 +1108,17 @@ def flydsl_forward_ragged_padded(
     max_q: int,
     runner,
 ) -> None:
-    """One ``pa_decode`` at a fixed ``max_q`` for a mixed-width verify batch.
+    """One ``pa_decode_ragged`` launch for a mixed-width verify batch.
 
     ``verify_lens``, ``qo_indptr``, and ``seq_lens`` are device tensors the
     compact runner refreshes before replay. This launch does not read a
-    length back to the host while the stream is capturing. ``max_q`` and
-    ``max_context`` are the host specialization baked into the graph.
-    Row indices and the block table are warmup buffers filled in place.
+    length back to the host. ``max_q`` and ``max_context`` are the host
+    specialization baked into the graph. The block table is a warmup buffer
+    filled in place. Live rows are already packed at ``qo_indptr[s] + j``.
+    When the caller buffer holds ``batch * max_q`` rows the kernel writes
+    those rows in place. A shorter buffer is copied into a static capacity
+    window and the live prefix is copied back; that copy is a fixed slice,
+    not an indexed scatter.
     """
     bs = int(layout.verify_lens.shape[0])
     n_q = int(layer.tp_q_head_num)
@@ -838,13 +1137,6 @@ def flydsl_forward_ragged_padded(
         )
     lens = layout.verify_lens[:bs]
     qo = layout.qo_indptr_device
-    capturing = flydsl_stream_capturing()
-    if not capturing:
-        widest = int(lens.max().item())
-        if widest > max_q or widest < 1:
-            raise RuntimeError(
-                f"FlyDSL ragged verify width {widest} is outside 1..{max_q}."
-            )
     page_size = int(backend.page_size)
     if page_size not in (16, 64, 128):
         raise ValueError(f"FlyDSL page size must be 16, 64, or 128, got {page_size}")
@@ -880,13 +1172,6 @@ def flydsl_forward_ragged_padded(
     lens_i32 = bufs["lens_i32"]
     lens_i32.copy_(lens)
     context.add_(lens_i32)
-    rows = flydsl_fill_ragged_row_index(
-        bufs, qo, lens, bs=bs, max_q=max_q, q_rows=q_rows
-    )
-    q_dense = bufs["q_dense"]
-    o_dense = bufs["o_dense"]
-    q_dense.zero_()
-    q_dense.index_copy_(0, rows, q3[:q_rows])
     req_indices = forward_batch.req_pool_indices[:bs]
     table = flydsl_fill_block_table_static(
         bufs,
@@ -895,37 +1180,64 @@ def flydsl_forward_ragged_padded(
         bs=bs,
         page_size=page_size,
     )
-    # One batch-1 launch per padded slot. A single launch at the capture
-    # slot count changes sequence 0 by one bf16 ulp even when the other
-    # sequences have context 0 (decode-step-l27kv/repro.json). Batch 1
-    # matches the uniform eager launch. The loop bound is the captured
-    # slot count, so replay stays inside the graph.
-    for slot in range(bs):
-        start = slot * max_q
-        stop = start + max_q
-        runner.run(
-            o_dense[start:stop],
-            q_dense[start:stop],
-            k_cache,
-            v_cache,
-            context[slot : slot + 1],
-            table[slot : slot + 1],
-            float(layer.scaling),
-            int(max_q),
-            int(max_context),
-            pin_scratch=True,
-        )
-    gathered = bufs["gathered"]
-    stride = n_q * dim
-    gidx = bufs["gidx"]
-    gidx.copy_(rows.view(q_rows, 1).expand(q_rows, stride))
-    torch.gather(
-        o_dense.view(int(o_dense.shape[0]), stride),
-        0,
-        gidx,
-        out=gathered.view(q_rows, stride),
+    if qo.dtype != torch.int32 or not qo.is_contiguous() or int(qo.shape[0]) != bs + 1:
+        if flydsl_stream_capturing():
+            raise RuntimeError(
+                "ragged qo_indptr must be a contiguous int32 vector of "
+                f"length {bs + 1} before capture, got {tuple(qo.shape)} {qo.dtype}"
+            )
+        qo_launch = bufs["qo_i32"]
+        qo_launch.copy_(qo[: bs + 1].to(dtype=torch.int32).contiguous())
+    else:
+        qo_launch = qo
+    # The reducer parks rows past each width in [qo[bs], bs * max_q).
+    # A caller buffer that already holds that window is written in place.
+    cap_rows = bs * int(max_q)
+    direct = (
+        q3.is_contiguous()
+        and o3.is_contiguous()
+        and int(q3.shape[0]) >= cap_rows
+        and int(o3.shape[0]) >= cap_rows
     )
-    o3[:q_rows].copy_(gathered)
+    if direct:
+        q_k = q3[:cap_rows]
+        o_k = o3[:cap_rows]
+    else:
+        q_in = q3
+        if not q_in.is_contiguous():
+            if flydsl_stream_capturing():
+                raise RuntimeError(
+                    "ragged verify query must be contiguous before capture"
+                )
+            q_in = q_in.contiguous()
+        if not o3.is_contiguous() and flydsl_stream_capturing():
+            raise RuntimeError("ragged verify output must be contiguous before capture")
+        q_k = bufs["q_dense"][:cap_rows]
+        o_k = bufs["o_dense"][:cap_rows]
+        q_k[:q_rows].copy_(q_in[:q_rows])
+    # q_dense is torch.empty and keyed by batch shape. The kernel reads
+    # batch * max_query_length rows; rows past the packed prefix share an
+    # MFMA tile. bs=1 cold128 uses a different key, so this tail survives
+    # flush. Zero it after the live copy and before the launch.
+    if q_rows < cap_rows:
+        q_k[q_rows:cap_rows].zero_()
+    if o_k.data_ptr() != q_k.data_ptr():
+        o_k.zero_()
+    runner.run_ragged(
+        o_k,
+        q_k,
+        k_cache,
+        v_cache,
+        context,
+        table,
+        float(layer.scaling),
+        qo_launch,
+        int(max_q),
+        int(max_context),
+        pin_scratch=True,
+    )
+    if not direct:
+        o3[:q_rows].copy_(o_k[:q_rows])
 
 
 def flydsl_block_table(
