@@ -143,6 +143,7 @@ from sglang.srt.layers.attention.aiter_utils import (
     flydsl_stream_capturing,
     flydsl_use_graph_bound,
     flydsl_verify_live_batch,
+    flydsl_verify_width_groups,
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
 )
