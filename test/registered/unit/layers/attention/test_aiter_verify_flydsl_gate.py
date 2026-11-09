@@ -21,6 +21,7 @@ from sglang.srt.layers.attention.aiter_utils import (
     flydsl_note_scratch,
     flydsl_use_graph_bound,
     flydsl_verify_live_batch,
+    flydsl_verify_width_groups,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
