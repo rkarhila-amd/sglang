@@ -8,6 +8,7 @@ import os
 import sys
 import types
 import unittest
+import unittest.mock
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -20,6 +21,7 @@ from sglang.srt.layers.attention.aiter_utils import (
     flydsl_note_scratch,
     flydsl_use_graph_bound,
     flydsl_verify_live_batch,
+    flydsl_verify_width_groups,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -117,8 +119,10 @@ class TestAiterVerifyFlydslGate(CustomTestCase):
         with _stub_capture(False):
             _backend()._flydsl_require_eager()
 
-    def test_ragged_verify_graph_stays_off(self):
-        self.assertFalse(AiterAttnBackend.supports_ragged_verify_graph)
+    def test_ragged_verify_graph_opts_in(self):
+        # The graph path is the padded window. The grouped eager path still
+        # syncs and is not what this flag selects.
+        self.assertTrue(AiterAttnBackend.supports_ragged_verify_graph)
 
 
 class TestFlydslGraphBound(CustomTestCase):
@@ -403,6 +407,180 @@ class TestFlydslGroupedVerifyLaunch(CustomTestCase):
         flat = o[:, 0, 0]
         self.assertTrue(torch.equal(flat[:16], torch.full((16,), 8.0)))
         self.assertTrue(torch.equal(flat[16:], torch.full((8,), 4.0)))
+
+
+class TestFlydslBreakableGap(CustomTestCase):
+    def _layer6(self):
+        layer = _layer()
+        layer.tp_q_head_num = 6
+        return layer
+
+    def test_gap_method_is_a_graph_break(self):
+        fn = AiterAttnBackend._flydsl_grouped_verify_gap
+        self.assertTrue(callable(getattr(fn, "run_eager", None)))
+
+    def test_gap_calls_padded_single_launch(self):
+        # The breakable gap is one pa_decode_ragged through the padded
+        # window (flydsl_forward_ragged_padded -> run_ragged).
+        backend = _backend()
+        seen = {}
+
+        def padded(self, q, o, layer, forward_batch, layout):
+            seen["rows"] = int(q.shape[0])
+            seen["layout"] = layout
+
+        q = torch.zeros(12, 6, 256)
+        layout = SimpleNamespace(
+            verify_lens=torch.tensor([4, 4, 4], dtype=torch.int32),
+            qo_indptr_device=torch.tensor([0, 4, 8, 12], dtype=torch.int32),
+        )
+        fb = SimpleNamespace(
+            req_pool_indices=torch.arange(3),
+            spec_info=SimpleNamespace(draft_token_num=8, ragged_verify_layout=layout),
+        )
+        with unittest.mock.patch.object(
+            AiterAttnBackend, "_forward_target_verify_flydsl_padded", padded
+        ):
+            backend._flydsl_grouped_verify_gap(
+                q, torch.zeros_like(q), self._layer6(), fb
+            )
+        self.assertEqual(seen["rows"], 12)
+        self.assertIs(seen["layout"], layout)
+
+    def _dispatch(self, *, breakable: bool):
+        backend = _backend()
+        backend.forward_metadata = SimpleNamespace(max_q_len=8, qo_indptr=None)
+        calls = []
+
+        def gap(self, q, o, layer, forward_batch):
+            calls.append("gap")
+
+        def padded(self, q, o, layer, forward_batch, layout):
+            calls.append("padded")
+
+        q = torch.zeros(12, 6, 256)
+        layout = SimpleNamespace()
+        fb = SimpleNamespace(
+            req_pool_indices=torch.arange(4),
+            spec_info=SimpleNamespace(draft_token_num=8, ragged_verify_layout=layout),
+        )
+        with (
+            unittest.mock.patch.object(
+                AiterAttnBackend, "_flydsl_grouped_verify_gap", gap
+            ),
+            unittest.mock.patch.object(
+                AiterAttnBackend, "_forward_target_verify_flydsl_padded", padded
+            ),
+            unittest.mock.patch(
+                "sglang.srt.layers.attention.aiter_backend.is_in_breakable_cuda_graph",
+                return_value=breakable,
+            ),
+            _stub_capture(True),
+        ):
+            backend._forward_target_verify_flydsl(
+                q, torch.zeros_like(q), self._layer6(), fb, None, torch.zeros(1), torch.zeros(1)
+            )
+        return calls
+
+    def test_grouped_qo_prefers_the_layout_indptr(self):
+        # Metadata's uniform arange is input_rows // slots. 24 rows on 4
+        # slots is width 5 and sums to 20, short of the packed query.
+        # The layout indptr is what the gap has to group on.
+        backend = _backend()
+        uniform = torch.arange(0, 25, 5)
+        layout_qo = torch.tensor([0, 8, 14, 20, 24], dtype=torch.int32)
+        backend.forward_metadata = SimpleNamespace(qo_indptr=uniform)
+        fb = SimpleNamespace(
+            spec_info=SimpleNamespace(
+                ragged_verify_layout=SimpleNamespace(qo_indptr_device=layout_qo)
+            )
+        )
+        got = backend._flydsl_grouped_qo(fb)
+        self.assertTrue(torch.equal(got, layout_qo))
+
+    def test_grouped_qo_falls_back_to_metadata(self):
+        backend = _backend()
+        uniform = torch.arange(0, 25, 5)
+        backend.forward_metadata = SimpleNamespace(qo_indptr=uniform)
+        fb = SimpleNamespace(spec_info=None)
+        got = backend._flydsl_grouped_qo(fb)
+        self.assertTrue(torch.equal(got, uniform))
+
+    def _gap_q_rows(self, q_rows: int, pool_bs: int, qo):
+        backend = _backend()
+        seen = {}
+
+        def padded(self, q, o, layer, forward_batch, layout):
+            seen["q_rows"] = int(q.shape[0])
+            seen["pool_bs"] = pool_bs
+
+        q = torch.zeros(q_rows, 6, 256)
+        fb = SimpleNamespace(
+            req_pool_indices=torch.arange(pool_bs),
+            spec_info=SimpleNamespace(
+                ragged_verify_layout=SimpleNamespace(
+                    qo_indptr_device=qo,
+                    verify_lens=torch.ones(pool_bs, dtype=torch.int32),
+                )
+            ),
+        )
+        with unittest.mock.patch.object(
+            AiterAttnBackend, "_forward_target_verify_flydsl_padded", padded
+        ):
+            backend._flydsl_grouped_verify_gap(
+                q, torch.zeros_like(q), self._layer6(), fb
+            )
+        return seen
+
+    def test_gap_slices_to_the_staged_indptr_not_the_tier(self):
+        # 912d636 died on GSM8K p32: graph tier 256 rows, pool 32, staged
+        # prefix [0, 6, 14, ...] never reached 256. The padded window must
+        # see only the covered rows, or searchsorted walks into the ghost tail.
+        qo = torch.tensor([0, 6, 14, 21, 28], dtype=torch.int32)
+        self.assertEqual(
+            self._gap_q_rows(32, 4, qo),
+            {"q_rows": 28, "pool_bs": 4},
+        )
+
+    def test_gap_keeps_q_rows_when_the_indptr_covers_the_tier(self):
+        qo = torch.tensor([0, 8, 16, 24, 32], dtype=torch.int32)
+        self.assertEqual(
+            self._gap_q_rows(32, 4, qo),
+            {"q_rows": 32, "pool_bs": 4},
+        )
+
+    def test_gap_keeps_q_rows_when_the_indptr_runs_past_the_buffer(self):
+        qo = torch.tensor([0, 10, 20, 40], dtype=torch.int32)
+        self.assertEqual(
+            self._gap_q_rows(12, 3, qo),
+            {"q_rows": 12, "pool_bs": 3},
+        )
+
+    def test_grouped_step_uses_the_real_lens_not_the_bucket_fill(self):
+        # 18faffe launched the filled last row. short-4 logprobs matched
+        # the 0fbbca3 graphs file (max abs 0.7435) and not cea4337.
+        from sglang.srt.speculative.ragged_verify import remember_real_verify_lens
+
+        backend = _backend()
+        layout = SimpleNamespace(
+            qo_indptr_device=torch.tensor([0, 5, 13, 21], dtype=torch.int32)
+        )
+        remember_real_verify_lens(layout, torch.tensor([5, 8, 6], dtype=torch.int32))
+        fb = SimpleNamespace(
+            req_pool_indices=torch.arange(3),
+            seq_lens=torch.tensor([10, 20, 30], dtype=torch.int32),
+            spec_info=SimpleNamespace(ragged_verify_layout=layout),
+        )
+        packed = backend._flydsl_grouped_step(21, 3, torch.zeros(21, 6, 256), fb)
+        sig = [(width, int(req.shape[0])) for width, _, _, _, req in packed]
+        self.assertEqual(sig, [(5, 1), (8, 1), (6, 1)])
+        self.assertEqual(packed[-1][1].tolist(), list(range(13, 19)))
+
+    def test_breakable_layout_takes_the_grouped_gap(self):
+        self.assertEqual(self._dispatch(breakable=True), ["gap"])
+
+    def test_full_graph_layout_stays_padded(self):
+        self.assertEqual(self._dispatch(breakable=False), ["padded"])
 
 
 class TestFlydslBlockTable(CustomTestCase):

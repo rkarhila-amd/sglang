@@ -97,6 +97,45 @@ class TestPaddedRaggedVerifyGeometry(CustomTestCase):
         self.assertEqual(padded.verify_lens.tolist(), [8, 1, 7])
         self.assertEqual(int(padded.qo_indptr_device[-1]), 16)
 
+    def test_capped_same_bs_fills_then_clamps_the_last_row(self):
+        raw = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=[5, 4, 6, 5],
+            device=_DEVICE,
+            grid=[16, 32, 64, 512],
+            graph_num_tokens_floor=32,
+        )
+        self.assertEqual(raw.graph_num_tokens, 32)
+        # leftover 12 is added to the last row, then clamped to cap.
+        # Dropping that fill moved graph replay off the eager logprobs.
+        padded = raw.padded_to_bucket(padded_bs=4, cap=8)
+        self.assertEqual(padded.verify_lens.tolist(), [5, 4, 6, 8])
+        self.assertEqual(padded.qo_indptr_device.tolist(), [0, 5, 9, 15, 23])
+
+    def test_promoted_tier_fills_only_the_natural_budget(self):
+        # Sum is 20. A 64-token replay with no pad budget clamps the last
+        # row to 8. The natural tier has 2 leftover tokens, so the last
+        # row stops at 7 and the promotion gap stays off the real requests.
+        raw = RaggedVerifyLayout.from_verify_lens_device(
+            verify_lens=torch.tensor([5, 4, 6, 5], dtype=torch.int32),
+            graph_num_tokens=64,
+            pad_num_tokens=22,
+        )
+        padded = raw.padded_to_bucket(padded_bs=4, cap=8)
+        self.assertEqual(padded.graph_num_tokens, 64)
+        self.assertEqual(padded.pad_num_tokens, 22)
+        self.assertEqual(padded.verify_lens.tolist(), [5, 4, 6, 7])
+        self.assertEqual(padded.qo_indptr_device.tolist(), [0, 5, 9, 15, 22])
+
+    def test_promoted_tier_with_no_natural_leftover_keeps_real_widths(self):
+        raw = RaggedVerifyLayout.from_verify_lens_device(
+            verify_lens=torch.tensor([5, 4, 6, 5], dtype=torch.int32),
+            graph_num_tokens=64,
+            pad_num_tokens=20,
+        )
+        padded = raw.padded_to_bucket(padded_bs=4, cap=8)
+        self.assertEqual(padded.verify_lens.tolist(), [5, 4, 6, 5])
+        self.assertEqual(padded.qo_indptr_device.tolist(), [0, 5, 9, 15, 20])
+
     def test_padded_layout_zero_len_pad_rows(self):
         raw = RaggedVerifyLayout.from_verify_lens(
             verify_lens_cpu=[8, 8],
