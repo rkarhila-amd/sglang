@@ -4095,11 +4095,21 @@ class AiterAttnBackend(AttentionBackend):
         max_context: int,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
+        req_indices: Optional[torch.Tensor] = None,
     ) -> None:
         bs = context.shape[0]
+        pool = (
+            req_indices
+            if req_indices is not None
+            else forward_batch.req_pool_indices[:bs]
+        )
+        if int(pool.shape[0]) != bs:
+            raise RuntimeError(
+                f"FlyDSL req_indices length {int(pool.shape[0])} != batch {bs}"
+            )
         table = flydsl_block_table(
             self.req_to_token,
-            forward_batch.req_pool_indices[:bs],
+            pool,
             self.page_size,
             max_context,
         )
