@@ -41,6 +41,7 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner_utils.capture_mode import (
     get_capture_attention_variant,
 )
+from sglang.srt.speculative.ragged_verify import staged_real_verify_lens
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
@@ -102,6 +103,7 @@ from sglang.srt.layers.attention.aiter_mla_gluon import (
 from sglang.srt.layers.attention.aiter_utils import (
     FlydslPaDecode,
     flydsl_block_table,
+    flydsl_forward_ragged_padded,
     flydsl_group_row_indices,
     flydsl_stream_capturing,
     flydsl_use_graph_bound,
@@ -109,6 +111,10 @@ from sglang.srt.layers.attention.aiter_utils import (
     flydsl_verify_width_groups,
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+    is_in_breakable_cuda_graph,
 )
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
@@ -436,10 +442,14 @@ class AiterAttnBackend(AttentionBackend):
     # Set in __init__; declared here for tests that build the backend without it
     # (test_aiter_fp8_kv_scales_paths.py).
     deterministic_prefill_max_q: Optional[int] = None
-    # Uniform FlyDSL verify can be captured. Ragged widths still host-sync
-    # (qo_indptr.tolist and a fresh output per group), so this stays off
-    # until that path fills metadata in place. Block graphs do not need it.
-    supports_ragged_verify_graph: bool = False
+    # Uniform FlyDSL verify captures. Mixed widths on a graph use
+    # flydsl_forward_ragged_padded (one right-aligned window, no host
+    # sync). A HIP 5 microbench of that window against two grouped
+    # pa_decode launches matched exactly (max abs 0). Eager mixed batches
+    # still take the grouped path. HybridLinearAttnBackend ANDs this with
+    # the GDN flag, which was already true. Compact serving gates are not
+    # this microbench.
+    supports_ragged_verify_graph: bool = True
 
     def __init__(
         self,
@@ -4121,17 +4131,90 @@ class AiterAttnBackend(AttentionBackend):
                 tuple(k_cache.shape),
             )
             self._flydsl_logged = True
-        self._flydsl_runner().run(
-            o3,
-            q3,
+        # query_length > 1 couples sequences. A batch-4 launch with long
+        # neighbors moves sequence 0, including row 0
+        # (decode-step-batch-bisect/bisect.json, bs4_q8_ctx_long_cloneq:
+        # max abs 0.0625, 3579 elements). The compact graph path already
+        # launches one slot at a time. This is the eager uniform and
+        # width-grouped verify. query_length 1 stays one launch: decode
+        # and the uniform draft block use it on both servers, and splitting
+        # only one side would open a new gap. A short neighbor (context
+        # 128) leaves row 0 unchanged, which matches the short-mix gate.
+        runner = self._flydsl_runner()
+        pin = self._flydsl_graph_bound()
+        if query_length == 1 or bs == 1:
+            runner.run(
+                o3,
+                q3,
+                k_cache,
+                v_cache,
+                context,
+                table,
+                float(layer.scaling),
+                query_length,
+                max_context,
+                pin_scratch=pin,
+            )
+            return
+        for slot in range(bs):
+            start = slot * query_length
+            stop = start + query_length
+            runner.run(
+                o3[start:stop],
+                q3[start:stop],
+                k_cache,
+                v_cache,
+                context[slot : slot + 1],
+                table[slot : slot + 1],
+                float(layer.scaling),
+                query_length,
+                max_context,
+                pin_scratch=pin,
+            )
+
+    def _forward_target_verify_flydsl_padded(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        layout,
+    ) -> None:
+        """Graph path for mixed verify widths. One padded ``pa_decode``.
+
+        Eager ragged batches stay on the grouped launch. The host width is
+        the capture cap (``draft_token_num`` on the target, which is
+        ``speculative_num_draft_tokens``).
+        """
+        spec = getattr(forward_batch, "spec_info", None)
+        max_q = getattr(spec, "draft_token_num", None) if spec is not None else None
+        if not max_q:
+            max_q = self.num_draft_tokens
+        max_q = int(max_q or 0)
+        if max_q < 1:
+            raise RuntimeError(
+                "FlyDSL ragged verify needs a host max query width "
+                "(spec draft_token_num or num_draft_tokens)."
+            )
+        if not getattr(self, "_flydsl_ragged_logged", False):
+            logger.info(
+                "AITER_VERIFY_FLYDSL ragged single-launch pa_decode_ragged max_q=%s",
+                max_q,
+            )
+            self._flydsl_ragged_logged = True
+        k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
+        flydsl_forward_ragged_padded(
+            self,
+            q,
+            o,
+            layer,
+            forward_batch,
+            layout,
             k_cache,
             v_cache,
-            context,
-            table,
-            float(layer.scaling),
-            query_length,
-            max_context,
-            pin_scratch=self._flydsl_graph_bound(),
+            max_context=self._flydsl_capture_max_context(),
+            max_q=max_q,
+            runner=self._flydsl_runner(),
         )
 
     def _forward_target_verify_flydsl(
@@ -4165,6 +4248,24 @@ class AiterAttnBackend(AttentionBackend):
                 q, o, layer, forward_batch, k, v, bs, max_extend
             )
             return
+        # Compact graphs replay one graph per token bucket and refresh
+        # verify_lens in place. A width-grouped launch would freeze the
+        # capture-time groups. The padded window does not.
+        layout = getattr(
+            getattr(forward_batch, "spec_info", None), "ragged_verify_layout", None
+        )
+        # A full graph cannot re-read width groups, so it stays on the padded
+        # window. A breakable decode graph ends the segment here and runs the
+        # grouped launches between segments, where the group sizes are live.
+        if layout is not None and is_in_breakable_cuda_graph():
+            self._flydsl_grouped_verify_gap(q, o, layer, forward_batch)
+            return
+        if layout is not None and self._flydsl_graph_bound():
+            self._forward_target_verify_flydsl_padded(
+                q, o, layer, forward_batch, layout
+            )
+            return
+        qo = md.qo_indptr
         try:
             bs = flydsl_verify_live_batch(q_rows, qlen, pool_bs)
         except ValueError as exc:
@@ -4252,6 +4353,60 @@ class AiterAttnBackend(AttentionBackend):
             q, o, layer, forward_batch, k, v, bs, qlen, context
         )
 
+    @eager_on_graph
+    def _flydsl_grouped_verify_gap(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Padded batch-1 verify between breakable graph segments.
+
+        The decorator records this call and does not run it while a segment
+        is capturing. At replay the runner has already copied the live
+        ``seq_lens`` and the staged layout into the static buffers. ``o``
+        is the caller's buffer.
+
+        ``pa_decode`` is dense causal: query ``j`` reads through
+        ``context_len - query_length + j``, and the last query is the
+        newest token. The gate that passed (``cea4337``) right-aligns each
+        request into a width-8 window and launches one slot at a time.
+        Exact-width groups on this gap reproduced the pre-``cea4337``
+        ``long-copy-1`` logprobs (max abs 0.044 at token 60) while the
+        eager server, which stays on the uniform batch-1 launch, matched
+        ``cea4337``.
+
+        ``q`` is the whole graph tier. A capped layout can end before that
+        buffer. The ghost tail is not a query row.
+        """
+        if not getattr(self, "_flydsl_gap_logged", False):
+            logger.info(
+                "AITER_VERIFY_FLYDSL breakable eager gap: padded batch-1 verify"
+            )
+            self._flydsl_gap_logged = True
+        spec = getattr(forward_batch, "spec_info", None)
+        layout = (
+            getattr(spec, "ragged_verify_layout", None) if spec is not None else None
+        )
+        if layout is None:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL breakable verify gap is missing "
+                "ragged_verify_layout."
+            )
+        n_q = layer.tp_q_head_num
+        q3 = q.reshape(-1, n_q, layer.qk_head_dim)
+        o3 = o.reshape(-1, n_q, layer.v_head_dim)
+        q_rows = int(q3.shape[0])
+        pool_bs = len(forward_batch.req_pool_indices)
+        covered = self._flydsl_grouped_covered_rows(q_rows, pool_bs, forward_batch)
+        if covered < q_rows:
+            q3 = q3[:covered]
+            o3 = o3[:covered]
+        self._forward_target_verify_flydsl_padded(
+            q3, o3, layer, forward_batch, layout
+        )
+
     def _flydsl_grouped_step(
         self,
         q_rows: int,
@@ -4266,18 +4421,14 @@ class AiterAttnBackend(AttentionBackend):
         read a KV token the verify window never wrote.
         """
         self._flydsl_require_eager()
+        qo_vals, q_rows, pool_bs = self._flydsl_grouped_qo_vals(
+            forward_batch, q_rows, pool_bs
+        )
         nonce = getattr(self, "_flydsl_nonce", 0)
-        step_key = (nonce, "verify-ragged", q_rows, pool_bs)
+        step_key = (nonce, "verify-ragged", q_rows, pool_bs, tuple(qo_vals))
         cached = getattr(self, "_flydsl_ragged", None)
         if cached is not None and cached[0] == step_key:
             return cached[1]
-        qo = self.forward_metadata.qo_indptr
-        if qo is None or int(qo.shape[0]) < 2:
-            raise RuntimeError(
-                "SGLANG_AITER_VERIFY_FLYDSL ragged verify is missing qo_indptr."
-            )
-        limit = min(pool_bs, int(qo.shape[0]) - 1)
-        qo_vals = [int(v) for v in qo[: limit + 1].tolist()]
         try:
             _bs, groups = flydsl_verify_width_groups(qo_vals, q_rows, pool_bs)
         except ValueError as exc:
@@ -4317,6 +4468,87 @@ class AiterAttnBackend(AttentionBackend):
             )
         self._flydsl_ragged = (step_key, packed)
         return packed
+
+    def _flydsl_grouped_qo_vals(
+        self, forward_batch: ForwardBatch, q_rows: int, pool_bs: int
+    ) -> tuple[list[int], int, int]:
+        """Indptr the grouped launches follow.
+
+        The captured layout's indptr includes the bucket fill. A batch
+        that fills the slot count adds that leftover to the last real
+        row, and the breakable gap used to launch it. ``0fbbca3`` did
+        the same fill and missed the short mix by the same logprobs.
+        The pre-pad lens staged next to that layout is the eager width.
+        """
+        spec = getattr(forward_batch, "spec_info", None)
+        layout = (
+            getattr(spec, "ragged_verify_layout", None) if spec is not None else None
+        )
+        real = staged_real_verify_lens(layout)
+        if real is not None:
+            widths = [int(v) for v in real.tolist()]
+            qo_vals = [0]
+            for width in widths:
+                if width < 1:
+                    break
+                qo_vals.append(qo_vals[-1] + width)
+            if len(qo_vals) < 2:
+                raise RuntimeError(
+                    "SGLANG_AITER_VERIFY_FLYDSL ragged verify has no real rows."
+                )
+            return qo_vals, qo_vals[-1], len(qo_vals) - 1
+        qo = self._flydsl_grouped_qo(forward_batch)
+        if qo is None or int(qo.shape[0]) < 2:
+            raise RuntimeError(
+                "SGLANG_AITER_VERIFY_FLYDSL ragged verify is missing qo_indptr."
+            )
+        limit = min(pool_bs, int(qo.shape[0]) - 1)
+        qo_vals = [int(v) for v in qo[: limit + 1].tolist()]
+        return qo_vals, q_rows, pool_bs
+
+    def _flydsl_grouped_qo(self, forward_batch: ForwardBatch) -> Optional[torch.Tensor]:
+        """Indptr the eager width groups must follow.
+
+        Capture metadata writes a uniform ``input_rows // slots`` arange.
+        A 1984-token tier on 256 slots becomes width 7 and sums to 1792,
+        so it does not cover the packed query. The layout indptr is the
+        mixed capture pattern. Replay copies the live lens into that same
+        tensor before this gap runs.
+        """
+        spec = getattr(forward_batch, "spec_info", None)
+        layout = (
+            getattr(spec, "ragged_verify_layout", None) if spec is not None else None
+        )
+        qo = getattr(layout, "qo_indptr_device", None) if layout is not None else None
+        if qo is None:
+            qo = self.forward_metadata.qo_indptr
+        return qo
+
+    def _flydsl_grouped_covered_rows(
+        self, q_rows: int, pool_bs: int, forward_batch: ForwardBatch
+    ) -> int:
+        """Rows the staged layout indptr covers inside the graph buffer.
+
+        ``padded_to_bucket(..., cap=width)`` clamps each request to the
+        verify window, so a 32-request replay on the 256-row tier can end
+        at 220. ``flydsl_verify_width_groups`` requires some prefix to
+        equal ``q_rows``. Passing the buffer length raises
+        ``qo_indptr does not cover 256 query rows`` and kills the decode
+        batch. The ghost tail is padding the graph keeps; the launches
+        index only the covered rows.
+        """
+        spec = getattr(forward_batch, "spec_info", None)
+        layout = (
+            getattr(spec, "ragged_verify_layout", None) if spec is not None else None
+        )
+        qo = getattr(layout, "qo_indptr_device", None) if layout is not None else None
+        if qo is None or pool_bs < 1 or int(qo.shape[0]) < 2:
+            return q_rows
+        index = min(pool_bs, int(qo.shape[0]) - 1)
+        covered = int(qo[index].item())
+        if covered < 1 or covered > q_rows:
+            return q_rows
+        return covered
 
     def _forward_target_verify_flydsl_grouped(
         self,

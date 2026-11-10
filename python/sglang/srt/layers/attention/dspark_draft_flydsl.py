@@ -395,18 +395,26 @@ def _launch_ragged_bidirectional(
     table = flydsl_block_table(
         backend.req_to_token, req_indices, backend.page_size, spec
     )
-    _runner(backend).run(
-        o_exp,
-        q_exp,
-        k_cache,
-        v_cache,
-        context,
-        table,
-        float(layer.scaling),
-        1,
-        spec,
-        pin_scratch=True,
-    )
+    # Same batch coupling as target verify: query_length 1 still moves
+    # sequence 0 when another row has a long context
+    # (decode-step-batch-bisect/bisect.json, qlen1_bs4_long: max abs
+    # 0.0625, 494 elements). Context-0 padding does not. One batch-1
+    # launch per capture slot matches the eager gather, which is one
+    # sequence at a time. The loop bound is the captured batch.
+    runner = _runner(backend)
+    for slot in range(bs):
+        runner.run(
+            o_exp[slot : slot + 1],
+            q_exp[slot : slot + 1],
+            k_cache,
+            v_cache,
+            context[slot : slot + 1],
+            table[slot : slot + 1],
+            float(layer.scaling),
+            1,
+            spec,
+            pin_scratch=True,
+        )
     collapse_draft_outputs(o_exp, max_q, n_kv, n_q, dest=o_slot)
     o_view = o.view(-1, n_q, layer.v_head_dim)
     o_view[:q_rows].copy_(o_slot.index_select(0, rows))
