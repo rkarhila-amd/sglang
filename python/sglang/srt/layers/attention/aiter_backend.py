@@ -3608,15 +3608,43 @@ class AiterAttnBackend(AttentionBackend):
                         max_extend_len=max_q_len,
                     )
         elif forward_mode.is_draft_extend_v2():
-            # EAGLE V2: Fixed num_draft_tokens per batch
+            # EAGLE V2. A staged per-request length tensor is cumsum'd into
+            # the preallocated qo_indptr. That path does not call
+            # _resolve_v2_num_draft_tokens, which rejects a mixed width and
+            # syncs on torch.all. Without the tensor, the fill stays the
+            # uniform host cap.
             self._ensure_spec_v2_topk_supported()
             seq_lens = seq_lens[:bs]
-            num_tokens_per_req = self._resolve_v2_num_draft_tokens()
-            extend_lens = torch.full(
-                (bs,), num_tokens_per_req, dtype=torch.int32, device=seq_lens.device
+            staged = (
+                getattr(spec_info, "extend_seq_lens_tensor", None)
+                if spec_info is not None
+                else None
             )
+            if staged is not None and int(staged.shape[0]) >= bs:
+                extend_lens = staged[:bs]
+                if extend_lens.dtype != torch.int32:
+                    extend_lens = extend_lens.to(dtype=torch.int32)
+                cap = self.num_draft_tokens
+                if not cap and spec_info is not None:
+                    cap = getattr(spec_info, "draft_token_num", None)
+                max_q_len = int(cap or 0)
+                if max_q_len < 1:
+                    raise ValueError(
+                        "DRAFT_EXTEND_V2 ragged graph needs a host width cap "
+                        "(num_draft_tokens or draft_token_num)."
+                    )
+            else:
+                num_tokens_per_req = self._resolve_v2_num_draft_tokens()
+                extend_lens = torch.full(
+                    (bs,),
+                    num_tokens_per_req,
+                    dtype=torch.int32,
+                    device=seq_lens.device,
+                )
+                max_q_len = num_tokens_per_req
 
             qo_indptr = self.qo_indptr[: bs + 1]
+            qo_indptr[:1].zero_()
             qo_indptr[1 : bs + 1] = torch.cumsum(extend_lens, dim=0)
             kv_indptr = self.kv_indptr[: bs + 1]
             kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
@@ -3634,7 +3662,6 @@ class AiterAttnBackend(AttentionBackend):
             )
 
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
-            max_q_len = num_tokens_per_req
 
             if self.use_mla and _use_mla_ps_kernel:
                 num_kv_splits = self.max_split_per_batch

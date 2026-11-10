@@ -276,6 +276,12 @@ class TritonAttnBackend(AttentionBackend):
             self.use_mla,
             self.use_verify_splitkv,
         )
+        # TODO: this logic should be fixed in non-hip platform
+        self.is_hip_dspark_draft = (
+            _is_hip
+            and model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_dspark()
+        )
         # gfx1151 verify attention reads full-space slot ids straight from req_to_token
         self.use_verify_gfx115 = (
             use_gfx115_kernels()
@@ -521,6 +527,10 @@ class TritonAttnBackend(AttentionBackend):
             return pool.get_v_head_dim(), ()
         # Use start_layer instead of 0 to handle pipeline parallelism.
         # In PP, start_layer may be > 0, so layer 0 isn't in this stage's buffer.
+        # SHUFFLE 5D stores the value head in a middle dim; the last dim
+        # is the 16-byte vector, so read the recorded head dim instead.
+        if getattr(pool, "kv_cache_layout", None) == "vectorized_5d":
+            return pool.get_v_head_dim(), ()
         return pool.get_value_buffer(pool.start_layer).shape[-1], ()
 
     def _builds_rails_per_window(
@@ -1023,6 +1033,10 @@ class TritonAttnBackend(AttentionBackend):
         if self.dllm_attention is not None:
             self.dllm_attention.graph_mode = False
         self._dense_one_shot_kv_indptr = None
+        if self.is_hip_dspark_draft and envs.SGLANG_DSPARK_DRAFT_FLYDSL.get():
+            # One bump per eager step. Layers reuse the block plan; the next
+            # step must not keep the previous context.
+            self._draft_flydsl_nonce = getattr(self, "_draft_flydsl_nonce", 0) + 1
         bs = forward_batch.batch_size
         windows: Dict[str, WindowRail] = {}
         extra_attn_logits: Dict[int, torch.Tensor] = {}
@@ -1808,6 +1822,11 @@ class TritonAttnBackend(AttentionBackend):
             o = torch.empty_like(q)
 
         if k is None and v is None:
+            if self.is_hip_dspark_draft and envs.SGLANG_DSPARK_DRAFT_FLYDSL.get():
+                raise RuntimeError(
+                    "SGLANG_DSPARK_DRAFT_FLYDSL needs K and V on this extend. "
+                    "The SHUFFLE pool is not indexed as NHD."
+                )
             cache_loc = forward_batch.out_cache_loc
             sub_pool = self.kv_layers.route(layer.layer_id).sub_pool
             window_locs = self._window_write_locs()
@@ -1872,6 +1891,25 @@ class TritonAttnBackend(AttentionBackend):
             )
         ):
             causal = False
+
+        if self.is_hip_dspark_draft and envs.SGLANG_DSPARK_DRAFT_FLYDSL.get():
+            if (
+                sinks is not None
+                or score_mod is not None
+                or aux_tensors is not None
+                or self.enable_deterministic
+            ):
+                raise RuntimeError(
+                    "SGLANG_DSPARK_DRAFT_FLYDSL does not support sinks, "
+                    "score_mod, aux tensors, or deterministic inference."
+                )
+            from sglang.srt.layers.attention.dspark_draft_flydsl import (
+                forward_draft_extend,
+            )
+
+            return forward_draft_extend(
+                self, q, o, k, v, layer, forward_batch, causal
+            )
 
         # Dense one-shot MLA prefill (AttnForwardMethod.MHA_ONE_SHOT): k/v were
         # up-projected out of the latent cache and span prefix + current chunk,
@@ -2434,6 +2472,11 @@ class TritonAttnBackend(AttentionBackend):
         score_mod=None,
         aux_tensors=None,
     ):
+        if self.is_hip_dspark_draft and envs.SGLANG_DSPARK_DRAFT_FLYDSL.get():
+            raise RuntimeError(
+                "SGLANG_DSPARK_DRAFT_FLYDSL is implemented on forward_extend. "
+                "This draft step called forward_decode."
+            )
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
