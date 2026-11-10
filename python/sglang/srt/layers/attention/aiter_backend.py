@@ -4655,6 +4655,12 @@ class AiterAttnBackend(AttentionBackend):
                 "FlyDSL ragged verify needs a host max query width "
                 "(spec draft_token_num or num_draft_tokens)."
             )
+        if not getattr(self, "_flydsl_ragged_logged", False):
+            logger.info(
+                "AITER_VERIFY_FLYDSL ragged single-launch pa_decode_ragged max_q=%s",
+                max_q,
+            )
+            self._flydsl_ragged_logged = True
         k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
         flydsl_forward_ragged_padded(
             self,
