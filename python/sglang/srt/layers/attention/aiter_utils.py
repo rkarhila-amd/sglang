@@ -18,6 +18,56 @@ from typing import TYPE_CHECKING
 
 import torch
 
+
+def flydsl_stream_capturing() -> bool:
+    """True only while this stream is recording a CUDA graph.
+
+    ``get_is_capture_mode`` is also set for the pre-capture warmup and for
+    a breakable eager gap. Those are not stream captures.
+    """
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
+def flydsl_use_graph_bound(
+    *, stream_capturing: bool, capture_mode: bool, breakable: bool
+) -> bool:
+    """Whether uniform ``pa_decode`` should bake a host max-context bound.
+
+    A full CUDA graph, including its pre-capture warmup, must specialize on
+    one bound: replay does not re-enter Python, and a different
+    ``max_context_length`` compiles a different kernel. A breakable eager
+    gap sets the capture-mode flag while the stream is not capturing; that
+    launch keeps the measured length.
+    """
+    if breakable and not stream_capturing:
+        return False
+    return bool(stream_capturing or capture_mode)
+
+
+def flydsl_note_scratch(
+    cache: dict, pinned: dict, key, value, pin: bool
+) -> None:
+    """Remember scratch, and keep any entry a captured graph still holds.
+
+    The eager cache stays at 16 keys. Pinned entries are the tensors
+    recorded into a CUDA graph; dropping them would free that storage
+    while the graph still writes it.
+    """
+    cache[key] = value
+    if pin:
+        pinned[key] = value
+    if len(cache) <= 16:
+        return
+    for old in list(cache.keys()):
+        if old == key or old in pinned:
+            continue
+        cache.pop(old)
+        return
+
+
 try:
     # `mha_batch_prefill_func` is re-exported at the aiter top level via
     # `aiter/__init__.py` (`from .ops.mha import *`). Note: a bare
@@ -303,3 +353,252 @@ def forward_decode_vectorized_5d(
         sliding_window=sliding_window_arg,
         ps=True,
     )
+
+
+class FlydslPaDecode:
+    """FlyDSL ``pa_decode`` on a SHUFFLE 5D cache, plans reused per batch size.
+
+    ``context_lengths`` count tokens the kernel may read, including the query
+    tokens. ``query_length`` is the same for every row. ``block_tables`` are
+    page ids. A dense plan (``sliding_window=0``) may be refreshed with a new
+    query length; the plan itself is tied to one batch size.
+    """
+
+    def __init__(self):
+        self._plans: dict = {}
+        # One scratch set per (heads, capacity, query rows). A ragged verify
+        # step launches two widths; swapping a single buffer would allocate
+        # on every layer.
+        self._scratch_cache: dict = {}
+        # Scratch recorded into a CUDA graph. Never evicted.
+        self._scratch_pinned: dict = {}
+
+    def run(
+        self,
+        output: torch.Tensor,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        context_lengths: torch.Tensor,
+        block_tables: torch.Tensor,
+        softmax_scale: float,
+        query_length: int,
+        max_context_length: int,
+        pin_scratch: bool = False,
+    ) -> None:
+        from aiter.ops.flydsl.pa_decode import pa_decode, plan_pa_decode
+
+        if query_length < 1:
+            raise ValueError(f"query_length must be positive, got {query_length}")
+        if context_lengths.dtype != torch.int32 or not context_lengths.is_contiguous():
+            context_lengths = context_lengths.to(dtype=torch.int32).contiguous()
+        if block_tables.dtype != torch.int32 or not block_tables.is_contiguous():
+            block_tables = block_tables.to(dtype=torch.int32).contiguous()
+        batch = int(context_lengths.shape[0])
+        if batch < 1:
+            raise ValueError("FlyDSL pa_decode needs at least one sequence")
+        if key_cache.dim() != 5 or value_cache.dim() != 5:
+            raise ValueError(
+                "FlyDSL pa_decode expects 5D K/V caches, "
+                f"got K {tuple(key_cache.shape)} V {tuple(value_cache.shape)}"
+            )
+        num_kv_heads = int(key_cache.shape[1])
+        num_q_heads = int(query.shape[1])
+        head_dim = int(query.shape[-1])
+        if num_q_heads % num_kv_heads != 0:
+            raise ValueError(
+                f"num_q_heads {num_q_heads} must be divisible by "
+                f"num_kv_heads {num_kv_heads}"
+            )
+        if query.shape[0] != batch * query_length:
+            raise ValueError(
+                f"query rows {query.shape[0]} != batch {batch} * "
+                f"query_length {query_length}"
+            )
+        if not query.is_contiguous():
+            query = query.contiguous()
+        out = output
+        if out.shape != query.shape or not out.is_contiguous():
+            out = torch.empty(query.shape, dtype=query.dtype, device=query.device)
+
+        key = (batch, num_kv_heads, query.device)
+        plan = plan_pa_decode(
+            context_lengths,
+            num_kv_heads,
+            query_length=query_length,
+            sliding_window=0,
+            plan=self._plans.get(key),
+        )
+        self._plans[key] = plan
+
+        rows = query_length * (num_q_heads // num_kv_heads)
+        scratch_key = (
+            num_kv_heads,
+            int(plan.capacity),
+            rows,
+            head_dim,
+            query.dtype,
+            query.device,
+        )
+        if self._scratch_key != scratch_key:
+            scalar = (num_kv_heads, int(plan.capacity), rows)
+            exp_sums = torch.empty(scalar, dtype=torch.float32, device=query.device)
+            self._scratch = (
+                exp_sums,
+                torch.empty_like(exp_sums),
+                torch.empty(*scalar, head_dim, dtype=query.dtype, device=query.device),
+            )
+        flydsl_note_scratch(
+            self._scratch_cache,
+            self._scratch_pinned,
+            scratch_key,
+            cached,
+            pin_scratch,
+        )
+        exp_sums, max_logits, temporary = cached
+
+        pa_decode(
+            out,
+            query,
+            key_cache,
+            value_cache,
+            context_lengths,
+            block_tables,
+            float(softmax_scale),
+            int(query_length),
+            work_plan=plan,
+            exp_sums=exp_sums,
+            max_logits=max_logits,
+            temporary_output=temporary,
+            max_context_length=int(max_context_length),
+        )
+        if out is not output:
+            output.copy_(out)
+
+
+def flydsl_verify_live_batch(q_rows: int, qlen: int, pool_bs: int) -> int:
+    """How many leading requests ``q_rows`` cover at one uniform ``qlen``.
+
+    The scheduler pool can be longer than this forward's query. Hybrid verify
+    rewrites ``batch_size`` to ``num_tokens // width`` and leaves a trailing
+    pool slot in place, so a 24-row query at width 8 is 3 requests even when
+    ``req_pool_indices`` still has 4. Those query rows are packed in pool
+    order, so the kernel reads the prefix. A ragged width is not a multiple
+    of ``qlen`` and is rejected.
+    """
+    if qlen < 1:
+        raise ValueError(f"query length must be positive, got {qlen}")
+    if pool_bs < 1:
+        raise ValueError(f"verify pool must be positive, got {pool_bs}")
+    if q_rows < 1 or q_rows % qlen != 0:
+        raise ValueError(
+            f"FlyDSL verify query rows {q_rows} are not a positive multiple "
+            f"of qlen {qlen} (pool {pool_bs})"
+        )
+    live = q_rows // qlen
+    if live > pool_bs:
+        raise ValueError(
+            f"FlyDSL verify live batch {live} exceeds pool {pool_bs} "
+            f"(query rows {q_rows}, qlen {qlen})"
+        )
+    return live
+
+
+def flydsl_block_table(
+    req_to_token: torch.Tensor,
+    req_indices: torch.Tensor,
+    page_size: int,
+    max_context: int,
+) -> torch.Tensor:
+    """Page ids for logical tokens ``[0, max_context)``.
+
+    ``req_to_token[req, t]`` is the pool slot of logical token ``t``. With
+    page size P the slot at column ``k * P`` is the first token of page k,
+    which is the same rule as ``AiterAttnBackend._transform_table_1_to_real``.
+    The last page may be partial, so the table only needs that page's first
+    column. A width of ``max_context`` is enough; the row does not have to
+    be padded out to a page boundary.
+    """
+    if page_size not in (16, 64, 128):
+        raise ValueError(f"FlyDSL page size must be 16, 64, or 128, got {page_size}")
+    if max_context < 1:
+        raise ValueError(f"max_context must be positive, got {max_context}")
+    n_pages = (max_context + page_size - 1) // page_size
+    last_start = (n_pages - 1) * page_size
+    if req_to_token.shape[1] <= last_start:
+        raise RuntimeError(
+            f"req_to_token width {req_to_token.shape[1]} has no column "
+            f"{last_start} for context {max_context} at page size {page_size}"
+        )
+    starts = torch.arange(n_pages, device=req_to_token.device, dtype=torch.long)
+    starts = starts * page_size
+    rows = req_to_token.index_select(
+        0, req_indices.to(device=req_to_token.device, dtype=torch.long)
+    )
+    slots = rows.index_select(1, starts)
+    # Divide before narrowing: a slot id can exceed int32 on a large pool.
+    return (slots.to(dtype=torch.int64) // page_size).to(dtype=torch.int32).contiguous()
+
+# --- mid-stack gap helpers (from G5 tip) ---
+
+def flydsl_verify_width_groups(
+    qo_vals: list[int],
+    q_rows: int,
+    pool_bs: int,
+) -> tuple[int, list[tuple[int, list[int]]]]:
+    """Live batch and ``(width, request positions)`` groups from ``qo_indptr``.
+
+    The live batch is the first index whose prefix sum equals ``q_rows``.
+    Requests that share a width are one ``pa_decode`` launch. The width is
+    the indptr delta, never rounded up to the batch max: a 7-token request
+    must not read an eighth KV token. Positions within a group stay in pool
+    order. Groups are ordered by the first request of that width.
+    """
+    if q_rows < 1:
+        raise ValueError(f"query rows must be positive, got {q_rows}")
+    if pool_bs < 1:
+        raise ValueError(f"verify pool must be positive, got {pool_bs}")
+    if len(qo_vals) < 2:
+        raise ValueError("verify qo_indptr is missing")
+    limit = min(pool_bs, len(qo_vals) - 1)
+    bs = None
+    for i in range(1, limit + 1):
+        if qo_vals[i] == q_rows:
+            bs = i
+            break
+        if qo_vals[i] > q_rows:
+            raise ValueError(
+                f"qo_indptr jumps over {q_rows} query rows at request {i} "
+                f"(qo={qo_vals[: i + 1]}, pool {pool_bs})"
+            )
+    if bs is None:
+        raise ValueError(
+            f"qo_indptr does not cover {q_rows} query rows "
+            f"(pool {pool_bs}, prefix {qo_vals[: min(8, len(qo_vals))]})"
+        )
+    buckets: dict[int, list[int]] = {}
+    order: list[int] = []
+    for i in range(bs):
+        width = qo_vals[i + 1] - qo_vals[i]
+        if width < 1:
+            raise ValueError(
+                f"verify width at request {i} is {width} (qo={qo_vals[: bs + 1]})"
+            )
+        if width not in buckets:
+            order.append(width)
+            buckets[width] = []
+        buckets[width].append(i)
+    return bs, [(width, buckets[width]) for width in order]
+
+def flydsl_group_row_indices(
+    qo_vals: list[int], width: int, positions: list[int]
+) -> list[int]:
+    """Query-row ids for one width group. Not a contiguous slice when a
+    different width sits between two members.
+    """
+    rows: list[int] = []
+    for i in positions:
+        start = qo_vals[i]
+        rows.extend(range(start, start + width))
+    return rows
+

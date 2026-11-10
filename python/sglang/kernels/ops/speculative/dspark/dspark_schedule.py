@@ -147,7 +147,9 @@ def _value_independent_descending_order(
     return order
 
 
-@triton.jit
+# gamma and cols vary with the draft block. Specializing them compiles a
+# new kernel per shape; the first full batch then stalls the measured window.
+@triton.jit(do_not_specialize=["gamma", "cols"])
 def _schedule_topk_prep_kernel(
     confidence_ptr,
     survival_ptr,
@@ -166,7 +168,7 @@ def _schedule_topk_prep_kernel(
     tl.store(selected_extra_ptr + row, 0)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["min_verify_len", "lower_bound", "max_len", "bs"])
 def _schedule_topk_finalize_kernel(
     selected_extra_ptr,
     out_ptr,
@@ -185,7 +187,10 @@ def _schedule_topk_finalize_kernel(
     tl.store(out_ptr + offs, lens, mask=mask)
 
 
-@triton.jit
+# n is num_requests * cols. Triton specializes plain integers and unrolls
+# range(0, n, BLOCK_CP), so each batch size compiled again. The ragged
+# conc256 book paid that compile inside run 1. Keep one kernel for every n.
+@triton.jit(do_not_specialize=["budget", "cols", "n", "survival_eps"])
 def _schedule_topk_selected_extra_kernel(
     survival_ptr,
     selected_extra_ptr,
