@@ -440,10 +440,11 @@ class FlydslPaDecode:
             query.dtype,
             query.device,
         )
-        if self._scratch_key != scratch_key:
+        cached = self._scratch_cache.get(scratch_key)
+        if cached is None:
             scalar = (num_kv_heads, int(plan.capacity), rows)
             exp_sums = torch.empty(scalar, dtype=torch.float32, device=query.device)
-            self._scratch = (
+            cached = (
                 exp_sums,
                 torch.empty_like(exp_sums),
                 torch.empty(*scalar, head_dim, dtype=query.dtype, device=query.device),
@@ -456,6 +457,11 @@ class FlydslPaDecode:
             pin_scratch,
         )
         exp_sums, max_logits, temporary = cached
+        # Zero reused scratch so fewer-KV-split steps do not leak prior partials.
+        with torch.inference_mode():
+            exp_sums.zero_()
+            max_logits.zero_()
+            temporary.zero_()
 
         pa_decode(
             out,
