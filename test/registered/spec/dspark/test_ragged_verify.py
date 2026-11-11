@@ -6,6 +6,7 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyLayout,
     build_ragged_target_verify_geometry,
     compute_uniform_extend_lengths,
+    copy_extend_graph_qo_indptr,
     ragged_verify_token_rows,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -117,6 +118,35 @@ class TestRaggedVerifyTokenRows(CustomTestCase):
         self.assertEqual(
             ragged_verify_token_rows(layout, 9).tolist(), [0, 0, 2, 2, 2, 3, 5, 5, 5]
         )
+
+
+class TestCopyExtendGraphQoIndptr(CustomTestCase):
+    def test_overwrites_uniform_arange_in_place(self):
+        layout = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=[8, 1, 3], device=_DEVICE, grid=_GRID
+        )
+        bs = 3
+        dest = torch.zeros(8, dtype=torch.int32)
+        dest[: bs + 1] = torch.arange(0, (bs + 1) * 8, step=8, dtype=torch.int32)
+        storage = dest.untyped_storage().data_ptr()
+        out = copy_extend_graph_qo_indptr(dest, layout, bs)
+        self.assertEqual(dest.untyped_storage().data_ptr(), storage)
+        self.assertEqual(dest[: bs + 1].tolist(), [0, 8, 9, 12])
+        self.assertEqual(dest[bs + 1 :].tolist(), [0, 0, 0, 0])
+        self.assertIs(out, layout)
+
+    def test_pads_to_captured_batch(self):
+        layout = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=[8, 1, 3],
+            device=_DEVICE,
+            grid=[8, 16, 32, 64],
+            graph_num_tokens_floor=24,
+        )
+        dest = torch.full((8,), 7, dtype=torch.int32)
+        out = copy_extend_graph_qo_indptr(dest, layout, bs=4)
+        self.assertEqual(out.bs, 4)
+        self.assertEqual(dest[:5].tolist(), [0, 8, 9, 12, 32])
+        self.assertEqual(dest[5:].tolist(), [7, 7, 7])
 
 
 class TestCaptureVerifyLens(CustomTestCase):
