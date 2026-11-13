@@ -1019,6 +1019,24 @@ class DFlashDecoderLayer(nn.Module):
         return self.mlp_conv.finish(hidden_states, mlp_kernel), residual, None
 
 
+def resolve_draft_target_depth(config, draft_config, num_layers: int) -> int:
+    """Target depth used to range-check ``target_layer_ids``.
+
+    Kimi-K3.1 DSpark stores the number of tapped target features in
+    ``num_target_layers`` (5) and the real target depth in
+    ``target_num_hidden_layers`` (93). The ids (75, 79, 83, 87, 91) index that
+    depth. Other drafts store the depth itself in ``num_target_layers``.
+    """
+    depth = getattr(config, "target_num_hidden_layers", None)
+    if depth is not None and int(depth) > 0:
+        return int(depth)
+    if draft_config.num_target_layers is not None:
+        return int(draft_config.num_target_layers)
+    if draft_config.target_layer_ids:
+        return max(draft_config.target_layer_ids) + 1
+    return int(num_layers)
+
+
 class DFlashDraftModel(nn.Module):
     """SGLang DFlash draft model with an optional Nemotron embedding.
 
@@ -1113,12 +1131,11 @@ class DFlashDraftModel(nn.Module):
         # Project per-token target context features:
         # concat(K * hidden_size) -> hidden_size, where K is the number of target-layer
         # feature tensors concatenated per token (not necessarily equal to num_layers).
-        if draft_config.num_target_layers is not None:
-            target_num_layers = int(draft_config.num_target_layers)
-        elif draft_config.target_layer_ids is not None:
-            target_num_layers = max(draft_config.target_layer_ids) + 1
-        else:
-            target_num_layers = num_layers
+        # K itself is len(target_layer_ids). The value below is only the bound those
+        # ids are checked against, which is the target model's depth.
+        target_num_layers = resolve_draft_target_depth(
+            config, draft_config, num_layers
+        )
         target_layer_ids = draft_config.resolve_target_layer_ids(
             target_num_layers=target_num_layers, draft_num_layers=num_layers
         )
