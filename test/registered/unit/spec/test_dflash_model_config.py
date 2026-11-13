@@ -215,6 +215,37 @@ def test_gemma_attention_and_npu_context_preparation_share_correct_qk_math(monke
     torch.testing.assert_close(attention(positions, hidden, None), expected_q)
 
 
+def test_kimi_dspark_layer_ids_are_checked_against_target_num_hidden_layers():
+    # num_target_layers is the tap count. The ids index the 93-layer target.
+    model = dflash.DFlashDraftModel(
+        _config(
+            num_hidden_layers=5,
+            num_target_layers=5,
+            target_num_hidden_layers=93,
+            dflash_config=dict(
+                block_size=4,
+                target_layer_ids=[75, 79, 83, 87, 91],
+            ),
+        )
+    )
+    assert model.num_context_features == 5
+    assert list(model.draft_config.target_layer_ids) == [75, 79, 83, 87, 91]
+
+
+def test_layer_ids_past_num_target_layers_still_fail_without_a_target_depth():
+    with pytest.raises(ValueError, match="out-of-range layer id"):
+        dflash.DFlashDraftModel(
+            _config(
+                num_hidden_layers=5,
+                num_target_layers=5,
+                dflash_config=dict(
+                    block_size=4,
+                    target_layer_ids=[75, 79, 83, 87, 91],
+                ),
+            )
+        )
+
+
 def test_legacy_architecture_name_loads_the_generic_dflash2_state():
     config = _config(
         use_gemma_norm=True,
