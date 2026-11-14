@@ -446,6 +446,9 @@ class DeepseekV2WeightLoaderMixin:
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
+                    # Quark block-FP8 scales are named weight_scale; the fused
+                    # FP8 parameter is weight_scale_inv.
+                    name = _resolve_quark_fp8_block_scale_name(name, params_dict)
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     maybe_executor_submit(
