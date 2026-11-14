@@ -51,15 +51,25 @@ class IdentityRotaryEmbedding(nn.Module):
 
     def __init__(self, like: DeepseekScalingRotaryEmbedding):
         super().__init__()
-        rows, width = like.cos_sin_cache.shape
-        cache = torch.cat(
-            [
-                torch.ones(rows, width // 2, dtype=torch.float32),
-                torch.zeros(rows, width // 2, dtype=torch.float32),
-            ],
-            dim=-1,
-        ).to(like.cos_sin_cache.device)
-        self.register_buffer("cos_sin_cache", cache, persistent=False)
+        if hasattr(like, "cos_sin_cache"):
+            rows, width = like.cos_sin_cache.shape
+            cache = torch.cat(
+                [
+                    torch.ones(rows, width // 2, dtype=torch.float32),
+                    torch.zeros(rows, width // 2, dtype=torch.float32),
+                ],
+                dim=-1,
+            ).to(like.cos_sin_cache.device)
+            self.register_buffer("cos_sin_cache", cache, persistent=False)
+        else:
+            # ROCm aiter rope keeps separate cos/sin tables (cos_cache, sin_cache) that the
+            # aiter fused fp8 indexer writer reads; same shape and dtype as the original.
+            self.register_buffer(
+                "cos_cache", torch.ones_like(like.cos_cache), persistent=False
+            )
+            self.register_buffer(
+                "sin_cache", torch.zeros_like(like.sin_cache), persistent=False
+            )
         self.head_size = like.head_size
         self.rotary_dim = like.rotary_dim
         self.is_neox_style = like.is_neox_style
