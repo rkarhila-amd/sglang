@@ -732,6 +732,19 @@ class DeepseekMLARocmForwardMixin:
                         topk_indices = maybe_capture_indexer_topk(
                             self.layer_id, prev_topk_indices
                         )
+        elif getattr(self, "custom_q_latent_prep", False) and not q_replicate_active:
+            # Models without q_lora that own their q/latent/top-k preparation
+            # (Mistral-Large-4: SSMax on q, KV-sharing consumers, NoPE layers, and
+            # the DSA indexer on the hidden states). Same hook the CUDA path calls.
+            q, latent_cache, k_nope, topk_indices = (
+                self.prepare_q_latent_without_q_lora(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    q_replicate_active=False,
+                    prev_topk_indices=prev_topk_indices,
+                )
+            )
         else:
             if q_replicate_active:
                 q = torch.nn.functional.linear(

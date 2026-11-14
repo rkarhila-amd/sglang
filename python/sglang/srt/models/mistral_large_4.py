@@ -103,6 +103,9 @@ class IdentityRotaryEmbedding(nn.Module):
 
 
 class MistralLarge4AttentionMLA(DeepseekV2AttentionMLA):
+    # forward_mla_rocm.py: call prepare_q_latent_without_q_lora (no q_lora) instead of its inline q_proj path.
+    custom_q_latent_prep = True
+
     def __init__(
         self,
         config: PretrainedConfig,
