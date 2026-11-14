@@ -460,6 +460,10 @@ def _check_context_parallel_layout() -> None:
 
 class MistralLarge4ForCausalLM(DeepseekV3ForCausalLM):
     model_cls = MistralLarge4Model
+    # Quark resolves a fused module's config and exclusion through its shards; the
+    # DeepSeek default is empty because it has no q_lora fusion here, and the dense
+    # and shared-expert MLPs would otherwise get the global MXFP4 scheme.
+    packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
 
     def __init__(
         self,

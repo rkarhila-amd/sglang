@@ -453,6 +453,12 @@ class MistralLarge4DSparkModel(MLADSparkModel):
                     for n in quant_config.exclude_layers
                 )
             )
+            quant_config.update_packed_modules_mapping(
+                {
+                    **getattr(quant_config, "packed_modules_mapping", {}),
+                    "gate_up_proj": ["gate_proj", "up_proj"],
+                }
+            )
         super().__init__(config, quant_config=quant_config, prefix=prefix)
         hidden_size = int(config.hidden_size)
         mask_shape = (hidden_size,)
