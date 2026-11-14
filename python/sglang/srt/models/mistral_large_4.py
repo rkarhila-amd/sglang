@@ -46,6 +46,30 @@ def layer_flag(config: PretrainedConfig, name: str, layer_id: int) -> bool:
     return flags is not None and bool(flags[layer_id])
 
 
+@torch.no_grad()
+def _set_lerope_alpha_aiter(rotary_emb, lerope_alpha: torch.Tensor) -> None:
+    """LeRoPE for aiter's DeepseekScalingRotaryEmbedding (no set_lerope_alpha, ROCm).
+
+    LeRoPE multiplies both YaRN branches of inv_freq by exp(alpha), and the YaRN blend is
+    linear, so inv_freq_new = inv_freq_old * exp(alpha). aiter keeps [rows, 1, 1, D/2]
+    cos_cache/sin_cache tables; rebuild them in place (same shape, dtype, device).
+    """
+    cos_cache, sin_cache = rotary_emb.cos_cache, rotary_emb.sin_cache
+    half = rotary_emb.rotary_dim // 2
+    assert lerope_alpha.shape == (half,), lerope_alpha.shape
+    inv_freq = rotary_emb._compute_inv_freq(rotary_emb.scaling_factor).to(
+        device=cos_cache.device, dtype=torch.float32
+    )
+    inv_freq = inv_freq * torch.exp(lerope_alpha.detach().to(inv_freq))
+    t = torch.arange(cos_cache.shape[0], device=cos_cache.device, dtype=torch.float32)
+    freqs = torch.einsum("i,j -> ij", t, inv_freq)
+    new_cos = freqs.cos().unsqueeze(-2).unsqueeze(-2)
+    new_sin = freqs.sin().unsqueeze(-2).unsqueeze(-2)
+    assert new_cos.shape == cos_cache.shape, (new_cos.shape, cos_cache.shape)
+    cos_cache.copy_(new_cos)
+    sin_cache.copy_(new_sin)
+
+
 class IdentityRotaryEmbedding(nn.Module):
     """A cos=1, sin=0 table: the fused indexer kernels then leave the rope slice as is."""
 
@@ -486,13 +510,20 @@ class MistralLarge4ForCausalLM(DeepseekV3ForCausalLM):
                     rotary_emb, IdentityRotaryEmbedding
                 ):
                     continue
-                if not isinstance(rotary_emb, DeepseekScalingRotaryEmbedding):
+                if not (
+                    isinstance(rotary_emb, DeepseekScalingRotaryEmbedding)
+                    # aiter's own YaRN rope class (ROCm): same name, different class.
+                    or type(rotary_emb).__name__ == "DeepseekScalingRotaryEmbedding"
+                ):
                     raise NotImplementedError(
                         f"LeRoPE does not support {type(rotary_emb).__name__}."
                     )
                 rotary_embs[id(rotary_emb)] = rotary_emb
         for rotary_emb in rotary_embs.values():
-            rotary_emb.set_lerope_alpha(self.model.lerope_alpha)
+            if hasattr(rotary_emb, "set_lerope_alpha"):
+                rotary_emb.set_lerope_alpha(self.model.lerope_alpha)
+            else:
+                _set_lerope_alpha_aiter(rotary_emb, self.model.lerope_alpha)
 
     def _check_indexer_ssmax_positive(self) -> None:
         log_max_position = math.log(self.config.max_position_embeddings)
