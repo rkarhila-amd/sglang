@@ -236,6 +236,12 @@ class PixtralForConditionalGeneration(nn.Module):
         # Now we call the language model load with the generator
         self.language_model.load_weights(llm_weights_generator())
 
+    def post_load_weights(self):
+        # Delegate so DummyModelLoader's post-load hook reaches the LM tower
+        # (builds w_kc / w_vc, which load_weights does when real weights load).
+        if hasattr(self.language_model, "post_load_weights"):
+            self.language_model.post_load_weights()
+
     def get_language_model(self) -> torch.nn.Module:
         return self.language_model
 
