@@ -406,6 +406,30 @@ def mistral_large_4_modelopt_layers(quantized_layers: dict) -> dict:
     return mapped
 
 
+def mistral_large_4_module_name(name: str) -> str:
+    """Map a checkpoint module name (``layers.1.attention.wq``) to this model's module
+    name, or return it unchanged when it names nothing in the text model."""
+    weight = f"{name}.weight"
+    for pattern, target in MISTRAL_LARGE_4_REMAPPING.items():
+        if re.fullmatch(pattern, weight):
+            return re.sub(pattern, target, weight).removesuffix(".weight")
+    return name
+
+
+def mistral_large_4_quark_config(quant_config) -> None:
+    """Rename the module names of a Quark config (``exclude`` and ``layer_quant_config``)
+    from checkpoint names to this model's names; they are matched exactly, so without
+    this the block-FP8 attention and shared experts load as the global MXFP4."""
+    quant_config.exclude_layers = list(
+        dict.fromkeys(mistral_large_4_module_name(n) for n in quant_config.exclude_layers)
+    )
+    layer_quant_config = quant_config.quant_config.get("layer_quant_config")
+    if layer_quant_config:
+        quant_config.quant_config["layer_quant_config"] = {
+            mistral_large_4_module_name(n): cfg for n, cfg in layer_quant_config.items()
+        }
+
+
 def _check_context_parallel_layout() -> None:
     parallel = get_parallel()
     if parallel.dcp_enabled and parallel.pp_size > 1:
@@ -453,6 +477,8 @@ class MistralLarge4ForCausalLM(DeepseekV3ForCausalLM):
             quant_config.quantized_layers = mistral_large_4_modelopt_layers(
                 quant_config.quantized_layers
             )
+        if type(quant_config).__name__ == "QuarkConfig":
+            mistral_large_4_quark_config(quant_config)
         super().__init__(config, quant_config, prefix=prefix)
         self.logits_processor.final_logit_softcapping = config.softmax_tanh_gating
 
