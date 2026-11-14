@@ -347,7 +347,19 @@ def maybe_executor_submit(
             # Set CUDA device in worker thread to match parent thread
             if current_device is not None:
                 torch.cuda.set_device(current_device)
-            return func(*args, **kwargs)
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                # Loader failures in worker threads carry no weight name.
+                owner = getattr(func, "__self__", None)
+                e.add_note(
+                    f"weight_loader={getattr(func, '__qualname__', func)} "
+                    f"module={type(owner).__name__} "
+                    f"prefix={getattr(owner, 'prefix', None)!r} "
+                    f"args={[(tuple(a.shape), str(a.dtype), type(a).__name__) for a in args if hasattr(a, 'shape')]} "
+                    f"kwargs={ {k: v for k, v in kwargs.items() if not hasattr(v, 'shape')} }"
+                )
+                raise
 
         futures.append(executor.submit(device_aware_wrapper, *func_args, **func_kwargs))
     else:
