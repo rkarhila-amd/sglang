@@ -394,6 +394,18 @@ def mistral_large_4_dspark_weight_name(name: str) -> Optional[str]:
     raise ValueError(f"Unrecognized Mistral Large 4 DSpark weight: mtp_dspark.{name}")
 
 
+def mistral_large_4_dspark_module_name(name: str) -> str:
+    """Map a Quark module name ``mtp_dspark.backbone.layers.0.attention.wq`` to the
+    draft's module name, or return it unchanged when it is not a draft module."""
+    if not name.startswith(_MTP_DSPARK_PREFIX):
+        return name
+    weight = f"{name.removeprefix(_MTP_DSPARK_PREFIX)}.weight"
+    for pattern, target in _MTP_DSPARK_NAMES:
+        if re.fullmatch(pattern, weight):
+            return re.sub(pattern, target, weight).removesuffix(".weight")
+    return name
+
+
 def _plain_yarn_rope(config) -> DeepseekScalingRotaryEmbedding:
     # get_rope would return the target's cached module, whose cos/sin cache
     # the target rewrites in place with LeRoPE; the draft is trained without it.
@@ -432,6 +444,15 @@ class MistralLarge4DSparkModel(MLADSparkModel):
     """
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
+        if type(quant_config).__name__ == "QuarkConfig":
+            # Quark excludes are matched exactly; the draft's linears are bf16 and
+            # named ``mtp_dspark.backbone...`` in the checkpoint.
+            quant_config.exclude_layers = list(
+                dict.fromkeys(
+                    mistral_large_4_dspark_module_name(n)
+                    for n in quant_config.exclude_layers
+                )
+            )
         super().__init__(config, quant_config=quant_config, prefix=prefix)
         hidden_size = int(config.hidden_size)
         mask_shape = (hidden_size,)
