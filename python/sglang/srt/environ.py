@@ -2254,6 +2254,8 @@ class Envs:
     # HIP prefill indexer without DCP: each attn-TP rank scores 1/W of the query rows and
     # the int32 top-k is all-gathered (same row split as DCP, over the attn-TP group).
     SGLANG_DSA_INDEXER_TP_ROW_SPLIT = EnvBool(False)
+    # HIP DSA prefill indexer: use aiter's FlyDSL fp8_mqa_logits instead of the Triton kernel (raises if unavailable).
+    SGLANG_DSA_INDEXER_FLYDSL_MQA_LOGITS = EnvBool(False)
     # DCP8 decode: the indexer's local top-k, candidate exchange, merge and
     # localization in one kernel (DcpFusedTopK, SM100, multicast).
     SGLANG_ENABLE_DSA_DCP_FUSED_TOPK = EnvBool(False)

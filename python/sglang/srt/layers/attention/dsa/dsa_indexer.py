@@ -1883,7 +1883,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             assert q_fp8[:q_offset].shape[0] != 0
             with self._with_real_sm_count():
                 if _is_hip:
-                    from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+                    from sglang.srt.layers.attention.dsa.hip_mqa_logits import (
+                        resolve_hip_fp8_mqa_logits,
+                    )
+
+                    fp8_mqa_logits = resolve_hip_fp8_mqa_logits()
 
                     kv, scale = kv_fp8
                     # Match the CUDA deep_gemm path (clean_logits=False): the topk
@@ -1945,7 +1949,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
             with self._with_real_sm_count():
                 if _is_hip:
-                    from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+                    from sglang.srt.layers.attention.dsa.hip_mqa_logits import (
+                        resolve_hip_fp8_mqa_logits,
+                    )
+
+                    fp8_mqa_logits = resolve_hip_fp8_mqa_logits()
 
                     kv, scale = kv_fp8
                     # clean_logits=False: topk transform handles masking (see above)
