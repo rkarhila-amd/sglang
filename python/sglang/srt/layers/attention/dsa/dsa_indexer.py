@@ -1845,17 +1845,27 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             return topk_result
         # Every DCP rank holds the whole index K: score 1/W of the rows each, then
         # all-gather the top-k.
-        split = _is_hip and getattr(metadata, "dcp_size", 1) > 1
+        # SGLANG_DSA_INDEXER_TP_ROW_SPLIT does the same over the attn-TP group when there is no DCP: the indexer
+        # (wq_b, index K) is replicated on every attn-TP rank, so each rank scores 1/W of the rows.
+        dcp_split = _is_hip and getattr(metadata, "dcp_size", 1) > 1
+        tp_split = (
+            _is_hip
+            and not dcp_split
+            and envs.SGLANG_DSA_INDEXER_TP_ROW_SPLIT.get()
+            and get_parallel().attn_tp_size > 1
+        )
+        split = dcp_split or tp_split
+        split_group = get_parallel().attn_tp_group if tp_split else None
         topk_dst = topk_result
         if split:
-            row_per, row_slot, row_lo, row_hi = dcp_split_rows(q_offset)
+            row_per, row_slot, row_lo, row_hi = dcp_split_rows(q_offset, split_group)
+            split_world = (
+                split_group.world_size if tp_split else metadata.dcp_size
+            )
             # Gather in place unless the strides would spill past the real rows.
-            if (
-                row_per * metadata.dcp_size != q_offset
-                or not topk_result.is_contiguous()
-            ):
+            if row_per * split_world != q_offset or not topk_result.is_contiguous():
                 topk_dst = topk_result.new_empty(
-                    (row_per * metadata.dcp_size, topk_result.shape[1])
+                    (row_per * split_world, topk_result.shape[1])
                 )
         else:
             row_lo, row_hi = 0, q_offset
@@ -1994,7 +2004,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             start = end
 
         if split:
-            dcp_all_gather_rows_(topk_dst, row_per, row_slot)
+            dcp_all_gather_rows_(topk_dst, row_per, row_slot, split_group)
             if topk_dst is not topk_result:
                 topk_result[:q_offset] = topk_dst[:q_offset]
         return topk_result
