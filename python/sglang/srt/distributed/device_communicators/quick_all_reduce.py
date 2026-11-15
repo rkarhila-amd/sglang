@@ -157,6 +157,10 @@ class QuickAllReduce:
         if _is_cuda or _is_hip:
             self.fully_connected = is_full_nvlink(physical_device_ids, self.world_size)
         if self.world_size > 2 and not self.fully_connected:
+            logger.info(
+                "[QR] quick allreduce off: group of %d GPUs is not fully connected",
+                self.world_size,
+            )
             logger.debug(
                 "Custom quick allreduce is disabled because it's not supported "
                 "on more than two PCIe-only GPUs. "
@@ -208,6 +212,15 @@ class QuickAllReduce:
         self.qr_max_size = qr_max_size if qr_max_size > 0 else ops.qr_max_size()
         self.create_shared_buffer()
         self.disabled = False
+        self._qr_max_seen = 0
+        logger.info(
+            "[QR] quick allreduce on: rank %d/%d level=%s fp16_cast=%d max_size=%d bytes",
+            self.rank,
+            self.world_size,
+            self.qr_quant_level.name,
+            self.use_fp16_kernels,
+            self.qr_max_size,
+        )
 
     def create_shared_buffer(self):
         """
@@ -253,6 +266,16 @@ class QuickAllReduce:
         # as QR uses static IPC buffer.
         if out is None:
             out = torch.empty_like(inp)
+        nbytes = inp.numel() * inp.element_size()
+        if self.rank == 0 and nbytes > self._qr_max_seen:
+            # proof line: every new largest size that really ran on quick-reduce
+            self._qr_max_seen = nbytes
+            logger.info(
+                "[QR] quick_all_reduce new max size: %d bytes dtype=%s level=%s",
+                nbytes,
+                inp.dtype,
+                self.qr_quant_level.name,
+            )
         ops.qr_all_reduce(
             self._ptr, inp, out, self.qr_quant_level.value, self.use_fp16_kernels
         )
