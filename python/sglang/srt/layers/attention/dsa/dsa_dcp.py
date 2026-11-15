@@ -119,23 +119,26 @@ def dcp_trtllm_sparse_attention(
     return output.view(rows, 1, heads, -1), lse
 
 
-def dcp_split_rows(rows: int) -> Tuple[int, int, int, int]:
+def dcp_split_rows(rows: int, group=None) -> Tuple[int, int, int, int]:
     """``(per, slot, lo, hi)``: every rank owns a stride of ``per`` rows starting
     at ``slot``, and scores the rows ``[lo, hi)`` of it that exist.
+
+    ``group`` defaults to the DCP group; the attn-TP row split of the HIP prefill
+    indexer (``SGLANG_DSA_INDEXER_TP_ROW_SPLIT``) passes the attn-TP group.
 
     The uniform stride makes the rank-major concatenation of the strides land
     row ``i`` back at row ``i``. ``slot`` is not clamped to ``rows``: the
     in-place all-gather needs this rank's own slot even when it has no rows.
     """
-    group = get_parallel().dcp_group
+    group = get_parallel().dcp_group if group is None else group
     per = -(-rows // group.world_size)
     slot = group.rank_in_group * per
     return per, slot, min(slot, rows), min(slot + per, rows)
 
 
-def dcp_all_gather_rows_(buf: torch.Tensor, per: int, slot: int) -> None:
+def dcp_all_gather_rows_(buf: torch.Tensor, per: int, slot: int, group=None) -> None:
     """In-place inverse of ``dcp_split_rows`` on ``world_size * per`` rows of
     ``buf``. Rows at and past the real row count are left unspecified."""
-    group = get_parallel().dcp_group
+    group = get_parallel().dcp_group if group is None else group
     out = buf[: group.world_size * per]
     group.all_gather_into_tensor(out, out[slot : slot + per])

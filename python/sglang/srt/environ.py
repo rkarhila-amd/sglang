@@ -2229,6 +2229,9 @@ class Envs:
     SGLANG_DSA_INDEXER_BF16_LOGITS = EnvBool(False)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
+    # HIP prefill indexer without DCP: each attn-TP rank scores 1/W of the query rows and
+    # the int32 top-k is all-gathered (same row split as DCP, over the attn-TP group).
+    SGLANG_DSA_INDEXER_TP_ROW_SPLIT = EnvBool(False)
     # DCP8 decode: the indexer's local top-k, candidate exchange, merge and
     # localization in one kernel (DcpFusedTopK, SM100, multicast).
     SGLANG_ENABLE_DSA_DCP_FUSED_TOPK = EnvBool(False)
