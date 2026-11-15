@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Optional, Tuple
 
+import logging
+
 import msgspec
 import torch
 
@@ -9,7 +11,11 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_dcp,
 )
 from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel
+
+logger = logging.getLogger(__name__)
+_AG_F32_LOGGED = False
 
 TRTLLM_MAX_BATCH_ROWS = 65535
 # FlashInfer carves heads * rows * 256 float2 softmax slots out of the workspace per call;
@@ -141,4 +147,22 @@ def dcp_all_gather_rows_(buf: torch.Tensor, per: int, slot: int, group=None) -> 
     ``buf``. Rows at and past the real row count are left unspecified."""
     group = get_parallel().dcp_group if group is None else group
     out = buf[: group.world_size * per]
-    group.all_gather_into_tensor(out, out[slot : slot + per])
+    inp = out[slot : slot + per]
+    if (
+        envs.SGLANG_DSA_TOPK_AG_AS_F32.get()
+        and out.dtype == torch.int32
+        and out.is_contiguous()
+    ):
+        # Same bits, a dtype the aiter custom all-gather accepts. The gather only copies.
+        out, inp = out.view(torch.float32), inp.view(torch.float32)
+        global _AG_F32_LOGGED
+        if not _AG_F32_LOGGED:
+            _AG_F32_LOGGED = True
+            ca = getattr(group, "ca_comm", None)
+            hit = bool(ca is not None and hasattr(ca, "should_custom_ag") and ca.should_custom_ag(inp))
+            logger.info(
+                "[AG] top-k gather as float32: per-rank %d bytes, aiter custom all-gather eligible=%s",
+                inp.numel() * inp.element_size(),
+                hit,
+            )
+    group.all_gather_into_tensor(out, inp)

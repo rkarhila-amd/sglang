@@ -2254,6 +2254,9 @@ class Envs:
     # HIP prefill indexer without DCP: each attn-TP rank scores 1/W of the query rows and
     # the int32 top-k is all-gathered (same row split as DCP, over the attn-TP group).
     SGLANG_DSA_INDEXER_TP_ROW_SPLIT = EnvBool(False)
+    # With the row split, hand the int32 top-k to the all-gather as a float32 view (same bits), so the
+    # aiter custom all-gather (float32/fp16/bf16 only, per-rank <= AITER_CUSTOM_AG_MAX_SIZE) can take it.
+    SGLANG_DSA_TOPK_AG_AS_F32 = EnvBool(False)
     # DCP8 decode: the indexer's local top-k, candidate exchange, merge and
     # localization in one kernel (DcpFusedTopK, SM100, multicast).
     SGLANG_ENABLE_DSA_DCP_FUSED_TOPK = EnvBool(False)
