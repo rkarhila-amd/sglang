@@ -732,6 +732,19 @@ class DeepseekMLARocmForwardMixin:
                         topk_indices = maybe_capture_indexer_topk(
                             self.layer_id, prev_topk_indices
                         )
+        elif getattr(self, "custom_q_latent_prep", False) and not q_replicate_active:
+            # Models without q_lora that own their q/latent/top-k preparation
+            # (Mistral-Large-4: SSMax on q, KV-sharing consumers, NoPE layers, and
+            # the DSA indexer on the hidden states). Same hook the CUDA path calls.
+            q, latent_cache, k_nope, topk_indices = (
+                self.prepare_q_latent_without_q_lora(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    q_replicate_active=False,
+                    prev_topk_indices=prev_topk_indices,
+                )
+            )
         else:
             if q_replicate_active:
                 q = torch.nn.functional.linear(
@@ -923,7 +936,12 @@ class DeepseekMLARocmForwardMixin:
         llama_4_scaling,
         q_nope_unabsorbed=None,
     ):
-        save_kv_cache = True
+        # Cross-layer KV sharing: a consumer layer reads the provider's latent
+        # cache and must not write its own, because its latent is an all-zero
+        # placeholder. forward_mla.py has honoured this since 2dcd076e7a, but
+        # that commit never touched this ROCm copy, so on AMD the consumers
+        # overwrote the provider's cache with zeros.
+        save_kv_cache = self.save_kv_cache
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             if self._skip_rope_for_dsa_tilelang_fused() and self.rotary_emb is not None:
@@ -1015,6 +1033,7 @@ class DeepseekMLARocmForwardMixin:
                         forward_batch,
                         q_rope=q_pe,
                         k_rope=k_pe,
+                        save_kv_cache=save_kv_cache,
                         **extra_args,
                         **(
                             dict(topk_indices=topk_indices)
@@ -1030,6 +1049,7 @@ class DeepseekMLARocmForwardMixin:
                         forward_batch,
                         q_rope=q_pe,
                         k_rope=k_pe,
+                        save_kv_cache=save_kv_cache,
                         **extra_args,
                         **(
                             dict(topk_indices=topk_indices)

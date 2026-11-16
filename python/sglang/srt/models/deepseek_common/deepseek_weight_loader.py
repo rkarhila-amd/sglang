@@ -446,6 +446,9 @@ class DeepseekV2WeightLoaderMixin:
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
+                    # Quark block-FP8 scales are named weight_scale; the fused
+                    # FP8 parameter is weight_scale_inv.
+                    name = _resolve_quark_fp8_block_scale_name(name, params_dict)
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     maybe_executor_submit(
@@ -842,8 +845,12 @@ class DeepseekV2WeightLoaderMixin:
                 and self.quant_config is not None
                 and self.quant_config.get_name() == "quark"
                 and self.config.architectures
-                and self.config.architectures[0]
-                == "DeepseekV3ForCausalLM"  # Avoid processing other models like GlmMoeDsaForCausalLM
+                and (
+                    self.config.architectures[0]
+                    == "DeepseekV3ForCausalLM"  # Avoid processing other models like GlmMoeDsaForCausalLM
+                    # Mistral-Large-4 Quark-MXFP4 ships kv_b_proj as packed mxfp4 too
+                    or type(self).__name__ == "MistralLarge4ForCausalLM"
+                )
                 and w.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
             ):
                 w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v = (
