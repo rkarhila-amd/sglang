@@ -27,6 +27,8 @@ class DatasetRow:
     vision_prompt_len: Optional[int] = None
     image_data: Optional[List[str]] = None
     video_data: Optional[List[str]] = None
+    audio_data: Optional[List[str]] = None
+    audio_data: Optional[List[str]] = None
     timestamp: Optional[float] = None
     routing_key: Optional[str] = None
     extra_request_body: Optional[Dict[str, Any]] = None  # Per-request API parameters
