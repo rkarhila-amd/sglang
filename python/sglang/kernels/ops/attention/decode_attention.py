@@ -1001,6 +1001,12 @@ def _fwd_kernel_stage2(
     USE_PDL: tl.constexpr = False,
     FORCED_KV_SPLITS: tl.constexpr = 0,
     DYNAMIC_SPLIT_END: tl.constexpr = False,
+    Lse_Out=None,
+    stride_lse_b=0,
+    Gate=None,
+    GateSink=None,
+    stride_gate_b=0,
+    stride_sink_b=0,
 ):
     # int64 to avoid overflow of flat offsets into Mid_O when
     # batch * num_head * max_kv_splits * head_dim exceeds 2**31.
@@ -1063,15 +1069,36 @@ def _fwd_kernel_stage2(
             e_sum = e_sum * old_scale + exp_logic
             e_max = n_e_max
 
-    if HAS_SINK:
-        cur_sink = tl.load(sink_ptr + cur_head)
-        e_sum += tl.exp(cur_sink - e_max)
+    if Lse_Out is not None or Gate is not None:
+        lse = tl.where(e_sum > 0, e_max + tl.log(e_sum), float("-inf"))
+    if Lse_Out is not None:
+        tl.store(Lse_Out + cur_batch * stride_lse_b + cur_head, lse)
+    if Gate is not None:
+        # Inkling2's output gate and query sink: o * sigmoid(gate) * sigmoid(lse - sink).
+        gate = tl.load(
+            Gate + cur_batch * stride_gate_b + cur_head * Lv + offs_d,
+            mask=mask_d,
+            other=0,
+        ).to(tl.float32)
+        sink = tl.load(GateSink + cur_batch * stride_sink_b + cur_head).to(tl.float32)
+        out = acc / e_sum * v_scale
+        out = out * (1.0 / (1.0 + tl.exp(-gate)))
+        out = out * (1.0 / (1.0 + tl.exp(sink - lse)))
+        tl.store(
+            O + cur_batch * stride_obs + cur_head * stride_oh + offs_d,
+            out.to(O.dtype.element_ty),
+            mask=mask_d,
+        )
+    else:
+        if HAS_SINK:
+            cur_sink = tl.load(sink_ptr + cur_head)
+            e_sum += tl.exp(cur_sink - e_max)
 
-    tl.store(
-        O + cur_batch * stride_obs + cur_head * stride_oh + offs_d,
-        acc / e_sum * v_scale,
-        mask=mask_d,
-    )
+        tl.store(
+            O + cur_batch * stride_obs + cur_head * stride_oh + offs_d,
+            acc / e_sum * v_scale,
+            mask=mask_d,
+        )
 
 
 def _decode_softmax_reducev_fwd(
@@ -1088,8 +1115,11 @@ def _decode_softmax_reducev_fwd(
     use_pdl=False,
     forced_kv_splits: int = 0,
     stop_at_request_splits: bool = False,
+    lse_out=None,
+    gate_sink=None,
 ):
     batch, head_num = q.shape[0], q.shape[1]
+    gate, gate_sinks = gate_sink if gate_sink is not None else (None, None)
     Lv = v_buffer.shape[-1]
     BLOCK_DV = triton.next_power_of_2(Lv)
 
@@ -1124,6 +1154,12 @@ def _decode_softmax_reducev_fwd(
         USE_PDL=use_pdl,
         FORCED_KV_SPLITS=forced_kv_splits,
         DYNAMIC_SPLIT_END=stop_at_request_splits and not forced_kv_splits,
+        Lse_Out=lse_out,
+        stride_lse_b=lse_out.stride(0) if lse_out is not None else 0,
+        Gate=gate,
+        GateSink=gate_sinks,
+        stride_gate_b=gate.stride(0) if gate is not None else 0,
+        stride_sink_b=gate_sinks.stride(0) if gate_sinks is not None else 0,
         num_warps=4,
         num_stages=2,
         **({"launch_pdl": True} if use_pdl else {}),
@@ -1152,6 +1188,8 @@ def decode_attention_fwd_normal(
     aux_tensors=None,
     uneven_batch=None,
     stop_at_request_splits: bool = False,
+    lse_out=None,
+    gate_sink=None,
 ):
     _decode_att_m_fwd(
         q,
@@ -1183,6 +1221,8 @@ def decode_attention_fwd_normal(
         max_kv_splits,
         sinks,
         stop_at_request_splits=stop_at_request_splits,
+        lse_out=lse_out,
+        gate_sink=gate_sink,
     )
 
 
@@ -1209,6 +1249,8 @@ def decode_attention_fwd_grouped(
     aux_tensors=None,
     uneven_batch=None,
     stop_at_request_splits: bool = False,
+    lse_out=None,
+    gate_sink=None,
 ):
     tune_mla, forced_kv_splits = _mla_launch_plan(q, k_buffer, max_kv_splits, has_mla)
     _decode_grouped_att_m_fwd(
@@ -1247,6 +1289,8 @@ def decode_attention_fwd_grouped(
         use_pdl=use_pdl,
         forced_kv_splits=forced_kv_splits,
         stop_at_request_splits=stop_at_request_splits,
+        lse_out=lse_out,
+        gate_sink=gate_sink,
     )
 
 
@@ -1279,6 +1323,8 @@ def decode_attention_fwd(
     lean_locks=None,
     uneven_batch=None,
     stop_at_request_splits: bool = False,
+    lse_out=None,
+    gate_sink=None,
 ):
     """``stop_at_request_splits``: the merge walks each request's own split count
     instead of the whole budget. It skips the empty tail of a large budget
@@ -1301,7 +1347,9 @@ def decode_attention_fwd(
     # Lean handles both page sizes: the kernel does page-aware address math.
     # ROCm/AMD only: Lean is validated on MI300X/MI355X; CUDA/NVIDIA uses the standard kernel.
     if (
-        _is_hip
+        lse_out is None
+        and gate_sink is None
+        and _is_hip
         and _lean_head_dim_ok(k_buffer.shape[-1], v_buffer.shape[-1])
         and _should_use_lean_decode(
             enable_lean, logit_cap, sinks, xai_temperature_len, score_mod
@@ -1356,6 +1404,8 @@ def decode_attention_fwd(
             aux_tensors=aux_tensors,
             uneven_batch=uneven_batch,
             stop_at_request_splits=stop_at_request_splits,
+            lse_out=lse_out,
+            gate_sink=gate_sink,
         )
     else:
         # GQA/MQA/MLA
@@ -1382,6 +1432,8 @@ def decode_attention_fwd(
             aux_tensors=aux_tensors,
             uneven_batch=uneven_batch,
             stop_at_request_splits=stop_at_request_splits,
+            lse_out=lse_out,
+            gate_sink=gate_sink,
         )
 
 
