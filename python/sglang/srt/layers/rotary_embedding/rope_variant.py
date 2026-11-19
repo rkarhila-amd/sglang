@@ -23,10 +23,9 @@ from sglang.srt.layers.rotary_embedding.yarn import (
     yarn_get_mscale,
     yarn_linear_ramp_mask,
 )
-from sglang.srt.utils import cpu_has_amx_support, get_device, is_cuda, is_hip, is_npu
+from sglang.srt.utils import cpu_has_amx_support, get_device, is_cuda, is_npu
 
 _is_cuda = is_cuda()
-_is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 
@@ -375,8 +374,6 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
-        if _is_hip:
-            self._forward_method = self.forward_native
 
     def set_lerope_alpha(self, lerope_alpha: torch.Tensor) -> None:
         """Update in place so existing cache references see the LeRoPE frequencies."""
