@@ -23,7 +23,6 @@ from sglang.kernels.ops.quantization.int8_kernel import (
 )
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe.utils import get_moe_padding_size
 from sglang.srt.utils import (
     is_cuda,
     is_hip,
@@ -40,8 +39,6 @@ except:
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
-
-padding_size = get_moe_padding_size(_use_aiter)
 
 
 def support_tensor_descriptor():
@@ -872,7 +869,8 @@ def invoke_fused_moe_kernel(
         assert B_scale is not None
         if block_shape is None:
             # activation tensor-wise fp8 quantization, dynamic or static
-            padded_size = 0 if _use_aiter else padding_size
+            # K padding the weight loader added to the experts (none unless it padded them)
+            padded_size = B.shape[2] - A.shape[1]
             # activations apply per-token quantization when weights apply per-channel quantization by default
             A, A_scale = scaled_fp8_quant(
                 A, A_scale, use_per_token_if_dynamic=per_channel_quant
