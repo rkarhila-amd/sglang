@@ -27,7 +27,6 @@ from sglang.srt.models.inkling2 import (
 from sglang.srt.models.inkling2_vision import Inkling2VisionEncoder
 from sglang.srt.models.inkling_common import inkling2_moe as moe
 from sglang.srt.multimodal.inkling2 import Inkling2ImageProcessor
-from sglang.srt.multimodal.media_io import ImageData
 from sglang.srt.parser.inkling_renderer import render_inkling_messages
 from sglang.srt.parser.inkling_tokenizer import IMAGE_TOKEN_ID
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
@@ -557,7 +556,7 @@ def test_image_expansion_matches_training_hydration():
             {"type": "text", "text": f"Image {index}:"},
             {"type": "image_url", "image_url": {"url": uri}},
         ]
-        sources.append(ImageData(url=uri))
+        sources.append(SimpleNamespace(url=uri))
         hydrated.append(
             image_processor.preprocess_image_for_training(
                 location=uri,
@@ -651,7 +650,7 @@ def test_multimodal_requires_explicit_enable(tmp_path):
 
 
 def _rocm_overrides(tmp_path, monkeypatch, release_config, *, hip=True, gfx95=True,
-                    env=(), **server_args):  # fmt: skip
+                    gfx942=False, env=(), **server_args):  # fmt: skip
     """Runs Inkling2's model override for the release config on a faked platform."""
     from sglang.srt.arg_groups.model_overrides import inkling
     from sglang.srt.configs.model_config import ModelConfig
@@ -661,6 +660,7 @@ def _rocm_overrides(tmp_path, monkeypatch, release_config, *, hip=True, gfx95=Tr
     platform = SimpleNamespace(is_hip=hip, is_sm90=False, is_sm100=False)
     monkeypatch.setattr(inkling, "get_platform", lambda: platform)
     monkeypatch.setattr(inkling, "is_gfx95_supported", lambda: gfx95)
+    monkeypatch.setattr(inkling, "is_gfx942_supported", lambda: gfx942)
     # the override exports these on ROCm; preset them so nothing leaks to later tests
     monkeypatch.setenv("SGLANG_TRITON_DECODE_SPLIT_MIN_TOKENS", "32")
     monkeypatch.setenv("SGLANG_TRITON_DECODE_SPLIT_MAX", "128")
@@ -710,16 +710,26 @@ def test_rocm_keeps_exact_all_reduce(tmp_path, monkeypatch, release_config, hip,
     assert os.environ["ROCM_QUICK_REDUCE_QUANTIZATION"] == expected
 
 
-@pytest.mark.parametrize("gfx95,allow", [(False, False), (False, True), (True, False)])
-def test_rocm_requires_gfx950(tmp_path, monkeypatch, release_config, gfx95, allow):
-    """Inkling2's ROCm kernels are sized and validated on gfx950 only (an LDS-sized
-    tile would not fit gfx942's 64 KB): other ROCm GPUs refuse at launch unless
+@pytest.mark.parametrize(
+    "gfx95,gfx942,allow",
+    [
+        (False, False, False),
+        (False, False, True),
+        (True, False, False),
+        (False, True, False),
+    ],
+)
+def test_rocm_requires_gfx950_or_gfx942(
+    tmp_path, monkeypatch, release_config, gfx95, gfx942, allow
+):
+    """Inkling2's ROCm kernels are sized and tuned on gfx950, and also run on
+    gfx942; any other ROCm GPU refuses at launch unless
     SGLANG_INKLING2_ALLOW_UNVALIDATED_ROCM is set."""
     env = [("SGLANG_INKLING2_ALLOW_UNVALIDATED_ROCM", "1")] if allow else []
     run = lambda: _rocm_overrides(
-        tmp_path, monkeypatch, release_config, gfx95=gfx95, env=env
+        tmp_path, monkeypatch, release_config, gfx95=gfx95, gfx942=gfx942, env=env
     )  # fmt: skip
-    if gfx95 or allow:
+    if gfx95 or gfx942 or allow:
         run()
     else:
         with pytest.raises(ValueError, match="gfx950"):
