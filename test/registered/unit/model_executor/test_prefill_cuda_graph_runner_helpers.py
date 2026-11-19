@@ -575,7 +575,6 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                     runner._is_full_backend = False
                     runner.is_dsv41_model = False
                     runner._qwen_bcg_hc_sidechannel = False
-                    runner._qwen_bcg_mtp_draft = False
                     runner._input_embeds_arg_idx = 3
                     backing = torch.zeros(4, 8)
                     supplied = torch.full((4, 8), 7.0) if first_rank else None
@@ -695,7 +694,6 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
         runner._is_full_backend = False
         runner.is_dsv41_model = False
         runner._qwen_bcg_hc_sidechannel = False
-        runner._qwen_bcg_mtp_draft = True
         runner._input_embeds_arg_idx = None
         runner.buffer_registry = SimpleNamespace(has_slot=lambda _name: False)
         runner.backend = SimpleNamespace(replay=lambda *_args, **_kwargs: None)
@@ -722,7 +720,6 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
         runner._is_full_backend = False
         runner.is_dsv41_model = False
         runner._qwen_bcg_hc_sidechannel = False
-        runner._qwen_bcg_mtp_draft = True
         runner._input_embeds_arg_idx = 3
         runner.buffer_registry = SimpleNamespace(has_slot=lambda _name: True)
         slot = torch.empty((8, 2 * 4))
