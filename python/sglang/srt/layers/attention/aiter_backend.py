@@ -594,6 +594,9 @@ class ForwardMetadata:
     # Unified target verify KV lengths (seq_lens + draft tokens), computed once
     # per batch; graph replay refills preallocated storage.
     verify_seqlen_k: Optional[torch.Tensor] = None
+    # Unified decode KV lengths read off the spec page table. None on a plain
+    # decode, where seq_lens is already the exact per-row length.
+    decode_seqlen_k: Optional[torch.Tensor] = None
     # paged_attention_ragged grid size; None means max_num_partitions.
     decode_num_partitions: Optional[int] = None
     # gfx1250 aiter Triton MLA decode; None: MLA decode takes the ASM /
@@ -3078,6 +3081,7 @@ class AiterAttnBackend(AttentionBackend):
         num_kv_splits = None
         swa_page_table = None
         swa_out_cache_loc = None
+        decode_seqlen_k = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             swa_out_cache_loc = self._get_swa_write_locations(forward_batch)
         # Absent under the sync-free path (needs_cpu_seq_lens=False); unified
@@ -3172,6 +3176,14 @@ class AiterAttnBackend(AttentionBackend):
                     )
                     max_q_len = 1
                     qo_indptr = self.qo_indptr_unified_decode[: bs + 1]
+                    # A draft step appends its own token to every row, so a row
+                    # holds seq_len + step + 1 tokens and the page table is the
+                    # only place that length survives. int64: unified_attention
+                    # derives its KV addresses from this dtype, and an int32
+                    # chain wraps once a per-layer KV buffer reaches 2 GiB.
+                    decode_seqlen_k = (
+                        spec_info.kv_indptr[1 : bs + 1] - spec_info.kv_indptr[:bs]
+                    ).to(torch.int64)
                     kv_indptr = None
                 else:
                     kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
@@ -3257,6 +3269,7 @@ class AiterAttnBackend(AttentionBackend):
                 ),
                 triton_mla_block_tables=triton_mla_tables,
                 triton_mla_seqused_k=triton_mla_seqused_k,
+                decode_seqlen_k=decode_seqlen_k,
             )
 
         elif forward_batch.forward_mode.is_draft_extend_v2():
@@ -3928,6 +3941,11 @@ class AiterAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
+            # Spec-decode KV lengths, refilled by replay preparation; every
+            # layer of the captured graph reads this storage.
+            self.cuda_graph_decode_seqlen_k = torch.zeros(
+                (max_bs,), dtype=torch.int64, device=self.device
+            )
 
         if self.use_aiter_triton_mla_decode:
             self.cuda_graph_triton_mla_block_tables = torch.zeros(
@@ -4074,6 +4092,7 @@ class AiterAttnBackend(AttentionBackend):
         use_asm_cprr_verify = False
 
         swa_page_table = None
+        decode_seqlen_k = None
         triton_mla_tables = triton_mla_seqused_k = None
         # Unified verify never reads this host max (replay sizes from
         # max_context_len); torch.max(seq_lens).item() would sync every replay.
@@ -4150,6 +4169,14 @@ class AiterAttnBackend(AttentionBackend):
                             bs,
                             dest_buf=kv_indices,
                             swa_dest_buf=swa_page_table,
+                        )
+                        # See init_forward_metadata for why the row length comes
+                        # from the page table rather than seq_lens.
+                        decode_seqlen_k = self.cuda_graph_decode_seqlen_k[:bs]
+                        torch.sub(
+                            spec_info.kv_indptr[1 : bs + 1],
+                            spec_info.kv_indptr[:bs],
+                            out=decode_seqlen_k,
                         )
                     elif self.use_sliding_window_kv_pool and self.page_size > 1:
                         # Both block tables in one launch (the gather / translate / stride / divide sequence
@@ -4274,6 +4301,7 @@ class AiterAttnBackend(AttentionBackend):
                 # num_kv_splits_indptr=num_kv_splits_indptr,
                 triton_mla_block_tables=triton_mla_tables,
                 triton_mla_seqused_k=triton_mla_seqused_k,
+                decode_seqlen_k=decode_seqlen_k,
             )
 
         elif forward_mode.is_target_verify():
@@ -6058,6 +6086,9 @@ class AiterAttnBackend(AttentionBackend):
                         page_table = self.forward_metadata.swa_page_table
 
                 max_kv_len = page_table.shape[1] * self.page_size
+                seqused_k = self.forward_metadata.decode_seqlen_k
+                if seqused_k is None:
+                    seqused_k = forward_batch.seq_lens
                 # q_len==1 decode (incl. EAGLE draft decode steps) via the asm
                 # verify kernel (in-kernel tail alignment; static shapes, so
                 # the path is cuda-graph capture safe). Must run BEFORE the
@@ -6080,7 +6111,7 @@ class AiterAttnBackend(AttentionBackend):
                             -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
                         ),
                         out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                        seqused_k=forward_batch.seq_lens,
+                        seqused_k=seqused_k,
                         max_seqlen_k=max_kv_len,
                         softmax_scale=layer.scaling,
                         block_table=page_table,
@@ -6140,7 +6171,7 @@ class AiterAttnBackend(AttentionBackend):
                     ),
                     out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                     cu_seqlens_q=self.forward_metadata.qo_indptr,
-                    seqused_k=forward_batch.seq_lens,
+                    seqused_k=seqused_k,
                     max_seqlen_q=self.forward_metadata.max_q_len,
                     max_seqlen_k=max_kv_len,
                     softmax_scale=layer.scaling,
