@@ -151,6 +151,32 @@ class TestDsaTilelangFp8Validation(CustomTestCase):
             qk_rope_head_dim=64,
         )
 
+    def test_prims_ts_shared_pool_layout_compatibility(self):
+        for prefill, decode in (("prims_ts", "trtllm"), ("trtllm", "prims_ts")):
+            with self.subTest(prefill=prefill, decode=decode):
+                _check_dsa_backend_constraints(
+                    "fp8_e4m3",
+                    prefill,
+                    decode,
+                    hip=False,
+                    kv_lora_rank=512,
+                    qk_rope_head_dim=64,
+                )
+        for prefill, decode in (
+            ("prims_ts", "flashmla_kv"),
+            ("flashmla_kv", "prims_ts"),
+        ):
+            with self.subTest(prefill=prefill, decode=decode):
+                with self.assertRaisesRegex(ValueError, "raw FP8"):
+                    _check_dsa_backend_constraints(
+                        "fp8_e4m3",
+                        prefill,
+                        decode,
+                        hip=False,
+                        kv_lora_rank=512,
+                        qk_rope_head_dim=64,
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()
