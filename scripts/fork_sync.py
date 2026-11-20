@@ -304,6 +304,10 @@ def pr_line(n, title):
     return f"- {link(n)} {text}".rstrip()
 
 
+def anchor(branch):
+    return re.sub(r"[^a-z0-9]+", "-", branch.lower()).strip("-")
+
+
 def pr_block(nums, titles):
     if not nums:
         return ["none"]
@@ -330,7 +334,7 @@ def write_report(results, contained, multi, unpushed, removed, upstream, today, 
     for b in results:
         landed = [x["pr"] for x in b["landed"] if x["status"] == "landed"]
         conflicts = [x["pr"] for x in b["skipped"]]
-        lines.append(f"### `{b['name']}`")
+        lines.append(f"### `{b['name']}` <a id=\"{anchor(b['name'])}\"></a>")
         lines.append("")
         tag = f"{b['name']}-{today.strftime('%Y%m%d')}"
         if b.get("tag_moved", True):
