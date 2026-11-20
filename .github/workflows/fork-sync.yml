@@ -1,0 +1,38 @@
+name: Fork sync
+
+on:
+  schedule:
+    # 01:00 UTC, Monday through Friday. No Saturday or Sunday run.
+    - cron: "0 1 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Rebuild stable and experimental branches
+        env:
+          FORK_TEAM_LOGINS: ${{ secrets.FORK_TEAM_LOGINS }}
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_REPO: sgl-project/sglang
+          FORK_REPO: rkarhila-amd/sglang
+        run: python3 scripts/fork_sync.py
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: branch-build
+          path: branch-build.md
+          retention-days: 30
