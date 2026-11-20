@@ -41,6 +41,14 @@ def git(*args, check=True, input=None):
     return r
 
 
+def ensure_identity():
+    """Actions runners have no commit identity. Keep one that is already set."""
+    if git("config", "--get", "user.name", check=False).returncode != 0:
+        git("config", "user.name", "github-actions[bot]")
+    if git("config", "--get", "user.email", check=False).returncode != 0:
+        git("config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com")
+
+
 def hits(text, table):
     found = []
     low = text.lower()
@@ -271,6 +279,7 @@ def write_report(results, contained, multi, unpushed, removed, upstream, today):
 
 
 def main():
+    ensure_identity()
     today = dt.datetime.now(dt.timezone.utc).date()
     upstream = prepare_main()
     prs = load_open_prs()
