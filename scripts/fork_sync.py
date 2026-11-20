@@ -109,43 +109,95 @@ def require_fork_remote():
         sys.exit("refusing to push: remote is not the fork")
 
 
+def drift_ok(path):
+    return path in TOOLING or path.startswith(".github/workflows/")
+
+
+def changed_paths(a, b):
+    out = git("diff", "--name-only", "--no-renames", a, b).stdout.splitlines()
+    return [p for p in out if p]
+
+
+def fork_main_ok(origin, upstream):
+    if git("merge-base", "--is-ancestor", origin, upstream, check=False).returncode == 0:
+        return True
+    msg = git("log", "-1", "--format=%B", origin).stdout
+    recorded = re.search(r"(?m)^Upstream: ([0-9a-f]{40})$", msg)
+    if recorded:
+        base = recorded.group(1)
+        if git("cat-file", "-e", f"{base}^{{commit}}", check=False).returncode != 0:
+            return False
+        if git("merge-base", "--is-ancestor", base, upstream, check=False).returncode != 0:
+            return False
+        return all(drift_ok(p) for p in changed_paths(base, origin))
+    mb = git("merge-base", origin, upstream).stdout.strip()
+    names = changed_paths(mb, origin)
+    return bool(names) and all(drift_ok(p) for p in names)
+
+
+def restore_workflows(source):
+    """Index keeps source's workflow files. The job token cannot push any others."""
+    git("rm", "-r", "-f", "-q", "--ignore-unmatch", ".github/workflows")
+    if git("cat-file", "-e", f"{source}:.github/workflows", check=False).returncode == 0:
+        git("checkout", source, "--", ".github/workflows")
+
+
 def prepare_main():
     require_fork_remote()
     git("fetch", FORK_REMOTE, f"+main:{FORK_MAIN}")
+    git("fetch", FORK_REMOTE, "+refs/heads/stripy/*:refs/remotes/forksync/stripy/*")
     git("fetch", "https://github.com/sgl-project/sglang.git", "main:refs/remotes/upstream/main")
     origin = git("rev-parse", FORK_MAIN).stdout.strip()
     upstream = git("rev-parse", "refs/remotes/upstream/main").stdout.strip()
-    if git("merge-base", "--is-ancestor", origin, upstream, check=False).returncode == 0:
-        base_ok = True
-    else:
-        mb = git("merge-base", origin, upstream).stdout.strip()
-        names = git("diff", "--name-only", mb, origin).stdout.split()
-        base_ok = names and all(n in TOOLING for n in names)
-        if not base_ok:
-            sys.exit("fork main has commits other than the sync tooling; not fast-forwarding")
+    if not fork_main_ok(origin, upstream):
+        sys.exit("fork main has commits other than the sync tooling; not fast-forwarding")
     saved = {p: Path(p).read_bytes() for p in TOOLING if Path(p).exists()}
-    git("checkout", "--force", "--detach", upstream)
-    git("reset", "--hard", upstream)
+    # Parent stays the current fork main, so the push does not send upstream
+    # commits. Those commits edit workflow files, which this token cannot do.
+    git("checkout", "--force", "--detach", origin)
     git("clean", "-fd")
-    dirty = False
+    git("read-tree", "--reset", "-u", upstream)
+    restore_workflows(origin)
     for path, data in saved.items():
         dest = Path(path)
         dest.parent.mkdir(parents=True, exist_ok=True)
         if not dest.exists() or dest.read_bytes() != data:
             dest.write_bytes(data)
             git("add", path)
-            dirty = True
-    if dirty:
-        git("commit", "-m", "chore: keep fork sync tooling")
+    if git("diff", "--cached", "--quiet", check=False).returncode != 0:
+        git("commit", "-m", f"chore: keep fork sync tooling\n\nUpstream: {upstream}\n")
     new = git("rev-parse", "HEAD").stdout.strip()
     if new != origin:
+        blocked = [p for p in changed_paths(origin, new) if p.startswith(".github/workflows/")]
+        if blocked:
+            sys.exit("refusing to push workflow file changes:\n" + "\n".join(blocked))
         pushed = subprocess.run(
             ["git", "push", "--force-with-lease=refs/heads/main:" + origin, FORK_REMOTE, f"{new}:refs/heads/main"],
             capture_output=True, text=True,
         )
         if pushed.returncode != 0:
             sys.exit("pushing main failed\n" + pushed.stderr[-1000:])
-    return upstream
+    return upstream, new
+
+
+def snapshot_branch(name, built, upstream, fork_main):
+    """One commit on the current branch tip, with that tip's workflow files."""
+    ref = f"refs/remotes/forksync/{name}"
+    if git("rev-parse", "--verify", "--quiet", ref, check=False).returncode == 0:
+        parent = git("rev-parse", ref).stdout.strip()
+    else:
+        parent = fork_main
+    git("read-tree", "--reset", f"{built}^{{tree}}")
+    restore_workflows(parent)
+    tree = git("write-tree").stdout.strip()
+    if tree == git("rev-parse", f"{parent}^{{tree}}").stdout.strip():
+        return parent
+    msg = f"[fork] Rebuild {name}\n\nUpstream: {upstream}\n"
+    sha = git("commit-tree", tree, "-p", parent, "-F", "-", input=msg).stdout.strip()
+    blocked = [p for p in changed_paths(parent, sha) if p.startswith(".github/workflows/")]
+    if blocked:
+        sys.exit(f"refusing to push workflow file changes on {name}:\n" + "\n".join(blocked))
+    return sha
 
 
 def fetch_prs(numbers, fork_only):
@@ -281,7 +333,7 @@ def write_report(results, contained, multi, unpushed, removed, upstream, today):
 def main():
     ensure_identity()
     today = dt.datetime.now(dt.timezone.utc).date()
-    upstream = prepare_main()
+    upstream, fork_main = prepare_main()
     prs = load_open_prs()
     groups = {}
     generic = []
@@ -326,6 +378,7 @@ def main():
     stamp = today.strftime("%Y%m%d")
     unpushed = {}
     for b in results:
+        b["sha"] = snapshot_branch(b["name"], b["sha"], upstream, fork_main)
         ok, err = push_ref(b["sha"], f"refs/heads/{b['name']}", force=True)
         if not ok:
             unpushed[b["name"]] = err.strip().splitlines()[-1][:200]
