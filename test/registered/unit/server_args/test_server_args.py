@@ -26,7 +26,10 @@ from sglang.srt.arg_groups.attention_hook import (
     handle_attention_backend_compatibility,
     handle_deterministic_inference,
 )
-from sglang.srt.arg_groups.choices import KV_CACHE_DTYPE_CHOICES
+from sglang.srt.arg_groups.choices import (
+    KV_CACHE_DTYPE_CHOICES,
+    WATERMARK_ALGORITHM_CHOICES,
+)
 from sglang.srt.arg_groups.cuda_graph_hook import (
     apply_cuda_graph_compatibility,
     finalize_cuda_graph_prefill_max_context,
@@ -1057,6 +1060,19 @@ class TestPrepareServerArgs(CustomTestCase):
             os.unlink(config_file)
 
 
+class TestWatermarkServerArgs(CustomTestCase):
+    def test_unknown_algorithm_refused_with_watermarking_off(self):
+        with self.assertRaisesRegex(ValueError, "unknown --watermark-algorithm"):
+            validation_hook.check_watermark_server_args(
+                ServerArgs(model_path="dummy", watermark_algorithm="synthid")
+            )
+
+    def test_every_algorithm_choice_has_an_adapter(self):
+        from sglang.srt.sampling.watermarking import runtime
+
+        self.assertEqual(sorted(runtime._ADAPTERS), sorted(WATERMARK_ALGORITHM_CHOICES))
+
+
 class TestMmEncoderDataParallelLogging(CustomTestCase):
     def test_logs_when_encoder_dp_has_no_parallelism(self):
         server_args = ServerArgs(
@@ -1111,6 +1127,25 @@ class TestTokenSpaceProcessorArgs(CustomTestCase):
 
                 with self.assertRaisesRegex(ValueError, "encoder disaggregation"):
                     pd_disaggregation_hook.handle_encoder_disaggregation(server_args)
+
+
+class TestLanguageModelOnlyArchitectures(CustomTestCase):
+    @staticmethod
+    def _handle(architecture):
+        from sglang.srt.arg_groups.model_hook import handle_language_model_only
+
+        server_args = ServerArgs(model_path="dummy", language_model_only=True)
+        server_args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[architecture])
+        )
+        handle_language_model_only(server_args)
+
+    def test_accepts_qwen4_exp(self):
+        self._handle("Qwen4ExpForConditionalGeneration")
+
+    def test_rejects_an_unlisted_architecture(self):
+        with self.assertRaisesRegex(ValueError, "does not support"):
+            self._handle("LlamaForCausalLM")
 
 
 class TestMultimodalFeatureTransport(CustomTestCase):

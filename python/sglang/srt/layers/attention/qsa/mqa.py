@@ -7,7 +7,7 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.utils.device import is_gfx95_supported, is_hip, is_npu
+from sglang.srt.utils.device import is_gfx942_supported, is_hip, is_npu
 
 _is_npu = is_npu()
 
@@ -116,6 +116,26 @@ _TILELANG_DTYPES = {
     torch.bfloat16: "bfloat16",
     torch.float8_e4m3fn: "float8_e4m3fn",
 }
+
+
+# gfx942 (MI300X/MI325X) has 64 KiB of LDS per workgroup; gfx950 has 160 KiB.
+_GFX942_LDS_BYTES = 64 * 1024
+
+
+def _prefill_num_stages(
+    block_q: int, heads: int, block_n: int, head_dim: int, dtype: torch.dtype
+) -> int:
+    """Pipeline depth for the prefill kernels. The default 3 stages need
+    (block_q * heads + 3 * block_n) * head_dim elements of shared memory, which
+    overflows gfx942's LDS for bf16 at head_dim 128; use the deepest that fits."""
+    if not is_gfx942_supported():
+        return 3
+    itemsize = torch.empty((), dtype=dtype).element_size()
+    for stages in (3, 2, 1):
+        lds_bytes = (block_q * heads + stages * block_n) * head_dim * itemsize
+        if lds_bytes <= _GFX942_LDS_BYTES:
+            return stages
+    return 1
 
 
 def _scoring_dtype(q: torch.Tensor, k: torch.Tensor) -> torch.dtype:
@@ -424,6 +444,7 @@ def tilelang_qsa_mqa_prefill(
         heads=heads,
         head_dim=head_dim,
         block_q=block_q,
+        num_stages=_prefill_num_stages(block_q, heads, 64, head_dim, scoring_dtype),
         dtype=_TILELANG_DTYPES[scoring_dtype],
     )(
         q_padded.reshape(-1, head_dim),
@@ -453,13 +474,6 @@ def _prefill_key_splits(row_blocks: int, width: int, block_n: int, device) -> in
         if level >= wanted or level >= max_useful:
             return level
     return _PREFILL_KEY_SPLIT_LEVELS[-1]
-
-
-def _prefill_relative_num_stages() -> int:
-    """K-tile pipeline stages of the relative kernel. One on gfx95 keeps a CTA's
-    shared memory at 48 KB (bf16) instead of 80 KB, so three CTAs fit a CU's
-    160 KB instead of two; the scores do not change."""
-    return 1 if is_gfx95_supported() else 3
 
 
 def torch_qsa_mqa_prefill_relative(
@@ -531,9 +545,11 @@ def tilelang_qsa_mqa_prefill_relative(
         head_dim=head_dim,
         block_n=block_n,
         block_q=block_q,
-        num_stages=_prefill_relative_num_stages(),
         key_splits=_prefill_key_splits(
             padded_rows // block_q, width, block_n, q.device
+        ),
+        num_stages=_prefill_num_stages(
+            block_q, heads, block_n, head_dim, scoring_dtype
         ),
         dtype=_TILELANG_DTYPES[scoring_dtype],
     )(
