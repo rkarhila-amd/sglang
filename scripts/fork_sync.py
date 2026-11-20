@@ -287,11 +287,30 @@ def prune_tags(today):
     return removed
 
 
+# Rendered width of one PR line. 80 is the usual readable column.
+COLUMN = 80
+
+
 def link(n):
     return f"[#{n}](https://github.com/{UPSTREAM_REPO}/pull/{n})"
 
 
-def write_report(results, contained, multi, unpushed, removed, upstream, today):
+def pr_line(n, title):
+    prefix = f"[#{n}] "
+    text = " ".join((title or "").split())
+    room = COLUMN - len(prefix)
+    if len(text) > room:
+        text = text[: max(room - 5, 0)] + "(...)"
+    return f"- {link(n)} {text}".rstrip()
+
+
+def pr_block(nums, titles):
+    if not nums:
+        return ["none"]
+    return [pr_line(n, titles.get(n, "")) for n in nums]
+
+
+def write_report(results, contained, multi, unpushed, removed, upstream, today, titles):
     lines = [
         f"# Branch build {today.isoformat()}",
         "",
@@ -313,13 +332,21 @@ def write_report(results, contained, multi, unpushed, removed, upstream, today):
         conflicts = [x["pr"] for x in b["skipped"]]
         lines.append(f"### `{b['name']}`")
         lines.append("")
-        lines.append(f"Commit `{b['sha'][:12]}`. Tag `{b['name']}-{today.strftime('%Y%m%d')}`.")
+        tag = f"{b['name']}-{today.strftime('%Y%m%d')}"
+        if b.get("tag_moved", True):
+            lines.append(f"Commit `{b['sha'][:12]}`. Tag `{tag}`.")
+        else:
+            lines.append(f"Commit `{b['sha'][:12]}`. Tag `{tag}` already pointed at an earlier commit, so it was left there.")
         if b["name"] in unpushed:
             lines.append(f"Branch push failed: {unpushed[b['name']]}")
         lines.append("")
-        lines.append("Landed: " + (", ".join(link(n) for n in landed) if landed else "none"))
+        lines.append("Landed:")
         lines.append("")
-        lines.append("Conflict, left off: " + (", ".join(link(n) for n in conflicts) if conflicts else "none"))
+        lines.extend(pr_block(landed, titles))
+        lines.append("")
+        lines.append("Conflict, left off:")
+        lines.append("")
+        lines.extend(pr_block(conflicts, titles))
         lines.append("")
     lines += ["## Tags removed", ""]
     lines.append(", ".join(f"`{t}`" for t in removed) if removed else "None.")
@@ -350,7 +377,13 @@ def main():
     fork_only = {n for n, pr in prs.items() if pr.get("fork_only")}
     fetch_prs(sorted(prs), fork_only)
     approved_generic = [n for n in generic if approved(prs[n])]
-    plan = [(f"{PREFIX}dev", approved_generic, None), (f"{PREFIX}experimental/dev", generic, f"{PREFIX}dev")]
+    # One copy of each model PR, in PR number order. A PR that matches several models is still listed once.
+    model_nums = sorted({n for nums in groups.values() for n in nums})
+    approved_models = [n for n in model_nums if approved(prs[n])]
+    # dev is every approved PR that applies. experimental/dev is that stack, then the open PRs that are not approved.
+    dev_prs = approved_generic + approved_models
+    experimental_dev = dev_prs + [n for n in generic if not approved(prs[n])] + [n for n in model_nums if not approved(prs[n])]
+    plan = [(f"{PREFIX}dev", dev_prs, None), (f"{PREFIX}experimental/dev", experimental_dev, f"{PREFIX}dev")]
     for model, nums in sorted(groups.items()):
         approved_model = [n for n in nums if approved(prs[n])]
         name = f"{PREFIX}{model}"
@@ -382,9 +415,11 @@ def main():
         ok, err = push_ref(b["sha"], f"refs/heads/{b['name']}", force=True)
         if not ok:
             unpushed[b["name"]] = err.strip().splitlines()[-1][:200]
-        push_ref(b["sha"], f"refs/tags/{b['name']}-{stamp}")
+        tag_ok, _ = push_ref(b["sha"], f"refs/tags/{b['name']}-{stamp}")
+        b["tag_moved"] = tag_ok
     removed = prune_tags(today)
-    write_report(results, contained, multi, unpushed, removed, upstream, today)
+    titles = {n: (pr.get("title") or "") for n, pr in prs.items()}
+    write_report(results, contained, multi, unpushed, removed, upstream, today, titles)
 
 
 if __name__ == "__main__":
