@@ -27,6 +27,7 @@ from sglang.srt.arg_groups.choices import (
     LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
     MOE_RUNNER_BACKEND_CHOICES,
     RL_ON_POLICY_TARGET_CHOICES,
+    WATERMARK_ALGORITHM_CHOICES,
     reject_removed_choice,
 )
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -88,8 +89,15 @@ class ExecFeatures(msgspec.Struct):
     ] = False
     enable_watermark: A[
         bool,
-        "Enable Aaronson-Gumbel text watermarking.",
+        "Enable text watermarking with the algorithm --watermark-algorithm selects.",
     ] = False
+    watermark_algorithm: A[
+        str,
+        Arg(
+            help="The text watermarking algorithm: gumbel (Aaronson-Gumbel).",
+            choices=WATERMARK_ALGORITHM_CHOICES,
+        ),
+    ] = "gumbel"
     watermark_config: A[
         Optional[str],
         "Watermark settings as a JSON file path or an inline JSON object with "
@@ -1065,6 +1073,10 @@ class ExecMoe(msgspec.Struct):
     enable_waterfill: A[
         bool,
         "Enable Waterfill: dispatch the fused shared expert as an extra routed expert slot to the least-loaded EP rank. Supports DeepEP and MegaMOE MoE A2A backends, implicitly enables shared-expert fusion, and supports --deepep-mode auto, normal, or low_latency when used with DeepEP. Use auto or low_latency for production DeepEP decode so CUDA graph remains enabled. Supported on DeepSeek-V3/R1 with EP >= 2.",
+    ] = False
+    enable_aiter_mega_moe_tp: A[
+        bool,
+        "Run the eager extend forwards (up to SGLANG_AITER_MEGA_MOE_TP_MAX_TOKENS tokens, default 4096) of a GLM-5-Next model (Glm5NextForConditionalGeneration, e.g. GLM-5.3-Flash) as one AITER MegaMoE-TP kernel that fuses the routed experts, the shared expert and the TP all-reduce. Any other model is refused at load. Needs MXFP4 experts on the AITER MoE runner, ROCm gfx950 and TP 2-8 on one node. Decode, CUDA graphs and torch.compile keep the stock MoE path; online weight updates are not supported.",
     ] = False
     ep_join_mode: A[
         Optional[Literal["scale", "recover"]],

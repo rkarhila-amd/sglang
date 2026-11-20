@@ -487,6 +487,7 @@ class Envs:
     SGLANG_PROFILE_BY_STAGE_DECODE_MIN_BS = EnvInt(0)
     SGLANG_ENABLE_NVTX_SCHEDULER = EnvBool(False)
     SGLANG_ENABLE_NVTX_OPERATIONS = EnvBool(False)
+    SGLANG_ENABLE_NVTX_FORWARD = EnvBool(False)
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE = EnvBool(False)
     # Opt-in: emit one CUDA-graph capture trace per captured batch size (per-bs).
@@ -722,6 +723,8 @@ class Envs:
     # Internal/testing only - users should not need to change this.
     SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
     SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
+    # UniBoost: estimated prefill cost per uncached prompt token, in microseconds.
+    SGLANG_UNIBOOST_ALPHA_US_PER_TOKEN = EnvFloat(64.0)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output
@@ -1235,6 +1238,13 @@ class Envs:
     SGLANG_AITER_MEGA_RANK_SYNC = EnvBool(False)
     SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY = EnvBool(False)
     SGLANG_AITER_MEGA_EPLB_FUSED_MAP_RECORD = EnvBool(False)
+    # --enable-aiter-mega-moe-tp: the largest eager extend forward (in tokens) that
+    # takes the kernel; larger forwards keep the stock MoE path. Sets the kernel's
+    # per-rank capacity, ceil(max tokens / TP size).
+    SGLANG_AITER_MEGA_MOE_TP_MAX_TOKENS = EnvInt(4096)
+    # Dtype of the data the kernel's ranks exchange. fp8 (default) is lossy: it adds
+    # quantization error beyond the stock bf16 all-reduce. bf16 is the accurate mode.
+    SGLANG_AITER_MEGA_MOE_TP_COMM_DTYPE = EnvStr("fp8")
     # Above 8192 tokens of context, aiter's non-static workspace is large enough
     # that mem_fraction_static is scaled by 0.85 to leave room for it. Set this to
     # honor an explicitly passed --mem-fraction-static instead. Off by default:
@@ -2327,6 +2337,9 @@ class Envs:
     # With --moe-a2a-backend megamoe, Inkling2 forwards with fewer tokens (all
     # ranks) keep the routed expert kernels instead of DeepGEMM MegaMoE.
     SGLANG_OPT_INKLING2_MEGA_MOE_MIN_TOKENS = EnvInt(64)
+    # Under MegaMoE, prefill computes the MoE input (AttnRes, norm, router) only
+    # for the tokens this rank dispatches.
+    SGLANG_OPT_INKLING2_MEGA_MOE_LOCAL_INPUT = EnvBool(True)
 
     # ===================================================================
     # DSA backend (GLM 5 and DeepSeek V3.2)
