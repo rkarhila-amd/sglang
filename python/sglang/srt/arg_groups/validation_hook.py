@@ -37,6 +37,7 @@ from sglang.srt.runtime_context import (
     get_platform,
     num_dp_ranks_of,
 )
+from sglang.srt.sampling.watermarking.config import ALGORITHM_CONFIG_FIELDS
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
@@ -89,6 +90,22 @@ def check_watermark_server_args(server_args: Any) -> None:
         )
     if envs.SGLANG_RUST_SERVER.get():
         raise ValueError("--enable-watermark is not supported with SGLANG_RUST_SERVER")
+    # Another algorithm's fields, set directly as server arguments; the config
+    # loader refuses them in the file.
+    allowed = ALGORITHM_CONFIG_FIELDS[cfg.watermark_algorithm]
+    others = sorted(
+        f"watermark_{name}"
+        for name in set().union(*ALGORITHM_CONFIG_FIELDS.values()) - allowed
+    )
+    fields = {field.name: field for field in record_fields(type(server_args))}
+    unread = [
+        name for name in others if getattr(cfg, name) != _field_default(fields[name])
+    ]
+    if unread:
+        raise ValueError(
+            f"server arguments {unread} are not supported with "
+            f"--watermark-algorithm {cfg.watermark_algorithm}"
+        )
     # lazy: the algorithm's adapter imports torch and its kernels.
     from sglang.srt.sampling.watermarking.runtime import check_watermark_algorithm_args
 
@@ -268,7 +285,6 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
 
 def check_server_args(server_args: Any):
     from sglang.srt.arg_groups.lora_hook import check_lora_server_args
-    from sglang.srt.arg_groups.mega_moe_hook import check_aiter_mega_moe_tp_compat
 
     cfg = resolving_view(server_args)
 
@@ -363,9 +379,6 @@ def check_server_args(server_args: Any):
 
     # Check LoRA
     check_lora_server_args(server_args)
-
-    # After the LoRA check, which turns --lora-paths into enable_lora.
-    check_aiter_mega_moe_tp_compat(server_args)
 
     # Check speculative decoding
     if cfg.speculative_algorithm is not None:

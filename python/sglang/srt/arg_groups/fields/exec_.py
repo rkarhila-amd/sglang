@@ -94,15 +94,18 @@ class ExecFeatures(msgspec.Struct):
     watermark_algorithm: A[
         str,
         Arg(
-            help="The text watermarking algorithm: gumbel (Aaronson-Gumbel).",
+            help="The text watermarking algorithm: gumbel (Aaronson-Gumbel) or "
+            "synthid (SynthID Text).",
             choices=WATERMARK_ALGORITHM_CHOICES,
         ),
     ] = "gumbel"
     watermark_config: A[
         Optional[str],
         "Watermark settings as a JSON file path or an inline JSON object with "
-        "optional key, key_b, context_window, mixing_probability, max_probability, "
-        "default_enabled, and enforce_all fields.",
+        "optional default_enabled and enforce_all fields; gumbel reads key, key_b, "
+        "context_window, mixing_probability, and max_probability; synthid reads "
+        "keys, ngram_len, num_candidates, context_history_size, and "
+        "skip_first_ngram_calls.",
     ] = None
     watermark_key: A[
         Optional[str],
@@ -132,6 +135,26 @@ class ExecFeatures(msgspec.Struct):
         bool,
         Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
     ] = False
+    watermark_keys: A[
+        Optional[List[int]],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = None
+    watermark_ngram_len: A[
+        Optional[int],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = None
+    watermark_num_candidates: A[
+        Optional[int],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = None
+    watermark_context_history_size: A[
+        Optional[int],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = None
+    watermark_skip_first_ngram_calls: A[
+        Optional[bool],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = None
     enable_return_hidden_states: A[
         bool,
         "Enable returning full hidden states with responses. Equivalent to "
@@ -1073,10 +1096,6 @@ class ExecMoe(msgspec.Struct):
     enable_waterfill: A[
         bool,
         "Enable Waterfill: dispatch the fused shared expert as an extra routed expert slot to the least-loaded EP rank. Supports DeepEP and MegaMOE MoE A2A backends, implicitly enables shared-expert fusion, and supports --deepep-mode auto, normal, or low_latency when used with DeepEP. Use auto or low_latency for production DeepEP decode so CUDA graph remains enabled. Supported on DeepSeek-V3/R1 with EP >= 2.",
-    ] = False
-    enable_aiter_mega_moe_tp: A[
-        bool,
-        "Run the eager extend forwards (up to SGLANG_AITER_MEGA_MOE_TP_MAX_TOKENS tokens, default 4096) of a GLM-5-Next model (Glm5NextForConditionalGeneration, e.g. GLM-5.3-Flash) as one AITER MegaMoE-TP kernel that fuses the routed experts, the shared expert and the TP all-reduce. Any other model is refused at load. Needs MXFP4 experts on the AITER MoE runner, ROCm gfx950 and TP 2-8 on one node. Decode, CUDA graphs and torch.compile keep the stock MoE path; online weight updates are not supported.",
     ] = False
     ep_join_mode: A[
         Optional[Literal["scale", "recover"]],

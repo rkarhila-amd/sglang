@@ -577,6 +577,10 @@ POSITIONAL_FIELD_ORDER = (
     "uniboost_gamma",
     "enable_uniboost_gamma_ada",
     "watermark_algorithm",
-    "enable_aiter_mega_moe_tp",
+    "watermark_keys",
+    "watermark_ngram_len",
+    "watermark_num_candidates",
+    "watermark_context_history_size",
+    "watermark_skip_first_ngram_calls",
 )
 # fmt: on
