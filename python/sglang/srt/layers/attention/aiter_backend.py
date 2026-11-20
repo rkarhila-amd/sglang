@@ -1032,6 +1032,10 @@ class AiterAttnBackend(AttentionBackend):
             and self.topk == 1
             and get_bool_env_var("SGLANG_AITER_UNIFIED_VERIFY", "1")
         )
+        # Every other verify path still reads the host seq_lens mirror.
+        self.needs_cpu_seq_lens = not (
+            self._use_unified_verify and envs.SGLANG_AITER_SYNC_FREE_VERIFY.get()
+        )
 
         # Muse Spark TP8 shapes on gfx950: head_dim 64, GQA 8, SWA KV pool, unified
         # Triton attention. Extend and target verify take the Muse fast paths below
@@ -2133,6 +2137,10 @@ class AiterAttnBackend(AttentionBackend):
                 window=uni_window[0] + 1 if swa_gluon else 0,
             )
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        # FP8 KV cache: quantize Q with the static q scale as forward_decode does,
+        # unless the Muse extend path above already produced an FP8 Q.
+        if q_descale is None and self.kv_cache_dtype == fp8_dtype:
+            q_u, q_descale = self._quantize_q_fp8(q_u)
         unified_attention(
             q=q_u,
             k=k_paged,
@@ -5422,6 +5430,14 @@ class AiterAttnBackend(AttentionBackend):
                     # signature num_query_heads_16/num_queries_per_kv_1). GQA head
                     # mapping here is identical to the proven decode path.
 
+                    # aiter's gfx950 Gluon kernel needs Q and KV in one dtype; with
+                    # a bf16 Q and an FP8 cache this falls back to the Triton kernel,
+                    # which at page size 1 walks the KV one token per tile. Quantize
+                    # Q as forward_decode does.
+                    q_descale = None
+                    if self.kv_cache_dtype == fp8_dtype:
+                        q_unified, q_descale = self._quantize_q_fp8(q_unified)
+
                     unified_attention(
                         q=q_unified,
                         k=k_unified,
@@ -5436,7 +5452,7 @@ class AiterAttnBackend(AttentionBackend):
                         window_size=window_size,
                         block_table=page_table,
                         softcap=layer.logit_cap,
-                        q_descale=None,
+                        q_descale=q_descale,
                         k_descale=k_descale,
                         v_descale=v_descale,
                         sinks=sinks,
@@ -5551,6 +5567,11 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 ):
                     return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+                # The asm kernel above takes bf16 Q; unified_attention wants Q in
+                # the KV dtype, as in target_verify.
+                q_descale = None
+                if self.kv_cache_dtype == fp8_dtype:
+                    q, q_descale = self._quantize_q_fp8(q)
                 unified_attention(
                     q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     k=k_cache.view(
@@ -5569,7 +5590,7 @@ class AiterAttnBackend(AttentionBackend):
                     window_size=de_window,
                     block_table=pt,
                     softcap=layer.logit_cap,
-                    q_descale=None,
+                    q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     sinks=sinks,

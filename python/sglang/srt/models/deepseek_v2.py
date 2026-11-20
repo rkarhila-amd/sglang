@@ -202,6 +202,7 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
 )
 from sglang.srt.models.deepseek_common.utils import (
     _get_llama_4_scaling,
+    _has_fp8_weight_scale,
     _is_block_scale_fp8,
     _is_cpu,
     _is_cpu_amx_available,
@@ -675,6 +676,7 @@ class DeepseekV2MoE(nn.Module):
         self.tp_size = get_parallel().tp_size
         self.moe_ep_size = get_parallel().moe_ep_size
         self.routed_scaling_factor = config.routed_scaling_factor
+        self._scales_routed_output = self.routed_scaling_factor != 1.0
         self.n_shared_experts = config.n_shared_experts
         self._deferred_finalize_max_tokens = (
             envs.SGLANG_MOE_DEFERRED_FINALIZE_MAX_TOKENS.get()
@@ -832,6 +834,17 @@ class DeepseekV2MoE(nn.Module):
                         else self.experts.should_fuse_routed_scaling_factor_in_topk
                     ),
                 )
+            # With one expert group the grouped top-k selects the same experts as a
+            # plain top-k, which is one fused softmax top-k kernel instead of several.
+            if (
+                _is_hip
+                and not is_deepseek_v4
+                and config.n_group == 1
+                and config.topk_group == 1
+                and config.scoring_func == "softmax"
+                and self.gate.e_score_correction_bias is None
+            ):
+                topk_kwargs["use_grouped_topk"] = False
             self.topk = TopK(**topk_kwargs)
             self.topk.bind_runner_backend(
                 self.experts.runner_backend,
@@ -1284,7 +1297,7 @@ class DeepseekV2MoE(nn.Module):
             and not _is_musa
             and not (_use_aiter and self.routed_scaling_factor_fused_in_topk)
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
-        ):
+        ) and self._scales_routed_output:
             final_hidden_states *= self.routed_scaling_factor
 
         # Shared expert on alt stream, issued AFTER the main (routed) branch. See note above.
@@ -1482,7 +1495,7 @@ class DeepseekV2MoE(nn.Module):
             and not _is_xpu
             and not (_use_aiter and self.routed_scaling_factor_fused_in_topk)
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
-        ):
+        ) and self._scales_routed_output:
             final_hidden_states *= self.routed_scaling_factor
 
         if (
@@ -2880,10 +2893,11 @@ class DeepseekV2DecoderLayer(nn.Module):
             # Use _is_block_scale_fp8 to distinguish block-scale fp8 (K/128 scale
             # cols, compatible with fused_rms_fp8_group_quant) from per-channel fp8
             # ([N, 1] scale, must use the plain bf16 path).
-            # weight_scale may not be reshaped yet at __init__ time — return
+            # The scale may not be reshaped yet at __init__ time; return
             # "fp8_pending" so _resolve_gfx95_quant_format re-checks on first forward.
-            weight_scale = getattr(proj, "weight_scale", None)
-            if weight_scale is None:
+            # Fp8LinearMethod stores block scales as `weight_scale_inv`, other
+            # methods as `weight_scale`; check both names.
+            if not _has_fp8_weight_scale(proj):
                 return "fp8_pending"
             return "fp8" if _is_block_scale_fp8(proj) else ""
         return ""

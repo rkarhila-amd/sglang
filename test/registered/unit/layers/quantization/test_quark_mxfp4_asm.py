@@ -1,16 +1,28 @@
-"""CPU-only tests for Quark MXFP4 AITER layouts."""
+"""CPU-only tests for Quark MXFP4 AITER GEMM layout helpers and the ROCm
+--fp4-gemm-backend choices (aiter / triton)."""
 
 from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_amd_ci(est_time=5, stage="base-b", runner_config="1-gpu-small-amd")
 
+import argparse
 import unittest
+import warnings
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
+from sglang.srt.arg_groups.choices import FP4_GEMM_RUNNER_BACKEND_CHOICES
+from sglang.srt.environ import envs
+from sglang.srt.layers.quantization import fp4_utils
+from sglang.srt.layers.quantization.fp4_utils import (
+    Fp4GemmRunnerBackend,
+    initialize_fp4_gemm_config,
+    resolve_rocm_fp4_gemm_backend,
+)
 from sglang.srt.layers.quantization.quark.schemes import quark_w4a4_mxfp4
 from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
     _asm_fp4_prequantized_input,
@@ -18,8 +30,147 @@ from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
     _shuffle_asm_fp4_act_scale,
     _swizzle_asm_fp4_scale,
 )
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_hip
 from sglang.test.test_utils import CustomTestCase
+
+
+def _resolve(backend, *, mxfp4=True, legacy_use_aiter_asm=None):
+    return resolve_rocm_fp4_gemm_backend(
+        backend=backend,
+        mxfp4_gemm_supported=mxfp4,
+        legacy_use_aiter_asm=legacy_use_aiter_asm,
+    )
+
+
+class TestFp4GemmBackendCli(CustomTestCase):
+    def test_rocm_backends_parse(self):
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        for backend in ("aiter", "triton"):
+            with self.subTest(backend=backend):
+                args = parser.parse_args(
+                    ["--model", "dummy", "--fp4-gemm-backend", backend]
+                )
+                server_args = ServerArgs.from_cli_args(args)
+                self.assertEqual(server_args.fp4_gemm_runner_backend, backend)
+
+    def test_every_cli_choice_is_a_runner_backend(self):
+        for choice in FP4_GEMM_RUNNER_BACKEND_CHOICES:
+            with self.subTest(choice=choice):
+                self.assertEqual(Fp4GemmRunnerBackend(choice).value, choice)
+
+
+class TestResolveRocmFp4GemmBackend(CustomTestCase):
+    def test_resolution(self):
+        cases = [
+            # (flag, native MXFP4, expected); AITER is opt-in, so auto is Triton.
+            ("auto", True, "triton"),
+            ("auto", False, "triton"),
+            ("aiter", True, "aiter"),
+            ("triton", True, "triton"),
+            ("triton", False, "triton"),
+        ]
+        for backend, mxfp4, expected in cases:
+            with self.subTest(backend=backend, mxfp4=mxfp4):
+                self.assertEqual(_resolve(backend, mxfp4=mxfp4), expected)
+        with self.assertRaisesRegex(ValueError, "native MXFP4"):
+            _resolve("aiter", mxfp4=False)
+
+    def test_legacy_env_is_honored_under_auto(self):
+        cases = [
+            # (legacy value, mxfp4, expected backend)
+            (True, True, "aiter"),
+            # The env var was a no-op without native MXFP4; it must not start raising.
+            (True, False, "triton"),
+            (False, True, "triton"),
+        ]
+        for legacy, mxfp4, expected in cases:
+            with self.subTest(legacy=legacy, mxfp4=mxfp4):
+                with self.assertWarnsRegex(
+                    DeprecationWarning, "SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM"
+                ):
+                    backend = _resolve("auto", mxfp4=mxfp4, legacy_use_aiter_asm=legacy)
+                self.assertEqual(backend, expected)
+
+    def test_explicit_flag_overrides_legacy_env(self):
+        with self.assertWarnsRegex(DeprecationWarning, "ignored"):
+            backend = _resolve("triton", legacy_use_aiter_asm=True)
+        self.assertEqual(backend, "triton")
+
+    def test_no_warning_without_legacy_env(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            self.assertEqual(_resolve("aiter"), "aiter")
+
+
+class TestInitializeFp4GemmConfig(CustomTestCase):
+    def setUp(self):
+        saved = fp4_utils.FP4_GEMM_RUNNER_BACKEND
+        self.addCleanup(setattr, fp4_utils, "FP4_GEMM_RUNNER_BACKEND", saved)
+
+    def _initialize(self, backend, *, is_hip, mxfp4=True):
+        exec_ctx = SimpleNamespace(
+            kernel=SimpleNamespace(fp4_gemm_runner_backend=backend)
+        )
+        with (
+            mock.patch.object(fp4_utils, "get_exec", return_value=exec_ctx),
+            mock.patch.object(fp4_utils, "is_hip", return_value=is_hip),
+            mock.patch.object(fp4_utils, "is_mxfp4_gemm_supported", return_value=mxfp4),
+        ):
+            initialize_fp4_gemm_config()
+        return fp4_utils.get_fp4_gemm_runner_backend()
+
+    def test_rocm_auto(self):
+        for mxfp4, expected in (
+            (True, Fp4GemmRunnerBackend.TRITON),
+            (False, Fp4GemmRunnerBackend.TRITON),
+        ):
+            with self.subTest(mxfp4=mxfp4):
+                with envs.SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM.override(False):
+                    # Restored to the pre-test state when the override exits.
+                    envs.SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM.clear()
+                    backend = self._initialize("auto", is_hip=True, mxfp4=mxfp4)
+                self.assertEqual(backend, expected)
+
+    def test_rocm_legacy_env_reaches_global_backend(self):
+        with envs.SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM.override(True):
+            with self.assertWarns(DeprecationWarning):
+                backend = self._initialize("auto", is_hip=True)
+        self.assertEqual(backend, Fp4GemmRunnerBackend.AITER)
+
+    def test_rocm_only_backends_rejected_off_rocm(self):
+        for backend in ("aiter", "triton"):
+            with self.subTest(backend=backend):
+                with self.assertRaisesRegex(ValueError, "only supported on ROCm"):
+                    self._initialize(backend, is_hip=False)
+
+
+class TestQuarkMxfp4BackendSelection(CustomTestCase):
+    def setUp(self):
+        saved = fp4_utils.FP4_GEMM_RUNNER_BACKEND
+        self.addCleanup(setattr, fp4_utils, "FP4_GEMM_RUNNER_BACKEND", saved)
+
+    def _make_scheme(self, backend):
+        fp4_utils.FP4_GEMM_RUNNER_BACKEND = backend
+        with mock.patch.object(quark_w4a4_mxfp4, "_is_hip", True):
+            return quark_w4a4_mxfp4.QuarkW4A4MXFP4(
+                weight_quant_spec={}, input_quant_spec={}
+            )
+
+    def test_scheme_follows_fp4_gemm_backend(self):
+        self.assertTrue(
+            self._make_scheme(Fp4GemmRunnerBackend.AITER).use_aiter_fp4_gemm
+        )
+        for backend in (
+            # AUTO is what get_fp4_gemm_runner_backend() returns before the
+            # scheduler resolves the flag; it must not enable the AITER path.
+            Fp4GemmRunnerBackend.AUTO,
+            Fp4GemmRunnerBackend.TRITON,
+            Fp4GemmRunnerBackend.FLASHINFER_CUTLASS,
+        ):
+            with self.subTest(backend=backend):
+                self.assertFalse(self._make_scheme(backend).use_aiter_fp4_gemm)
 
 
 class TestQuarkMxfp4AsmScaleLayout(CustomTestCase):
@@ -75,49 +226,139 @@ class TestQuarkMxfp4AsmTupleInput(CustomTestCase):
         expected[:rows, :cols] = scale
         torch.testing.assert_close(unshuffled, expected, rtol=0, atol=0)
 
-    def test_only_quantized_pair_is_accepted(self):
+    def test_quantized_pair_is_passed_through(self):
         rows, k = 4, 64
         x_q = torch.zeros((rows, k // 2), dtype=torch.uint8)
         x_scales = torch.full((rows, k // 32), 0x7F, dtype=torch.uint8)
 
-        a, a_scales = _asm_fp4_prequantized_input((x_q, x_scales))
+        a, a_scales = _asm_fp4_prequantized_input(x_q, x_scales)
         self.assertEqual(a.dtype, torch.float4_e2m1fn_x2)
         self.assertEqual(a.data_ptr(), x_q.data_ptr())
         self.assertEqual(tuple(a_scales.shape), (256, 8))
 
-        # The 3- and 5-tuples ask for Triton-only fused epilogues; they must not
-        # be silently unpacked as (x, x_scales).
-        for fused in ((x_q, x_scales, torch.empty(0)), (x_q,) * 5):
-            with self.assertRaises(NotImplementedError):
-                _asm_fp4_prequantized_input(fused)
 
+class TestQuarkMxfp4AsmFusedEpilogueInputs(CustomTestCase):
+    """The ASM path runs the Triton-only fused epilogues unfused, so every tuple
+    input the Triton path accepts works on a layer that uses gemm_a4w4."""
 
-class TestQuarkMxfp4AsmNarrowLayer(CustomTestCase):
-    def test_narrow_layer_stays_on_triton(self):
-        """With the ASM flag on, a layer with N <= 128 (Qwen3.8 GDN in_proj_ba,
-        N=96) must keep the Triton GEMM: AITER's untuned ASM heuristic returns
-        wrong rows 1..M-1 for it at small batch sizes."""
-        n, k = 96, 5120
-        layer = torch.nn.Module()
-        weight = torch.nn.Parameter(
-            torch.zeros((n, k // 2), dtype=torch.uint8), requires_grad=False
+    M, K, HEADS, S1, S2, ROPE = 3, 64, 2, 4, 6, 5
+
+    def _apply(self, x):
+        n = self.HEADS * (self.S1 + self.S2)
+        layer = _make_mxfp4_layer(n, self.K)
+        layer.use_aiter_asm_fp4_gemm = True
+        self.gemm_out = torch.randn(self.M, n, dtype=torch.bfloat16)
+        scheme = quark_w4a4_mxfp4.QuarkW4A4MXFP4.__new__(
+            quark_w4a4_mxfp4.QuarkW4A4MXFP4
         )
-        layer.weight = weight
-        layer.weight_scale = torch.nn.Parameter(
-            torch.zeros((n, k // 32), dtype=torch.uint8), requires_grad=False
-        )
-        scheme = quark_w4a4_mxfp4.QuarkW4A4MXFP4({}, {})
-
+        scheme.out_dtype = torch.bfloat16
+        quantized = (torch.empty(self.M, self.K // 2), torch.empty(self.M, 1))
+        quant = mock.Mock(return_value=quantized)
         with (
-            mock.patch.object(quark_w4a4_mxfp4, "_use_aiter_asm_fp4_gemm", True),
             mock.patch.object(
-                quark_w4a4_mxfp4, "is_gfx95_supported", return_value=True
+                quark_w4a4_mxfp4, "per_1x32_f4_quant", quant, create=True
+            ),
+            mock.patch.object(
+                quark_w4a4_mxfp4,
+                "_asm_fp4_prequantized_input",
+                return_value=quantized,
+            ) as prequant,
+            mock.patch.object(
+                quark_w4a4_mxfp4,
+                "gemm_a4w4",
+                return_value=self.gemm_out,
+                create=True,
             ),
         ):
-            scheme.process_weights_after_loading(layer)
+            out = scheme.apply_weights(layer, x)
+        return out, quant, prequant
 
+    def test_three_tuple_drops_the_preallocated_output(self):
+        x = torch.randn(self.M, self.K, dtype=torch.bfloat16)
+        unused = torch.zeros(self.M, self.HEADS * (self.S1 + self.S2))
+        out, quant, prequant = self._apply((x, None, unused))
+        quant.assert_called_once()
+        self.assertIs(quant.call_args.args[0], x)
+        prequant.assert_not_called()
+        self.assertIs(out, self.gemm_out)
+
+    def test_three_tuple_with_scales_uses_them(self):
+        x_q = torch.zeros(self.M, self.K // 2, dtype=torch.uint8)
+        x_s = torch.zeros(self.M, self.K // 32, dtype=torch.uint8)
+        out, quant, prequant = self._apply((x_q, x_s, torch.empty(0)))
+        quant.assert_not_called()
+        prequant.assert_called_once_with(x_q, x_s)
+        self.assertIs(out, self.gemm_out)
+
+    def test_five_tuple_matches_split_cat_reference(self):
+        x = torch.randn(self.M, self.K, dtype=torch.bfloat16)
+        k_pe = torch.randn(self.M, 1, self.ROPE, dtype=torch.bfloat16).expand(
+            -1, self.HEADS, -1
+        )
+        (k, v), _, _ = self._apply((x, k_pe, self.S1, self.S2, torch.float32))
+
+        # The docstring reference of aiter's fused_gemm_afp4wfp4_split_cat; like
+        # the Triton path, the outputs take k_pe's dtype.
+        c = self.gemm_out.view(-1, self.HEADS, self.S1 + self.S2)
+        c1, c2 = c.split([self.S1, self.S2], dim=-1)
+        torch.testing.assert_close(k, torch.cat([c1, k_pe], dim=-1), rtol=0, atol=0)
+        torch.testing.assert_close(v, c2, rtol=0, atol=0)
+        self.assertEqual((k.dtype, v.dtype), (k_pe.dtype, k_pe.dtype))
+        self.assertTrue(v.is_contiguous())
+
+
+def _make_mxfp4_layer(n, k):
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(
+        torch.zeros((n, k // 2), dtype=torch.uint8), requires_grad=False
+    )
+    layer.weight_scale = torch.nn.Parameter(
+        torch.zeros((n, k // 32), dtype=torch.uint8), requires_grad=False
+    )
+    return layer
+
+
+class TestQuarkMxfp4AiterLayerSelection(CustomTestCase):
+    N, K = 1024, 5120
+
+    def setUp(self):
+        saved = fp4_utils.FP4_GEMM_RUNNER_BACKEND
+        self.addCleanup(setattr, fp4_utils, "FP4_GEMM_RUNNER_BACKEND", saved)
+
+    def _process(self, backend, n=None):
+        fp4_utils.FP4_GEMM_RUNNER_BACKEND = backend
+        layer = _make_mxfp4_layer(n or self.N, self.K)
+        self.loaded_weight = layer.weight
+        with (
+            mock.patch.object(quark_w4a4_mxfp4, "_is_hip", True),
+            mock.patch.object(
+                quark_w4a4_mxfp4,
+                "shuffle_weight",
+                side_effect=lambda w, layout: w.clone(),
+                create=True,
+            ),
+        ):
+            scheme = quark_w4a4_mxfp4.QuarkW4A4MXFP4({}, {})
+            scheme.process_weights_after_loading(layer)
+        return layer
+
+    def test_only_explicit_aiter_uses_the_aiter_gemm(self):
+        self.assertTrue(
+            self._process(Fp4GemmRunnerBackend.AITER).use_aiter_asm_fp4_gemm
+        )
+        for backend in (Fp4GemmRunnerBackend.AUTO, Fp4GemmRunnerBackend.TRITON):
+            with self.subTest(backend=backend):
+                layer = self._process(backend)
+                self.assertFalse(layer.use_aiter_asm_fp4_gemm)
+                self.assertIs(layer.weight, self.loaded_weight)
+
+    def test_narrow_layer_stays_on_triton(self):
+        """With --fp4-gemm-backend aiter, a layer with N <= 128 (Qwen3.8 GDN
+        in_proj_ba, N=96) must keep the Triton GEMM: AITER's untuned ASM
+        heuristic returns wrong rows 1..M-1 for it at small batch sizes."""
+        layer = self._process(Fp4GemmRunnerBackend.AITER, n=96)
         self.assertFalse(layer.use_aiter_asm_fp4_gemm)
-        self.assertIs(layer.weight, weight)
+        self.assertIs(layer.weight, self.loaded_weight)  # not shuffled for AITER
 
 
 @unittest.skipUnless(is_hip(), "needs a ROCm build with aiter")
@@ -133,6 +374,127 @@ class TestQuarkMxfp4DynamicQuantFake(CustomTestCase):
         self.assertEqual(tuple(x_fp4.shape), (m, n // 2))
         self.assertEqual(tuple(scale.shape), (m, n // 32))
         self.assertEqual(scale.stride(), (1, m))
+
+
+def _shuffle_weight_ref(x: torch.Tensor, layout=(16, 16)) -> torch.Tensor:
+    """AITER shuffle_weight for uint8 (fp4x2) weights, layout (16, 16)."""
+    assert layout == (16, 16)
+    n, k = x.shape
+    return (
+        x.view(1, n // 16, 16, k // 32, 2, 16)
+        .permute(0, 1, 3, 4, 2, 5)
+        .contiguous()
+        .view(n, k)
+    )
+
+
+def _unshuffle_weight(x: torch.Tensor) -> torch.Tensor:
+    n, k = x.shape
+    return x.view(n // 16, k // 32, 2, 16, 16).permute(0, 3, 1, 2, 4).reshape(n, k)
+
+
+def _unswizzle_scale(scale: torch.Tensor) -> torch.Tensor:
+    rows, cols = scale.shape
+    return (
+        scale.view(torch.uint8)
+        .view(rows // 32, cols // 8, 4, 16, 2, 2, 1)
+        .permute(0, 5, 3, 1, 4, 2, 6)
+        .reshape(rows, cols)
+    )
+
+
+_FP4_LUT = torch.tensor(quark_w4a4_mxfp4._MXFP4_VALUES, dtype=torch.float64)
+
+
+def _dequant(codes: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Row-major fp4x2 codes and E8M0 scales to float64, exactly."""
+    rows, k_packed = codes.shape
+    vals = torch.empty(rows, k_packed * 2, dtype=torch.float64)
+    vals[:, 0::2] = _FP4_LUT[(codes & 0xF).long()]
+    vals[:, 1::2] = _FP4_LUT[(codes >> 4).long()]
+    scale = torch.exp2(scale.view(torch.uint8).to(torch.float64) - 127.0)
+    return (vals.view(rows, -1, 32) * scale.unsqueeze(-1)).view(rows, -1)
+
+
+def _asm_gemm_ref(x_q, x_scales, weight, weight_scale) -> torch.Tensor:
+    """gemm_a4w4(bpreshuffle=True) semantics: shuffled weight, swizzled scales.
+    Products and sums of these dyadic values are exact in float64, so the
+    result does not depend on the accumulation order."""
+    m = x_q.shape[0]
+    x = _dequant(x_q, _unswizzle_scale(x_scales)[:m])
+    w = _dequant(_unshuffle_weight(weight), _unswizzle_scale(weight_scale))
+    return x @ w.t()
+
+
+class TestQuarkMxfp4AsmPackedTail(CustomTestCase):
+    def setUp(self):
+        patcher = mock.patch.object(
+            quark_w4a4_mxfp4, "shuffle_weight", _shuffle_weight_ref, create=True
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _rand_proj(n, k, gen):
+        weight = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8, generator=gen)
+        scale = torch.randint(120, 134, (n, k // 32), dtype=torch.uint8, generator=gen)
+        return weight, scale
+
+    def test_packed_rows_match_separate_gemms(self):
+        """Qwen3.8 GDN in_proj packing: qkvz in ASM layout + in_proj_ba (N=96,
+        raw layout) as a zero-padded tail. The shuffle is local to 16 rows and
+        the swizzle to 32, so one GEMM over the packed buffer must reproduce
+        both separate GEMMs exactly, and the padding rows must read zero."""
+        gen = torch.Generator().manual_seed(0)
+        k, n_qkvz, n_ba, m = 256, 512, 96, 5
+        qkvz_w, qkvz_s = self._rand_proj(n_qkvz, k, gen)
+        ba_w, ba_s = self._rand_proj(n_ba, k, gen)
+        # process_weights_after_loading for the ASM layer.
+        qkvz_w_asm = _shuffle_weight_ref(qkvz_w)
+        qkvz_s_asm = _swizzle_asm_fp4_scale(qkvz_s)
+
+        packed = quark_w4a4_mxfp4.pack_asm_fp4_weight_tail(
+            qkvz_w_asm, qkvz_s_asm, ba_w, ba_s
+        )
+        self.assertIsNotNone(packed)
+        weight, scale = packed
+        self.assertEqual(tuple(weight.shape), (n_qkvz + 256, k // 2))
+        self.assertEqual(tuple(scale.shape), (n_qkvz + 256, k // 32))
+        torch.testing.assert_close(weight[:n_qkvz], qkvz_w_asm, rtol=0, atol=0)
+        torch.testing.assert_close(scale[:n_qkvz], qkvz_s_asm, rtol=0, atol=0)
+
+        x_q, x_s = self._rand_proj(m, k, gen)
+        x_s_asm = _shuffle_asm_fp4_act_scale(x_s)
+        out = _asm_gemm_ref(x_q, x_s_asm, weight, scale)
+        x = _dequant(x_q, x_s)
+        torch.testing.assert_close(
+            out[:, :n_qkvz], x @ _dequant(qkvz_w, qkvz_s).t(), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            out[:, n_qkvz : n_qkvz + n_ba],
+            x @ _dequant(ba_w, ba_s).t(),
+            rtol=0,
+            atol=0,
+        )
+        self.assertTrue(bool((out[:, n_qkvz + n_ba :] == 0).all()))
+
+    def test_unpackable_projections_are_rejected(self):
+        """Packing must fall back (None) rather than build a buffer whose
+        leading rows are not whole ASM tiles or whose K differs."""
+        gen = torch.Generator().manual_seed(1)
+        k = 256
+        ba_w, ba_s = self._rand_proj(96, k, gen)
+        pack = quark_w4a4_mxfp4.pack_asm_fp4_weight_tail
+        # Leading rows not a multiple of 256 (whole gemm_a4w4 N tiles).
+        w, s = self._rand_proj(288, k, gen)
+        self.assertIsNone(pack(w, s, ba_w, ba_s))
+        # K mismatch.
+        w, s = self._rand_proj(256, 2 * k, gen)
+        self.assertIsNone(pack(w, s, ba_w, ba_s))
+        # K/32 not a multiple of 8: the scale swizzle does not apply.
+        w, s = self._rand_proj(256, 128, gen)
+        tail_w, tail_s = self._rand_proj(96, 128, gen)
+        self.assertIsNone(pack(w, s, tail_w, tail_s))
 
 
 if __name__ == "__main__":

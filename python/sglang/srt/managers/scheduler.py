@@ -82,6 +82,7 @@ except ImportError:
 import traceback
 
 from sglang.srt.beam_search.coordinator import BeamCoordinator
+from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.configs.model_config import (
     ModelConfig,
     ModelImpl,
@@ -413,6 +414,7 @@ from sglang.srt.utils import (
     DynamicGradMode,
     configure_gc_logging,
     configure_logger,
+    disable_transparent_hugepages,
     freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -1896,9 +1898,16 @@ class Scheduler(
         }
         prefill_backend, _ = attention_backends()
         env_var, default_size = backend_sizes.get(prefill_backend, (None, None))
-        self.truncation_align_size = (
-            get_int_env_var(env_var, default_size) if env_var else None
-        )
+        aligns = []
+        if env_var:
+            aligns.append(get_int_env_var(env_var, default_size))
+        if hybrid_gdn_config(self.model_config) is not None:
+            # Gated DeltaNet prefill sums each chunk in blocks counted from the chunk
+            # start, so a split off this grid changes the result.
+            from sglang.kernels.ops.attention.fla.chunk import CHUNK_SIZE
+
+            aligns.append(CHUNK_SIZE)
+        self.truncation_align_size = math.lcm(*aligns) if aligns else None
 
     def init_dsa_kpool_truncation_align(self):
         """Kpool compress-write asserts chunked extends start on pool boundaries.
@@ -3287,11 +3296,15 @@ class Scheduler(
 
     def _record_kv_event_lora_name(self, req: Req, lora_name: Optional[str]) -> None:
         # Keyed by the final extra_key, so it must run after elastic namespacing.
-        # Only a cache whose events are taken prunes the table.
+        # The default event format namespaces only named LoRA keys, so a rank
+        # that binds hinted storage keys to event IDs needs the name as well.
         if (
             self.kv_events_publisher.enable_kv_cache_events
-            and self.tree_cache.supports_prefix_sharing()
-        ):
+            or (
+                req.kv_hints is not None
+                and self.tree_cache.forwards_kv_hint_actions(req.kv_hints)
+            )
+        ) and self.tree_cache.supports_prefix_sharing():
             self.kv_event_lora_names.register(req, lora_name)
 
     def _maybe_namespace_elastic_radix_cache(self, req: Req) -> None:
@@ -3835,6 +3848,7 @@ class Scheduler(
                     extra_key=req.extra_key,
                     cache_salt=req.cache_salt,
                     storage_hit_end=storage_hit_end,
+                    kv_hints=req.kv_hints,
                 )
 
     def _process_storage_prefetch_retries(self):
@@ -4702,7 +4716,12 @@ class Scheduler(
                 self.page_size,
                 processed_tokens=self.processed_tokens_counter,
             )
-            if adder.add_chunked_req(resumed_req) is None:
+            if (
+                adder.add_chunked_req(
+                    resumed_req, truncation_align_size=self.truncation_align_size
+                )
+                is None
+            ):
                 # Its last chunk is in this batch.
                 move([resumed_req], self.prefill_launched_reqs)
 
@@ -7131,6 +7150,8 @@ def configure_scheduler_process(
     # Set cpu affinity to this gpu process
     if envs.SGLANG_SET_CPU_AFFINITY.get():
         set_gpu_proc_affinity(gpu_id)
+    if envs.SGLANG_DISABLE_THP.get():
+        disable_transparent_hugepages()
     if not envs.SGLANG_NUMA_BIND_V2.get():
         numa_node = get_numa_node_if_available(server_args, gpu_id)
         if numa_node is not None:

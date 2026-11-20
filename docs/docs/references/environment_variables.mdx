@@ -1992,6 +1992,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On gfx95x with <code>SGLANG_USE_AITER=1</code>, quantize the BF16 GDN <code>in_proj_qkvz</code> and <code>out_proj</code> of Qwen3.5 / Qwen3.8 to MXFP4 after load. Projections with N or K not a multiple of 256 stay BF16. Batches of up to 64 rows run the AITER preshuffled MXFP4 GEMM if AITER has a tuned config for the shape. All other batches run the ASM <code>gemm_a4w4</code>. Set to <code>0</code> to keep the BF16 projections.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_GDN_ONLINE_MXFP4_HADAMARD</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Rotate each 32-wide block of the input dimension of the <code>SGLANG_ROCM_GDN_ONLINE_MXFP4</code> projections by the orthonormal 32-point Hadamard matrix before MXFP4: the weight once at load, the activation inside the AITER MXFP4 quant. The product does not change, and the quantization error is lower. Needs AITER with <code>hadamard_rotate</code> on <code>per_1x32_f4_quant_hip</code> (ROCm/aiter#6734). Set to <code>0</code> for plain MXFP4.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+    </tr>
   </tbody>
 </table>
 
@@ -2362,6 +2367,11 @@ MPS and does not read them.
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_CRASH_ON_NUMA_BIND_FAILURE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Crash if NUMA binding fails instead of warning.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DISABLE_THP</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Turn off transparent huge pages in each scheduler process (Linux, <code>prctl(PR_SET_THP_DISABLE)</code>; processes it starts inherit this). With THP on, a first touch of an eligible region zeroes a whole huge page in the faulting thread, and khugepaged collapses pages while holding the process's mmap lock. On kernels with 64K base pages (some Arm servers) a huge page is 512 MB, so either can stall a scheduler for tens of milliseconds, and with DP attention every rank waits for it. Also stops THP for host buffers SGLang marks <code>MADV_HUGEPAGE</code> (hugetlbfs pages from <code>SGLANG_HUGEPAGE_SIZE</code> are not affected).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
   </tbody>

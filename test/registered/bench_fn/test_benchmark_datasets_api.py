@@ -41,6 +41,7 @@ from sglang.benchmark.datasets.generated_shared_prefix import (
 )
 from sglang.benchmark.datasets.image import (
     ImageDataset,
+    get_image_token_id,
     parse_random_image_resolution,
     sample_image_requests,
 )
@@ -603,6 +604,37 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
         self.assertTrue(all(row.image_data for row in rows))
 
+    def test_image_sampler_excludes_image_token_id_from_text(self):
+        image_token_id = 100
+        rows = sample_image_requests(
+            num_requests=4,
+            image_count=1,
+            input_len=4000,
+            output_len=4,
+            range_ratio=1.0,
+            processor=self.processor,
+            image_content="blank",
+            image_format="png",
+            image_resolution="8x8",
+            backend="sglang-oai-chat",
+            random_image_count=False,
+            image_token_id=image_token_id,
+        )
+        for row in rows:
+            ids = self.tokenizer.encode(row.prompt, add_special_tokens=False)
+            self.assertNotIn(image_token_id, ids)
+
+    def test_get_image_token_id_reads_config_for_bare_tokenizer(self):
+        with patch(
+            "sglang.benchmark.datasets.image.AutoConfig.from_pretrained",
+            return_value=SimpleNamespace(image_token_id=7),
+        ) as from_pretrained:
+            # A checkpoint without a multimodal processor loads as a bare tokenizer.
+            self.assertEqual(get_image_token_id(self.tokenizer, "test-model"), 7)
+            # A real processor keeps its own (here unset) image token id.
+            self.assertIsNone(get_image_token_id(self.processor, "test-model"))
+        from_pretrained.assert_called_once_with("test-model", trust_remote_code=True)
+
     def test_image_sampler_chat_backends_use_raw_prompt(self):
         for backend in ("sglang-oai-chat", "vllm-chat", "lmdeploy-chat"):
             with self.subTest(backend=backend):
@@ -752,6 +784,33 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
 
         sampled_pool = set(captured_population["tokens"])
         self.assertFalse(special_token_ids & sampled_pool)
+        self.assertTrue(sampled_pool)
+
+    def test_gen_mm_prompt_excludes_added_vocab_tokens(self):
+        # Media placeholders are not always registered as special tokens: MiniMax-M3
+        # keeps `]<]video[>[` in the added vocabulary only. Sampling one makes the
+        # server look for a video the request never carries, so it answers HTTP 400.
+        tokenizer = create_lightweight_tokenizer()
+        placeholders = ["]<]image[>[", "]<]video[>["]
+        tokenizer.add_tokens(placeholders)
+        placeholder_ids = set(tokenizer.convert_tokens_to_ids(placeholders))
+        # Precondition: these are exactly the tokens `all_special_ids` does not cover.
+        self.assertFalse(placeholder_ids & set(tokenizer.all_special_ids))
+        image_pad_id = tokenizer.convert_tokens_to_ids("]<]image[>[")
+        captured_population = {}
+
+        def fake_choices(population, k):
+            captured_population["tokens"] = population
+            return population[:k]
+
+        with patch(
+            "sglang.benchmark.datasets.common.random.choices",
+            side_effect=fake_choices,
+        ):
+            gen_mm_prompt(tokenizer, image_pad_id, token_num=8)
+
+        sampled_pool = set(captured_population["tokens"])
+        self.assertFalse(placeholder_ids & sampled_pool)
         self.assertTrue(sampled_pool)
 
     def test_gen_mm_prompt_is_independent_of_vocab_order(self):

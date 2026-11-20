@@ -1064,7 +1064,7 @@ class TestWatermarkServerArgs(CustomTestCase):
     def test_unknown_algorithm_refused_with_watermarking_off(self):
         with self.assertRaisesRegex(ValueError, "unknown --watermark-algorithm"):
             validation_hook.check_watermark_server_args(
-                ServerArgs(model_path="dummy", watermark_algorithm="synthid")
+                ServerArgs(model_path="dummy", watermark_algorithm="kirchenbauer")
             )
 
     def test_every_algorithm_choice_has_an_adapter(self):
@@ -1127,6 +1127,25 @@ class TestTokenSpaceProcessorArgs(CustomTestCase):
 
                 with self.assertRaisesRegex(ValueError, "encoder disaggregation"):
                     pd_disaggregation_hook.handle_encoder_disaggregation(server_args)
+
+
+class TestLanguageModelOnlyArchitectures(CustomTestCase):
+    @staticmethod
+    def _handle(architecture):
+        from sglang.srt.arg_groups.model_hook import handle_language_model_only
+
+        server_args = ServerArgs(model_path="dummy", language_model_only=True)
+        server_args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[architecture])
+        )
+        handle_language_model_only(server_args)
+
+    def test_accepts_qwen4_exp(self):
+        self._handle("Qwen4ExpForConditionalGeneration")
+
+    def test_rejects_an_unlisted_architecture(self):
+        with self.assertRaisesRegex(ValueError, "does not support"):
+            self._handle("LlamaForCausalLM")
 
 
 class TestMultimodalFeatureTransport(CustomTestCase):

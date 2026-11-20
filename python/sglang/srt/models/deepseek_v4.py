@@ -30,6 +30,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_q_norm_rope,
     fused_rope_inplace,
 )
+from sglang.kernels.ops.attention.dsv4.opus_sparse_prefill_hip import OpusPackedQ
 from sglang.kernels.ops.attention.dsv4.wo_a import MAX_M as _FUSED_WO_A_MAX_TOKENS
 from sglang.kernels.ops.attention.dsv4.wo_a import (
     can_use_fused_wo_a,
@@ -142,6 +143,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
     check_cuda_graph_backend,
+    cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
@@ -206,12 +208,14 @@ from sglang.srt.models.deepseek_v4_replay_tail import (
     bcg_tail_kv_store,
     in_replay_tail_graph,
 )
-from sglang.srt.models.deepseek_v41_vit import Aligner, ViT
+from sglang.srt.models.deepseek_v41_vit import Aligner, ViT, assemble_image_span
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.deepseek_v41_image_processing import (
     GPU_PLAN_KEY,
-    image_token_types,
     materialize_image_gpu,
+)
+from sglang.srt.multimodal.deepseek_v41_vit_cuda_graph_runner import (
+    DeepseekV41ViTCudaGraphRunner,
 )
 from sglang.srt.runtime_context import (
     get_device,
@@ -2527,7 +2531,15 @@ class MQALayer(MqaAttentionBase):
             q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
             if _is_hip:
                 q, q_lora, fuse_q_rope = _hip.compute_q_b(
-                    self, q_lora, q_for_wqb, positions, q_out, unified, use_cp
+                    self,
+                    q_lora,
+                    q_for_wqb,
+                    positions,
+                    q_out,
+                    unified,
+                    use_cp,
+                    forward_batch=forward_batch,
+                    attn_backend=attn_backend,
                 )
             else:
                 q = self._compute_q_b(q_for_wqb, positions, q_out)
@@ -2593,7 +2605,11 @@ class MQALayer(MqaAttentionBase):
                     forward_batch,
                     attn_backend,
                     qkv_a=qkv_a,
-                    q_rope=q if fuse_q_rope else None,
+                    q_rope=(
+                        (q.q_rope if isinstance(q, OpusPackedQ) else q)
+                        if fuse_q_rope
+                        else None
+                    ),
                 )
                 kv = None
 
@@ -4189,8 +4205,16 @@ class DeepseekV4Model(nn.Module):
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
             attn_backend = get_attn_backend()
-            tail = attn_backend.tail_forward_metadata.late_layer_tail
-            self._check_late_layer_tail_readers(forward_batch, tail)
+            # None inside a HIP prefill CUDA graph: the late layers run every row.
+            # On CUDA the tail is required, so a missing one is a bug.
+            tail_metadata = attn_backend.tail_forward_metadata
+            if tail_metadata is None:
+                assert not (
+                    _is_cuda and attn_backend.enable_decoder_swa_bounded_replay
+                ), "CUDA prefill is missing the SWA tail"
+            else:
+                tail = tail_metadata.late_layer_tail
+                self._check_late_layer_tail_readers(forward_batch, tail)
         tail_in_graph = (
             tail is not None
             and tail.scatter_indices is not None
@@ -4227,6 +4251,7 @@ class DeepseekV4Model(nn.Module):
         # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
         assert not get_forward().sp_active
         state = mhc.HcState(hidden_states)
+        fused_step = _is_hip and _hip.fused_boundary_this_step(forward_batch)
         if _is_cuda:
             residual_batch.start(forward_batch)
             hidden_states = residual_batch.set_written(state, forward_batch)
@@ -4256,7 +4281,7 @@ class DeepseekV4Model(nn.Module):
             if tail is not None and i == self.late_layer_start:
                 if self.tail_writes_source_kv:
                     source = self.layers[i]
-                    if _is_hip and source.hc_boundary_fused:
+                    if fused_step and source.hc_boundary_fused:
                         # The previous FFN hc_post has not run yet, so run it here too.
                         source_x = fused_boundary_attn_input(source, state)
                     else:
@@ -4394,7 +4419,7 @@ class DeepseekV4Model(nn.Module):
                         input_ids_global=input_ids_global,
                     )
                 else:
-                    if _is_hip and self.layers[i].hc_boundary_fused:
+                    if fused_step and self.layers[i].hc_boundary_fused:
                         state = forward_layer_fused_boundary(
                             self,
                             i,
@@ -4888,6 +4913,13 @@ class DeepseekV4ForCausalLM(
             self.image_start = nn.Parameter(torch.empty(config.hidden_size))
             self.image_end = nn.Parameter(torch.empty(config.hidden_size))
             self.image_newline = nn.Parameter(torch.empty(config.hidden_size))
+            # Off with --disable-cuda-graph. The runner keeps at most 16 grids and
+            # skips one-off sizes; one grid took <= 0.6 GiB of graph pool on MI350X.
+            self.vit_graph_runner = None
+            if (_is_cuda or _is_hip) and not cuda_graph_fully_disabled():
+                self.vit_graph_runner = DeepseekV41ViTCudaGraphRunner(
+                    self._encode_image, self.vision.inputs
+                )
         self.model = DeepseekV4Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -4994,6 +5026,20 @@ class DeepseekV4ForCausalLM(
     def pad_input_ids(self, input_ids: array, mm_inputs) -> array:
         return pad_mm_tokens(input_ids, mm_inputs)
 
+    def _encode_image(self, patches, n_vit_h, n_vit_w):
+        features = self.aligner(
+            self.vision(patches, n_vit_h, n_vit_w), n_vit_h, n_vit_w
+        )
+        r = self.config.vision_downsample_ratio
+        return assemble_image_span(
+            features.to(self.image_start.dtype),
+            (n_vit_h + r - 1) // r,
+            (n_vit_w + r - 1) // r,
+            self.image_start,
+            self.image_newline,
+            self.image_end,
+        )
+
     def get_image_feature(self, items):
         """Return complete spans for the shared MM cache and chunk scheduler."""
 
@@ -5009,17 +5055,10 @@ class DeepseekV4ForCausalLM(
                 if plan is not None
                 else pixels.to(dtype)
             )
-            features = self.aligner(self.vision(patches, h, w), h, w)
-            r = self.config.vision_downsample_ratio
-            types = image_token_types((h + r - 1) // r, (w + r - 1) // r).to(device)
-            span = torch.empty(
-                (len(types), self.config.hidden_size), device=device, dtype=dtype
-            )
-            span[types == 0] = self.image_start
-            span[types == 1] = features.to(dtype)
-            span[types == 2] = self.image_newline
-            span[types == 3] = self.image_end
-            spans.append(span)
+            if self.vit_graph_runner is not None:
+                spans.append(self.vit_graph_runner.run(patches, h, w))
+            else:
+                spans.append(self._encode_image(patches, h, w))
         return spans
 
     def _prepare_mm_embeddings(self, input_ids, forward_batch):
@@ -5163,7 +5202,16 @@ class DeepseekV4ForCausalLM(
             and self.model.late_layer_start is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
-            return get_attn_backend().tail_forward_metadata.late_layer_tail
+            attn_backend = get_attn_backend()
+            # None inside a HIP prefill CUDA graph: the late layers run every row.
+            # On CUDA the tail is required, so a missing one is a bug.
+            tail_metadata = attn_backend.tail_forward_metadata
+            if tail_metadata is None:
+                assert not (
+                    _is_cuda and attn_backend.enable_decoder_swa_bounded_replay
+                ), "CUDA prefill is missing the SWA tail"
+                return None
+            return tail_metadata.late_layer_tail
         return None
 
     def postprocess_cp_output(self, hidden_states, forward_batch):

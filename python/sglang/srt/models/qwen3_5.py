@@ -25,7 +25,10 @@ from safetensors.torch import load_file
 from transformers.utils import cached_file
 
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
-from sglang.kernels.ops.attention.fla.layernorm_gated import _layer_norm_fwd
+from sglang.kernels.ops.attention.fla.layernorm_gated import (
+    _layer_norm_fwd,
+    quant_heads_num_warps,
+)
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat_contiguous,
     qwen3_5_gdn_prefill_projection_views,
@@ -166,6 +169,11 @@ _is_hip = is_hip()
 _QWEN3_5_MOE_TEXT_MODEL_TYPES = ("qwen3_5_moe_text", "qwen4_exp_text")
 # qwen4_exp shares these classes, but the ROCm packed path is Qwen3.5-only.
 _QWEN3_5_ROCM_PACKED_MODEL_TYPES = ("qwen3_5_text", "qwen3_5_moe_text")
+# Row caps of the ROCm packed in_proj GEMM, measured on MI355X. MXFP4 goes up to
+# 256 rows only under CUDA-graph capture; eager extends keep 64 so short
+# prefills do not JIT extra quant/GEMM variants.
+_ROCM_PACKED_IN_PROJ_MAX_M = 64
+_ROCM_PACKED_MXFP4_IN_PROJ_GRAPH_MAX_M = 256
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
@@ -293,6 +301,10 @@ if _is_npu:
     )
 
 
+# A producer quantizes for its linear when the forward has at most this many tokens, whatever its mode.
+_FP8_TUPLE_MAX_TOKENS = 256
+
+
 def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
     quant_method = getattr(linear, "quant_method", None)
     return quant_method.__class__.__name__ == "Fp8LinearMethod" and (
@@ -301,19 +313,31 @@ def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
     )
 
 
-def _fp8_tuple_input(linear: nn.Module, num_tokens: int) -> bool:
-    """Whether the producer hands ``linear`` a per-token FP8 (q, scale) pair for the gfx950 small-M FP8 GEMM."""
+def _fp8_tuple_input(linear: nn.Module, num_tokens: int, dtype: torch.dtype) -> bool:
+    """Whether the producer hands ``linear`` a per-token FP8 (q, scale) pair: the one apply_fp8_linear's own
+    per-token quant of the producer's BF16 output gives it, for at most ``_FP8_TUPLE_MAX_TOKENS`` tokens."""
     scheme = getattr(linear, "scheme", None)
     return (
         _use_aiter
-        and num_tokens > 0
+        # gfx950: the producers quantize to e4m3fn and the launch shapes are checked there
+        and _is_gfx95
+        and 0 < num_tokens <= _FP8_TUPLE_MAX_TOKENS
+        # the GEMM returns BF16
+        and dtype == torch.bfloat16
         and type(scheme).__name__ == "QuarkW8A8Fp8"
         and scheme.per_token
         and scheme.weight_qscheme == "per_channel"
-        and smallm_fp8_gemm_config(num_tokens, *linear.weight.shape[::-1]) is not None
+        # None: an output width the GEMM cannot take, served dequantized
+        and linear.weight_scale is not None
         and not torch.compiler.is_compiling()
         and not get_forward().sp_active
-        and smallm_fp8_gemm_enabled()
+    )
+
+
+def _smallm_fp8_gemm_takes(linear: nn.Module, num_tokens: int) -> bool:
+    return (
+        smallm_fp8_gemm_enabled()
+        and smallm_fp8_gemm_config(num_tokens, *linear.weight.shape[::-1]) is not None
     )
 
 
@@ -416,6 +440,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self._fused_in_proj_qkvz_width = 0
         self._fused_in_proj_ba_width = 0
         self._fused_in_proj_scale: Optional[torch.Tensor] = None
+        self._fused_in_proj_mxfp4 = False
         self._fused_in_proj_sources = None
         self._derived_weight_cache_error = None
         self._fused_input_proj_cpu_enabled = LazyValue(
@@ -526,7 +551,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     and proj.weight.dtype == torch.bfloat16
                     and all(d % 256 == 0 for d in proj.weight.shape)
                 ):
-                    proj.quant_method = AiterMxfp4OnlineLinearMethod()
+                    proj.quant_method = AiterMxfp4OnlineLinearMethod(
+                        envs.SGLANG_ROCM_GDN_ONLINE_MXFP4_HADAMARD.get()
+                    )
 
     @staticmethod
     def _override_weight_loader(param, loader):
@@ -724,7 +751,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         return query, key, value, z, b, a
 
     def finalize_fused_in_proj(self) -> None:
-        """Prepare one BF16 or FP8 GEMM for both input projections.
+        """Prepare one BF16, FP8 or MXFP4 GEMM for both input projections.
 
         BF16 parameters alias the packed rows. FP8 keeps the original layouts
         for the separate path and publishes its derived-cache update constraint.
@@ -743,7 +770,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         if _use_aiter and not get_bool_env_var("SGLANG_QWEN35_PACKED_IN_PROJ", "True"):
             return
         qkvz, ba = self.in_proj_qkvz, self.in_proj_ba
-        if _use_aiter and self._finalize_fused_fp8_in_proj():
+        if _use_aiter and (
+            self._finalize_fused_fp8_in_proj() or self._finalize_fused_mxfp4_in_proj()
+        ):
             return
         if not (
             isinstance(qkvz.quant_method, UnquantizedLinearMethod)
@@ -829,6 +858,83 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
         return True
 
+    def _finalize_fused_mxfp4_in_proj(self) -> bool:
+        """Pack Quark MXFP4 projections for one AITER ASM FP4 GEMM.
+
+        in_proj_qkvz runs the ASM GEMM; in_proj_ba is too narrow for it
+        (N <= 128) and keeps its raw layout for the Triton GEMM, so the packed
+        GEMM gets a shuffled, zero-padded copy of its rows. in_proj_qkvz
+        aliases the packed rows.
+        """
+        from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+            QuarkW4A4MXFP4,
+            pack_asm_fp4_weight_tail,
+        )
+
+        qkvz, ba = self.in_proj_qkvz, self.in_proj_ba
+        if not (
+            all(
+                type(getattr(proj, "scheme", None)) is QuarkW4A4MXFP4
+                and not getattr(proj, "dequantized_bf16", False)
+                and proj.bias is None
+                and proj.weight.is_cuda
+                for proj in (qkvz, ba)
+            )
+            and getattr(qkvz, "use_aiter_asm_fp4_gemm", False)
+            and not getattr(ba, "use_aiter_asm_fp4_gemm", False)
+        ):
+            return False
+        # Same uniform derived-cache constraint as the FP8 packer.
+        if get_parallel().pp_size != 1:
+            return False
+        packed = pack_asm_fp4_weight_tail(
+            qkvz.weight.data,
+            qkvz.weight_scale.data,
+            ba.weight.data,
+            ba.weight_scale.data,
+        )
+        if packed is None:
+            return False
+        weight, scale = packed
+        qkvz_width, ba_width = qkvz.weight.shape[0], ba.weight.shape[0]
+        qkvz.weight.data = weight[:qkvz_width]
+        qkvz.weight_scale.data = scale[:qkvz_width]
+        self._fused_in_proj_weight = weight
+        self._fused_in_proj_scale = scale
+        self._fused_in_proj_mxfp4 = True
+        self._fused_in_proj_qkvz_width = qkvz_width
+        self._fused_in_proj_ba_width = ba_width
+        self._fused_in_proj_sources = tuple(
+            (value, value.data_ptr(), None if value.is_inference() else value._version)
+            for proj in (qkvz, ba)
+            for value in (proj.weight, proj.weight_scale)
+        )
+        self._derived_weight_cache_error = (
+            "Online weight updates are not supported with packed MXFP4 GDN input "
+            "projections: captured graphs retain a packed copy of in_proj_ba. "
+            "Restart with SGLANG_QWEN35_PACKED_IN_PROJ=0 before updating weights."
+        )
+        return True
+
+    def _packed_mxfp4_in_proj(self, x_q: torch.Tensor, x_scales: torch.Tensor):
+        """The packed MXFP4 GEMM on an fp4x2 input with ASM-layout scales."""
+        from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+            gemm_a4w4,
+        )
+
+        fused_out = gemm_a4w4(
+            x_q,
+            self._fused_in_proj_weight,
+            x_scales,
+            self._fused_in_proj_scale,
+            torch.empty(0, dtype=self.in_proj_qkvz.scheme.out_dtype, device=x_q.device),
+        )
+        split = self._fused_in_proj_qkvz_width
+        return (
+            fused_out[:, :split],
+            fused_out[:, split : split + self._fused_in_proj_ba_width],
+        )
+
     def _fused_fp8_in_proj_sources_valid(self) -> bool:
         current = tuple(
             value
@@ -852,12 +958,25 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             # decode/verify-sized batches, so larger batches keep the separate
             # projections below.
             x = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+            max_m = (
+                _ROCM_PACKED_MXFP4_IN_PROJ_GRAPH_MAX_M
+                if self._fused_in_proj_mxfp4 and get_is_capture_mode()
+                else _ROCM_PACKED_IN_PROJ_MAX_M
+            )
             if (
                 x.dtype == torch.bfloat16
-                and 0 < x.shape[0] <= 64
+                and 0 < x.shape[0] <= max_m
                 and not torch.compiler.is_compiling()
             ):
-                if self._fused_in_proj_scale is not None:
+                if self._fused_in_proj_mxfp4:
+                    if self._fused_fp8_in_proj_sources_valid():
+                        from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+                            per_1x32_f4_quant,
+                        )
+
+                        # Shuffled, 256-row-padded scales: the packed GEMM's layout.
+                        return self._packed_mxfp4_in_proj(*per_1x32_f4_quant(x))
+                elif self._fused_in_proj_scale is not None:
                     if self._fused_fp8_in_proj_sources_valid():
                         from sglang.srt.layers.quantization.fp8_utils import (
                             apply_fp8_linear,
@@ -1084,7 +1203,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out = core_attn_out_pad
 
         nv = self.num_v_heads // self.attn_tp_size
-        if not use_strided_prefill_z and _fp8_tuple_input(self.out_proj, len(z) // nv):
+        if (
+            not use_strided_prefill_z
+            and _fp8_tuple_input(self.out_proj, len(z) // nv, z.dtype)
+            # without a launch that rounds as the unfused one does, the norm and the quant stay two
+            # launches; the small-M GEMM's shapes keep the launch they always had
+            and (
+                quant_heads_num_warps(len(z), z.shape[-1], nv, z.device) is not None
+                or _smallm_fp8_gemm_takes(self.out_proj, len(z) // nv)
+            )
+        ):
             fp8, _, _ = _layer_norm_fwd(
                 core_attn_out,
                 self.norm.weight,
@@ -1628,7 +1756,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
-            if _fp8_tuple_input(self.o_proj, attn_output.shape[0]):
+            if _fp8_tuple_input(self.o_proj, attn_output.shape[0], attn_output.dtype):
                 attn_output = fused_sigmoid_mul(attn_output, gate, quant=True)
             elif not _is_npu:
                 attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
@@ -1874,22 +2002,27 @@ class Qwen3_5ForCausalLM(nn.Module):
         if _use_aiter and self.config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES:
             packed = 0
             mxfp4 = 0
+            hadamard = 0
             for module in self.modules():
                 if isinstance(module, Qwen3_5GatedDeltaNet):
-                    mxfp4 += sum(
-                        hasattr(getattr(module, name, None), "mxfp4_preshuffle_tuned")
-                        for name in _gdn_online_mxfp4
-                    )
+                    for name in _gdn_online_mxfp4:
+                        proj = getattr(module, name, None)
+                        mxfp4 += hasattr(proj, "mxfp4_preshuffle_tuned")
+                        hadamard += getattr(
+                            getattr(proj, "quant_method", None), "hadamard", False
+                        )
                     module.finalize_fused_in_proj()
                     packed += int(module._fused_in_proj_weight is not None)
             logger.info(
-                "Packed BF16/FP8 GDN input projection enabled for %d layers", packed
+                "Packed BF16/FP8/MXFP4 GDN input projection enabled for %d layers",
+                packed,
             )
             if _gdn_online_mxfp4:
                 logger.info(
-                    "Online MXFP4 GDN %s: %d projections",
+                    "Online MXFP4 GDN %s: %d projections, %d with Hadamard-32",
                     ",".join(_gdn_online_mxfp4),
                     mxfp4,
+                    hadamard,
                 )
 
     def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
@@ -2430,6 +2563,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
     def should_apply_lora(self, module_name: str) -> bool:
         return module_name.startswith("model.layers.")
+
+    def prepare_before_cuda_graph_capture(self, model_runner) -> None:
+        self.model.prepare_before_cuda_graph_capture(model_runner)
 
     @property
     def start_layer(self) -> int:

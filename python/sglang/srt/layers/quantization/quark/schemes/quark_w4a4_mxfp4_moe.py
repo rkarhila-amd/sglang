@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import functools
 import logging
+import os
 import threading
 from typing import TYPE_CHECKING, Any
 
@@ -18,18 +20,21 @@ from sglang.srt.layers.quantization.dequantization import (
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.mxfp4 import (
+    _aiter_situ_uses_a4w4,
     _aiter_situ_uses_gu_interleaved_weights,
 )
 from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
 from sglang.srt.layers.quantization.quark.utils import Nvfp4SourceConfig
 from sglang.srt.layers.utils.common import set_weight_attrs
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import (
     get_bool_env_var,
     is_gfx95_supported,
     is_gfx1250_supported,
     is_hip,
 )
+from sglang.srt.utils.aiter_tuned_tables import _aiter_has_flydsl
 
 NVFP4_BLOCK_SIZE = 16
 
@@ -119,8 +124,106 @@ OCP_MX_BLOCK_SIZE = 32
 _arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] if _is_hip else ""
 # gfx120, not gfx12: gfx1250 (MI455) also starts with gfx12 and must stay on AITER.
 _is_consumer_rdna = _arch.startswith(("gfx11", "gfx120"))
-_use_triton_w4a16 = _is_consumer_rdna
+# gfx942 (CDNA3) has no FP4 MoE kernel (FP4 instances are gfx950-only), so it
+# runs the MXFP4 MoE through the same W4A16 upcast path as consumer RDNA.
+_use_triton_w4a16 = _is_consumer_rdna or _arch == "gfx942"
 _TRITON_W4A16_NUM_WARPS = 8
+
+# AITER's FlyDSL W4A4 MoE tiles an intermediate width that is not a multiple of
+# 256 columns by 128 (pick_flydsl_stage2_tile_k), so it needs 128 columns (64
+# packed bytes) of alignment where AITER's generic one is 256; vLLM pads its
+# AITER W4A4 MoE the same way (vllm-project/vllm#55104).
+FLYDSL_MXFP4_PADDING_SIZE = 64
+
+
+@functools.cache
+def _aiter_refuses_unaligned_cktile_mxfp4() -> bool:
+    """Whether aiter refuses its CK-Tile MXFP4 stage 2 at an intermediate width
+    that is not a multiple of 256 (ROCm/aiter#5232); before, that kernel read
+    the wrong scale groups there. No capability flag exists, hence the probe;
+    an aiter whose source cannot be read keeps the generic alignment."""
+    import inspect
+
+    try:
+        import aiter.fused_moe
+
+        source = inspect.getsource(aiter.fused_moe)
+    except (ImportError, OSError, TypeError):
+        return False
+    return "requires inter_dim to be a multiple of 256" in source
+
+
+def _pads_for_flydsl_mxfp4(layer: torch.nn.Module) -> bool:
+    """Whether AITER runs this layer's MoE on its FlyDSL W4A4 kernels.
+
+    Covers plain Silu (no SwiGLU clamp), which AITER sends to FlyDSL when
+    AITER_FLYDSL_FORCE is "1", its default and its parse. The AMD monokernels
+    read these weights at the generic alignment.
+    """
+    cfg = layer.moe_runner_config
+    return (
+        _is_gfx95
+        and cfg.activation == "silu"
+        and not cfg.swiglu_limit
+        and cfg.gemm1_clamp_limit is None
+        and os.environ.get("AITER_FLYDSL_FORCE", "1") == "1"
+        and not get_exec().kernel.enable_amd_monokernel
+        and _aiter_has_flydsl()
+        and _aiter_refuses_unaligned_cktile_mxfp4()
+    )
+
+
+def _smallm_takes_only_the_generic_width(
+    layer: torch.nn.Module, hidden_size: int, intermediate_size: int
+) -> bool:
+    """Whether SGLang's gfx950 small-M MXFP4 MoE kernel serves this layer's
+    small batches at AITER's generic alignment but not at the FlyDSL one.
+
+    The FlyDSL alignment would move those batches to AITER, which runs them up
+    to 2x slower (Qwen3.5-397B-A17B at TP8, 128 columns, <= 8 rows). Asks the
+    kernel's own support check about a one-row call at each width.
+    """
+    cfg = layer.moe_runner_config
+    # Under EP the dispatcher hands AITER an expert mask, which the kernel
+    # refuses; a FusedMoE built without top_k leaves the routing width unknown.
+    if layer.moe_ep_size > 1 or cfg.top_k is None:
+        return False
+    from sglang.kernels.ops.moe.smallm_moe_gfx950 import smallm_moe_supported
+
+    meta = functools.partial(torch.empty, device="meta")
+
+    def takes(aiter_padding_size):
+        w13_up_dim, w2_down_dim, _ = get_moe_weight_sizes(
+            intermediate_size,
+            is_concat=True,
+            is_packed=True,
+            is_aiter_moe=True,
+            aiter_padding_size=aiter_padding_size,
+        )
+        return smallm_moe_supported(
+            hidden_states=meta(1, hidden_size, dtype=cfg.params_dtype),
+            w13=meta(1, w13_up_dim, hidden_size // 2, dtype=torch.uint8),
+            w2=meta(1, hidden_size, w2_down_dim, dtype=torch.uint8),
+            topk_ids=meta(1, cfg.top_k, dtype=torch.int32),
+            expert_mask=None,
+            doweight_stage1=False,
+            activation_is_silu=cfg.activation == "silu",
+            has_bias=False,
+            a1_scale=None,
+        )
+
+    return takes(None) and not takes(FLYDSL_MXFP4_PADDING_SIZE)
+
+
+def _clamped_swiglu_oai(
+    gate_up: torch.Tensor, intermediate_size: int, alpha: float, limit: float
+) -> torch.Tensor:
+    """Clamped SwiGLU-OAI (gpt-oss / MiniMax-M3) over split gate/up halves.
+    Mirrors aiter.fused_moe.swiglu(); assumes gemm1_beta == 1."""
+    gate_up = gate_up.view(-1, 2 * intermediate_size)
+    gate = gate_up[..., :intermediate_size].clamp(max=limit)
+    up = gate_up[..., intermediate_size:].clamp(min=-limit, max=limit)
+    return gate * torch.sigmoid(alpha * gate) * (up + 1)
 
 
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
@@ -286,6 +389,16 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             is_aiter_moe=pad_for_aiter,
             is_concat=True,
             is_packed=True,
+            aiter_padding_size=(
+                FLYDSL_MXFP4_PADDING_SIZE
+                if pad_for_aiter
+                and self.is_checkpoint_mxfp4_serialized
+                and _pads_for_flydsl_mxfp4(layer)
+                and not _smallm_takes_only_the_generic_width(
+                    layer, hidden_size, intermediate_size_per_partition
+                )
+                else None
+            ),
         )
         layer.hidden_pad = 0
         layer.intermediate_pad = w13_up_dim // 2 - intermediate_size_per_partition
@@ -952,18 +1065,19 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
         layer.w2_weight = torch.nn.Parameter(qw2_weight, requires_grad=False)
 
-    def _shuffle_gu_interleaved(self, layer: torch.nn.Module) -> None:
-        """Preshuffle into the GU-interleaved layout the a16w4/a8w4 kernels read.
+    def _shuffle_a16w4(self, layer: torch.nn.Module, gate_up: bool) -> None:
+        """Preshuffle for the A16W4 / A8W4 kernels: w13 gate/up-interleaved
+        when ``gate_up`` (A8W4), separated otherwise (A16W4).
 
         Scales stay 2-D; opus_moe rejects the 3-D form the a4w4 path keeps.
         """
         num_experts = layer.w13_weight_scale.shape[0]
 
-        layer.w13_weight.data = shuffle_weight_a16w4(layer.w13_weight, 16, True)
+        layer.w13_weight.data = shuffle_weight_a16w4(layer.w13_weight, 16, gate_up)
         w13_weight_scale = shuffle_scale_a16w4(
             layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]),
             num_experts,
-            True,
+            gate_up,
         )
         layer.w2_weight.data = shuffle_weight_a16w4(layer.w2_weight, 16, False)
         w2_weight_scale = shuffle_scale_a16w4(
@@ -1016,16 +1130,19 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             assert layer.w13_weight_scale.dtype == torch.uint8
             assert layer.w2_weight_scale.dtype == torch.uint8
 
-        # AITER picks the SiTUv2 activation dtype at runtime: A8W4 and the
-        # A16W4 default read the preshuffled GU-interleaved layout, only A4W4
-        # reads the separated layout below. The mxfp4 MoE method agrees.
+        # AITER picks the SiTUv2 activation dtype at runtime. A8W4 reads the
+        # GU-interleaved layout and the A16W4 default the separated one, both
+        # with 2-D scales from _shuffle_a16w4. A4W4 takes the generic path
+        # below. The mxfp4 MoE method agrees.
         if (
             _is_shuffle_moe_mxfp4
             and not _is_gfx1250
             and layer.moe_runner_config.activation == "situ"
-            and _aiter_situ_uses_gu_interleaved_weights()
+            and not _aiter_situ_uses_a4w4()
         ):
-            self._shuffle_gu_interleaved(layer)
+            self._shuffle_a16w4(
+                layer, gate_up=_aiter_situ_uses_gu_interleaved_weights()
+            )
             if hasattr(layer, "dispatcher"):
                 layer.dispatcher.set_quant_config(
                     build_dispatcher_quant_config(
@@ -1034,6 +1151,26 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
                         AiterQuantType.PER_1X32,
                         gate_up_interleaved=_is_gfx1250,
                     )
+                )
+            return
+
+        # Deterministic mode runs SwiGLU and gated SiLU experts through AITER's
+        # deterministic fused_moe, which takes gate/up-interleaved weights.
+        from sglang.srt.layers.moe.moe_runner.aiter import (
+            aiter_deterministic_moe_covers,
+        )
+
+        if (
+            _is_shuffle_moe_mxfp4
+            and not _is_gfx1250
+            and get_exec().deterministic.enable_deterministic_inference
+            and aiter_deterministic_moe_covers(layer.moe_runner_config)
+        ):
+            self._shuffle_gu_interleaved(layer)
+            layer.w13_gu_interleaved = True
+            if hasattr(layer, "dispatcher"):
+                layer.dispatcher.set_quant_config(
+                    {"weight_dtype": torch.float4_e2m1fn_x2}
                 )
             return
 
@@ -1162,10 +1299,25 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             from aiter.ops.flydsl.moe_common import GateMode
 
             # Quark checkpoints store gate and up projections as separate
-            # contiguous row ranges. Keep that ordering for correctness.
-            _fused_moe_kwargs = {"gate_mode": GateMode.SEPARATED.value}
+            # contiguous row ranges. Keep that ordering for correctness, unless the
+            # weights were preshuffled GU-interleaved (deterministic mode).
+            _fused_moe_kwargs = {
+                "gate_mode": (
+                    GateMode.INTERLEAVE.value
+                    if getattr(layer, "w13_gu_interleaved", False)
+                    else GateMode.SEPARATED.value
+                )
+            }
         else:
             _fused_moe_kwargs = None
+
+        swiglu_oai_limit = aiter_swiglu_oai_limit(self.moe_runner_config)
+        # The pad rows are zero-filled, so computing them is exact; declaring them
+        # makes AITER's CK-Tile SwiGLU-OAI stage 1 wrong on the separated gate/up
+        # layout (ROCm/aiter#3862).
+        intermediate_pad = (
+            0 if swiglu_oai_limit is not None else getattr(layer, "intermediate_pad", 0)
+        )
 
         quant_info = AiterMoeQuantInfo(
             w13_weight=w13_weight,
@@ -1175,11 +1327,9 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             w2_scale=layer.w2_weight_scale,
             expert_mask=layer.dispatcher.expert_mask_gpu,
             hidden_pad=getattr(layer, "hidden_pad", 0),
-            intermediate_pad=getattr(layer, "intermediate_pad", 0),
+            intermediate_pad=intermediate_pad,
             swiglu_limit=(
-                aiter_swiglu_oai_limit(self.moe_runner_config)
-                or self.moe_runner_config.swiglu_limit
-                or 0.0
+                swiglu_oai_limit or self.moe_runner_config.swiglu_limit or 0.0
             ),
             fused_moe_kwargs=_fused_moe_kwargs,
         )
@@ -1194,22 +1344,12 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         assert self.moe_runner_config.activation == "silu", (
             f"The W4A16 triton path only supports silu, got {self.moe_runner_config.activation}"
         )
-        # silu_and_mul below is plain SwiGLU on split gate/up halves; the clamped /
-        # alpha-scaled variants (e.g. gpt-oss, DeepSeek-V4) would be silently wrong.
+        # Clamped SwiGLU-OAI (gemm1_alpha, gemm1_clamp_limit) is applied in
+        # _apply_triton_w4a16; only gemm1_beta != 1 is unsupported here.
         cfg = self.moe_runner_config
-        unsupported = {
-            name: value
-            for name, value in (
-                ("gemm1_alpha", cfg.gemm1_alpha),
-                ("gemm1_beta", cfg.gemm1_beta),
-                ("gemm1_clamp_limit", cfg.gemm1_clamp_limit),
-                ("swiglu_limit", cfg.swiglu_limit or None),
-            )
-            if value is not None
-        }
-        if unsupported:
+        if cfg.gemm1_beta not in (None, 1, 1.0):
             raise NotImplementedError(
-                f"The W4A16 triton path does not support SwiGLU variants: {unsupported}"
+                f"W4A16 triton path supports gemm1_beta=1, got {cfg.gemm1_beta}"
             )
         logger.info_once(
             "Quark MXFP4 MoE on consumer RDNA: no FP4 hardware, running the W4A4 MXFP4 "
@@ -1278,10 +1418,23 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             gather_indx=gather,
             precision_config=self.w13_precision_config,
         )
-        act = torch.empty(
-            (gate_up.shape[0], self.intermediate_size), dtype=x.dtype, device=x.device
+        clamp_limit = float(
+            self.moe_runner_config.gemm1_clamp_limit
+            or self.moe_runner_config.swiglu_limit
+            or 0.0
         )
-        silu_and_mul(gate_up.view(-1, 2 * self.intermediate_size), act)
+        if clamp_limit:
+            alpha = float(self.moe_runner_config.gemm1_alpha or 1.702)
+            act = _clamped_swiglu_oai(
+                gate_up, self.intermediate_size, alpha, clamp_limit
+            ).to(x.dtype)
+        else:
+            act = torch.empty(
+                (gate_up.shape[0], self.intermediate_size),
+                dtype=x.dtype,
+                device=x.device,
+            )
+            silu_and_mul(gate_up.view(-1, 2 * self.intermediate_size), act)
         out = matmul(
             act,
             self.w2_triton_weight,

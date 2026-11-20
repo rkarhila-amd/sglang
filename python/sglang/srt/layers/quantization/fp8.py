@@ -2207,10 +2207,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 padded_inter = (
                     (inter_per_part + fp4_k_align - 1) // fp4_k_align * fp4_k_align
                 )
-                # Record the padding so fused_moe is told the real intermediate size
-                # (aiter fused_moe needs intermediate_pad = padded - real; ATOM passes
-                # 128, SGLang previously defaulted to 0 -> computed the padded region).
-                layer.intermediate_pad = padded_inter - inter_per_part
+                # Compute the zero-padded region; declaring it leaves AITER scratch
+                # unwritten while some stage-2 kernels still read those columns.
+                layer.intermediate_pad = 0
                 layer.hidden_pad = 0
                 if padded_inter != inter_per_part:
                     pad_amount = padded_inter - inter_per_part
@@ -2322,6 +2321,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         )
                 layer.w13_weight.is_shuffled = is_shuffled
                 layer.w2_weight.is_shuffled = is_shuffled
+                if is_shuffled:
+                    layer._aiter_gate_up_interleaved = bool(gu_intv)
                 if get_moe_a2a_backend().is_megamoe():
                     from sglang.srt.layers.moe.mega_moe import (
                         build_mega_moe_experts_weights,
@@ -3256,6 +3257,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             torch.cuda.empty_cache()
 
+    def _deterministic_fp8_experts_on_triton(self) -> bool:
+        """Deterministic mode runs FP8 experts through the Triton runner on ROCm: with
+        AITER's FP8 MoE a token's result depends on its batch, while the Triton runner
+        uses one fixed config in deterministic mode."""
+        from sglang.srt.runtime_context import get_exec
+
+        return (
+            get_exec().deterministic.enable_deterministic_inference
+            and not self.is_fp4_expert
+            and not self.use_mxfp8
+            and not _use_hip_int4
+        )
+
     def _resolve_moe_runner_backend(self) -> MoeRunnerBackend:
         moe_runner_backend = get_moe_runner_backend()
 
@@ -3266,6 +3280,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 _is_hip
                 and (_use_aiter or _use_hip_int4)
                 and get_moe_a2a_backend().supports_aiter()
+                and not self._deterministic_fp8_experts_on_triton()
             ):
                 moe_runner_backend = MoeRunnerBackend.AITER
             else:
@@ -3776,10 +3791,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         fused_moe_kwargs = None
         gate_up_interleaved = getattr(layer, "_aiter_gate_up_interleaved", None)
-        if (
-            gate_up_interleaved is not None
-            and (self.moe_runner_config.swiglu_limit or 0.0) > 0
-        ):
+        if gate_up_interleaved is not None:
             from aiter.ops.flydsl.moe_common import GateMode
 
             fused_moe_kwargs = {
