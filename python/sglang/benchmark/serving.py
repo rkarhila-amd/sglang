@@ -41,7 +41,7 @@ import requests
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
-from sglang.benchmark.datasets import DatasetRow, get_dataset
+from sglang.benchmark.datasets import DATASET_RESULT_ARG_KEYS, DatasetRow, get_dataset
 from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
 from sglang.benchmark.goodput import (
     GOODPUT_SLO_METRICS,
@@ -56,6 +56,7 @@ from sglang.benchmark.utils import (
 )
 from sglang.srt.constants import ROUTING_KEY_HEADER
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
+from sglang.srt.environ import envs
 from sglang.srt.utils.auth import admin_auth_headers
 from sglang.srt.utils.network import resolve_base_url, resolve_host_port
 
@@ -66,12 +67,6 @@ TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) a
 )
 
 global args
-
-
-# don't want to import sglang package here
-def _get_bool_env_var(name: str, default: str = "false") -> bool:
-    value = os.getenv(name, default)
-    return value.lower() in ("true", "1")
 
 
 def _create_bench_client_session():
@@ -888,7 +883,7 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
 
                 output_dir = getattr(args, "profile_output_dir", None)
                 if output_dir is None:
-                    output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
+                    output_dir = envs.SGLANG_TORCH_PROFILER_DIR.get()
                 output_dir = Path(os.path.abspath(os.path.normpath(output_dir))) / str(
                     time.time()
                 )
@@ -1100,6 +1095,10 @@ async def get_request(
     slowdown_factor: float = 1.0,
 ) -> AsyncGenerator[DatasetRow, None]:
     if use_trace_timestamps:
+        if any(request.timestamp is None for request in input_requests):
+            raise ValueError(
+                "--use-trace-timestamps requires every request to have a timestamp"
+            )
         print(
             f"Using trace timestamps for request generation with slowdown factor {slowdown_factor}."
         )
@@ -1384,6 +1383,17 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
     return f
 
 
+def _dataset_specific_args(args: argparse.Namespace) -> Dict[str, Any]:
+    """Return dataset-shaping args relevant to ``args.dataset_name``.
+
+    For programmatic/manual namespaces, missing dataset-relevant fields are
+    tolerated and surfaced as ``None`` instead of raising ``AttributeError``.
+    """
+    dataset_name = getattr(args, "dataset_name", None)
+    result_keys = DATASET_RESULT_ARG_KEYS.get(dataset_name, ())
+    return {key: getattr(args, key, None) for key in result_keys}
+
+
 async def benchmark(
     backend: str,
     api_url: str,
@@ -1521,7 +1531,7 @@ async def benchmark(
     # request-local prefix reuse. vLLM exposes a different, development-mode
     # endpoint for the same purpose.
     should_flush_cache = (
-        "sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")
+        "sglang" in backend and envs.SGLANG_IS_IN_CI.get()
     ) or flush_cache
     if should_flush_cache:
         flush_server_cache(
@@ -1572,7 +1582,12 @@ async def benchmark(
         )
         pbar_total *= args.mooncake_num_rounds
     else:
-        request_generator = get_request(input_requests, request_rate)
+        request_generator = get_request(
+            input_requests,
+            request_rate,
+            use_trace_timestamps=use_trace_timestamps,
+            slowdown_factor=mooncake_slowdown_factor,
+        )
 
     # Prepare LoRA request distribution parameters
     if lora_request_distribution == "distinct":
@@ -1868,10 +1883,7 @@ async def benchmark(
             "dataset_name": args.dataset_name,
             "request_rate": "trace" if use_trace_timestamps else request_rate,
             "max_concurrency": max_concurrency,
-            "sharegpt_output_len": args.sharegpt_output_len,
-            "random_input_len": args.random_input_len,
-            "random_output_len": args.random_output_len,
-            "random_range_ratio": args.random_range_ratio,
+            **_dataset_specific_args(args),
             # Information
             "server_info": server_info,
             # Results
@@ -2033,9 +2045,6 @@ def run_benchmark(args_: argparse.Namespace):
 
     if not hasattr(args, "use_trace_timestamps"):
         args.use_trace_timestamps = False
-    if not hasattr(args, "mooncake_slowdown_factor"):
-        args.mooncake_slowdown_factor = 1.0
-
     if not hasattr(args, "mooncake_slowdown_factor"):
         args.mooncake_slowdown_factor = 1.0
 
