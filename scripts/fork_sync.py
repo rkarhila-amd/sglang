@@ -106,10 +106,22 @@ def gh_pr_list(*args):
     return json.loads(r.stdout)
 
 
+def team_logins():
+    raw = os.environ.get("FORK_TEAM_LOGINS", "")
+    return [ln.strip() for ln in raw.splitlines() if ln.strip() and not ln.startswith("#")]
+
+
+def scrub(text, logins):
+    """Replace team logins (whole word, any case, optional leading @) in text that gets published."""
+    if not text or not logins:
+        return text
+    alts = "|".join(re.escape(x) for x in sorted(logins, key=len, reverse=True))
+    return re.sub(rf"@?(?<![A-Za-z0-9-])(?:{alts})(?![A-Za-z0-9-])", "a team member", text, flags=re.I)
+
+
 def load_open_prs():
     """Open team PRs, plus the drafts that were left out (kept to complete stacks)."""
-    raw = os.environ.get("FORK_TEAM_LOGINS", "")
-    logins = [ln.strip() for ln in raw.splitlines() if ln.strip() and not ln.startswith("#")]
+    logins = team_logins()
     if not logins:
         sys.exit("FORK_TEAM_LOGINS is empty")
     prs = {}
@@ -544,7 +556,7 @@ def write_report(results, contained, multi, unpushed, removed, upstream, today, 
         Path(summary).write_text(Path("branch-build.md").read_text())
 
 
-def write_plan_json(built_all, prs, fork_only, upstream, fork_main, today, deps):
+def write_plan_json(built_all, titles, fork_only, upstream, fork_main, today, deps):
     """Machine-readable twin of branch-build.md, read by the conflict resolver. No logins."""
     nums = sorted({n for b in built_all for n in b["prs"]})
     heads = {}
@@ -572,7 +584,7 @@ def write_plan_json(built_all, prs, fork_only, upstream, fork_main, today, deps)
             for b in built_all
         ],
         "prs": {
-            str(n): {"title": prs[n].get("title") or "", "head": heads.get(str(n)), "fork_only": n in fork_only,
+            str(n): {"title": titles.get(n, ""), "head": heads.get(str(n)), "fork_only": n in fork_only,
                      **({"base_pr": deps[n]} if n in deps else {})}
             for n in nums
         },
@@ -663,10 +675,11 @@ def main():
         tag_ok, _ = push_ref(b["sha"], f"refs/tags/{b['name']}-{stamp}")
         b["tag_moved"] = tag_ok
     removed = prune_tags(today)
-    titles = {n: (pr.get("title") or "") for n, pr in known.items()}
+    logins = team_logins()
+    titles = {n: scrub(pr.get("title") or "", logins) for n, pr in known.items()}
     ctx = {"deps": deps, "drafts": sorted(n for n in drafts if n not in stack_bases), "held": sorted(held)}
     write_report(results, contained, multi, unpushed, removed, upstream, today, titles, ctx)
-    write_plan_json(built_all, known, fork_only, upstream, fork_main, today, deps)
+    write_plan_json(built_all, titles, fork_only, upstream, fork_main, today, deps)
 
 
 if __name__ == "__main__":
