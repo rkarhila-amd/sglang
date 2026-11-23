@@ -747,11 +747,12 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 "_handle_dspark",
                 speculative_draft_model_path=cfg.model_path,
             )
-            declare_resolution(
-                server_args,
-                "_handle_dspark",
-                speculative_draft_model_revision=cfg.revision,
-            )
+            if cfg.speculative_draft_model_revision is None:
+                declare_resolution(
+                    server_args,
+                    "_handle_dspark",
+                    speculative_draft_model_revision=cfg.revision,
+                )
             logger.info(
                 "DSpark draft weights are bundled in the target checkpoint; "
                 "defaulting --speculative-draft-model-path to --model-path (%s).",
@@ -1345,11 +1346,12 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                 "_handle_eagle_family",
                 speculative_draft_model_path=cfg.model_path,
             )
-            declare_resolution(
-                server_args,
-                "_handle_eagle_family",
-                speculative_draft_model_revision=cfg.revision,
-            )
+            if cfg.speculative_draft_model_revision is None:
+                declare_resolution(
+                    server_args,
+                    "_handle_eagle_family",
+                    speculative_draft_model_revision=cfg.revision,
+                )
         else:
             if model_arch not in [
                 "MistralLarge3ForCausalLM",
@@ -1643,23 +1645,6 @@ def _auto_choose_speculative_params(server_args: ServerArgs, model_arch: str) ->
         return (3, 1, 4)
     if model_arch in ["LlamaForCausalLM"]:
         return (5, 4, 8)
-    elif model_arch in [
-        "DeepseekV32ForCausalLM",
-        "DeepseekV3ForCausalLM",
-        "DeepseekV2ForCausalLM",
-        "GptOssForCausalLM",
-        "Glm4MoeForCausalLM",
-        "Glm4MoeLiteForCausalLM",
-        "GlmMoeDsaForCausalLM",
-        "BailingMoeForCausalLM",
-        "BailingMoeV2ForCausalLM",
-        "BailingMoeV2_5ForCausalLM",
-        "MistralLarge3ForCausalLM",
-        "PixtralForConditionalGeneration",
-        "MiMoV2ForCausalLM",
-        "MiMoV2FlashForCausalLM",
-    ]:
-        return (3, 1, 4)
     elif model_arch in ["Grok1ForCausalLM", "Grok1VForCausalLM"]:
         return (5, 4, 8)
     elif model_arch == ERNIE5_5_MOE_ARCH:

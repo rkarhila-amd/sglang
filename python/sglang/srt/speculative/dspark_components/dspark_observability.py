@@ -772,6 +772,15 @@ class DsparkStepObservers:
         self._sts_collect_path = envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
         self._sts_recorder: Optional[StsDataRecorder] = None
 
+    @property
+    def reads_target_logits(self) -> bool:
+        """Whether a sink reads the verify's full-vocabulary target rows."""
+        return (
+            bool(self._sts_collect_path)
+            or self._block_accept_recorder is not None
+            or envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS.get()
+        )
+
     # --- step lifecycle -------------------------------------------------
 
     def begin_step(self) -> None:
@@ -832,6 +841,7 @@ class DsparkStepObservers:
         draft_tokens: torch.Tensor,
         draft_block,
         sampling_info,
+        has_grammar: bool,
         correct_len: torch.Tensor,
         cap_trim_lens: torch.Tensor,
         bonus: torch.Tensor,
@@ -883,7 +893,7 @@ class DsparkStepObservers:
                     else None
                 ),
                 logits_adjustments_are_noop=verify_logits_adjustments_are_noop(
-                    sampling_info
+                    sampling_info, has_grammar=has_grammar
                 ),
                 correct_len=correct_len,
                 cap_trim_lens=cap_trim_lens,
