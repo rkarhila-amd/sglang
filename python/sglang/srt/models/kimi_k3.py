@@ -12,7 +12,7 @@ from array import array
 from collections.abc import Iterable
 from functools import cached_property
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -485,6 +485,51 @@ def _add3(
     return add3.add3(a, b, c, prefetch_bc=prefetch_bc)
 
 
+# The sharded tail adds one collective launch, so it only pays off at prefill
+# sizes.
+_ROCM_SHARDED_UP_PROJ_MIN_TOKENS = 1024
+
+
+def _sharded_up_proj_eligible(
+    up_proj: Optional[nn.Module], tp_size: int, *, on_hip: bool
+) -> bool:
+    """ROCm TP8 and a bf16 up_proj whose rows split evenly over TP. Quantized
+    weights (FP8, packed MXFP4) have another dtype and keep the stock tail.
+    TP4 and TP2 measured slower than the replicated tail at 4096 tokens."""
+    weight = getattr(up_proj, "weight", None)
+    return (
+        on_hip
+        and tp_size == 8
+        and isinstance(weight, torch.Tensor)
+        and weight.dtype == torch.bfloat16
+        and weight.shape[0] % tp_size == 0
+    )
+
+
+def _tp_row_slice(num_rows: int, *, tp_size: int, tp_rank: int) -> slice:
+    rows = num_rows // tp_size
+    return slice(tp_rank * rows, (tp_rank + 1) * rows)
+
+
+def _sharded_up_proj_tail(
+    latent: torch.Tensor,
+    shared_output: torch.Tensor,
+    up_weight: torch.Tensor,
+    rows: slice,
+    *,
+    reduce_latent: Callable[[torch.Tensor], torch.Tensor],
+    reduce_shared: Callable[[torch.Tensor], torch.Tensor],
+    prefix_sum: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """reduce(shared) + up_proj(reduce_latent(latent)) [+ prefix_sum], where
+    this rank computes only `rows` of up_proj and folds them into its shared
+    partial sum before that sum is reduced. Updates shared_output in place."""
+    latent = reduce_latent(latent)
+    shared_output[:, rows] += _k3_bf16_gemm(latent, up_weight[rows])
+    out = reduce_shared(shared_output)
+    return out if prefix_sum is None else out + prefix_sum
+
+
 # One-shot log guard: proves the merged front is live (see _ep_front).
 _EP_FRONT_LOGGED = False
 
@@ -861,6 +906,15 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             and self.routed_expert_up_proj.weight.dtype == torch.bfloat16
             and self.routed_expert_up_proj.weight.is_contiguous()
         )
+        self._shard_up_proj = _sharded_up_proj_eligible(
+            self.routed_expert_up_proj, self.tp_size, on_hip=_is_hip
+        )
+        if self._shard_up_proj:
+            self._up_proj_rows = _tp_row_slice(
+                self.routed_expert_up_proj.weight.shape[0],
+                tp_size=self.tp_size,
+                tp_rank=get_parallel().tp_rank,
+            )
 
     def _merge_front_weights(self) -> None:
         """Merge shared gate_up + router gate + latent down_proj weights.
@@ -1365,6 +1419,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         shared_output = None
         shared_event = None
         shared_compute_event = None
+        shared_alt_output = None
 
         def issue_shared():
             nonlocal shared_input, shared_output, shared_event
@@ -1386,7 +1441,6 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 shared_input = hidden_states
                 if self._shared_experts_tp_comm:
                     shared_input = self._gather_shared_expert_inputs(hidden_states)
-                shared_input.record_stream(self.alt_stream)
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
                     shared_output = self.shared_experts(shared_input)
@@ -1441,18 +1495,29 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 pre_handle.remove()
 
         def wait_and_finalize_shared_experts():
-            nonlocal shared_output
+            nonlocal shared_output, shared_alt_output
             if shared_event is None:
                 return
             # Join just before consuming the shared result. The legacy path
             # still needs to reduce-scatter its TP-partial MLP output here.
             current_stream = torch.cuda.current_stream()
             current_stream.wait_event(shared_event)
-            shared_output.record_stream(current_stream)
+            if fine_grained_overlap:
+                shared_output.record_stream(current_stream)
+            else:
+                shared_alt_output = shared_output
             if self._shared_experts_tp_comm and not fine_grained_overlap:
                 shared_output = self._reduce_scatter_shared_experts(
                     shared_output, hidden_states
                 )
+                if shared_output is not shared_alt_output:
+                    release_shared_output()
+
+        def release_shared_output():
+            nonlocal shared_alt_output
+            if shared_alt_output is not None:
+                self.alt_stream.wait_stream(torch.cuda.current_stream())
+                shared_alt_output = None
 
         # Give the NPU shared-expert branch a head start. At this point
         # hidden_states is the decoder layer's post-attention RMSNorm output.
@@ -1484,6 +1549,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             wait_and_finalize_shared_experts()
             if shared_output is not None:
                 expert_output = expert_output + shared_output
+            release_shared_output()
             return expert_output
 
         # Latent MoE: compress after routing, before experts
@@ -1522,7 +1588,10 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 and not self._shared_experts_tp_comm
             ):
                 shared_output = self._reduce_shared(shared_output)
+                if shared_output is not shared_alt_output:
+                    release_shared_output()
             out = _add3(out, shared_output, prefix_sum)
+            release_shared_output()
             return out
         out = out if prefix_sum is None else out + prefix_sum
         return out
@@ -1830,6 +1899,21 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         else:  # single collective over the flat [latent | shared] pair
             self._forward_shared(gate_up, shared_output)
             self._forward_routed(hidden_states, router_logits, routed_input, latent)
+            if (
+                self._shard_up_proj
+                and not scatters
+                and num_tokens >= _ROCM_SHARDED_UP_PROJ_MIN_TOKENS
+                and not k3_ar_fusion.enabled()
+            ):
+                return _sharded_up_proj_tail(
+                    latent=latent,
+                    shared_output=shared_output,
+                    up_weight=self.routed_expert_up_proj.weight,
+                    rows=self._up_proj_rows,
+                    reduce_latent=self._reduce_latent,
+                    reduce_shared=self._reduce_shared,
+                    prefix_sum=prefix_sum,
+                )
             if scatters:
                 latent = k3_sp_collective.sp_reduce_scatter(latent)
                 shared_output = k3_sp_collective.sp_reduce_scatter(shared_output)
