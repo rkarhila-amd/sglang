@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_weight_sizes
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -273,6 +274,8 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
         self.static_input_scales = not self.input_quant.get("is_dynamic")
         self.with_bias = False
+        # Set per layer by create_moe_runner.
+        self._aiter_stage2_fp8 = False
 
         if not self.is_checkpoint_mxfp4_serialized:
             if not is_gfx95_supported():
@@ -1154,26 +1157,6 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
                 )
             return
 
-        # Deterministic mode runs SwiGLU and gated SiLU experts through AITER's
-        # deterministic fused_moe, which takes gate/up-interleaved weights.
-        from sglang.srt.layers.moe.moe_runner.aiter import (
-            aiter_deterministic_moe_covers,
-        )
-
-        if (
-            _is_shuffle_moe_mxfp4
-            and not _is_gfx1250
-            and get_exec().deterministic.enable_deterministic_inference
-            and aiter_deterministic_moe_covers(layer.moe_runner_config)
-        ):
-            self._shuffle_gu_interleaved(layer)
-            layer.w13_gu_interleaved = True
-            if hasattr(layer, "dispatcher"):
-                layer.dispatcher.set_quant_config(
-                    {"weight_dtype": torch.float4_e2m1fn_x2}
-                )
-            return
-
         # Pre-shuffle weight scales
         if _is_gfx1250:
             # gfx1250 grouped MoE GEMM consumes B-scales in the n32k4 layout.
@@ -1260,6 +1243,22 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
             self._owns_moe_runner = True
             self._owns_moe_weight_layout = True
+            # A speculative draft's MoE keeps the default stage 2.
+            self._aiter_stage2_fp8 = (
+                _is_gfx95
+                and envs.SGLANG_AITER_MOE_STAGE2_FP8.get()
+                and not layer.is_draft
+            )
+            if self._aiter_stage2_fp8:
+                from sglang.srt.layers.moe.moe_runner.aiter import (
+                    _aiter_fused_moe_supports_stage2_fp8,
+                )
+
+                if not _aiter_fused_moe_supports_stage2_fp8():
+                    raise RuntimeError(
+                        "SGLANG_AITER_MOE_STAGE2_FP8=1 needs an AITER build whose "
+                        "aiter.fused_moe accepts stage2_fp8."
+                    )
         else:
             raise NotImplementedError(
                 "Quark MXFP4 MoE currently requires the AITER runner; "
@@ -1299,15 +1298,10 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             from aiter.ops.flydsl.moe_common import GateMode
 
             # Quark checkpoints store gate and up projections as separate
-            # contiguous row ranges. Keep that ordering for correctness, unless the
-            # weights were preshuffled GU-interleaved (deterministic mode).
-            _fused_moe_kwargs = {
-                "gate_mode": (
-                    GateMode.INTERLEAVE.value
-                    if getattr(layer, "w13_gu_interleaved", False)
-                    else GateMode.SEPARATED.value
-                )
-            }
+            # contiguous row ranges. Keep that ordering for correctness.
+            _fused_moe_kwargs = {"gate_mode": GateMode.SEPARATED.value}
+            if self._aiter_stage2_fp8:
+                _fused_moe_kwargs["stage2_fp8"] = True
         else:
             _fused_moe_kwargs = None
 

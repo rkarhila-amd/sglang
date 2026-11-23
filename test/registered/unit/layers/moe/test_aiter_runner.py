@@ -44,7 +44,6 @@ def _install_fake_aiter(monkeypatch, fused_moe):
     fake_aiter.__path__ = []
     fake_aiter.ActivationType = SimpleNamespace(Silu="Silu")
     fake_aiter.QuantType = SimpleNamespace(per_1x32="per_1x32")
-    fake_aiter.dtypes = SimpleNamespace(fp8="fp8")
 
     fake_fused_moe = ModuleType("aiter.fused_moe")
     fake_fused_moe.fused_moe = fused_moe
@@ -89,6 +88,27 @@ def test_aiter_runner_forwards_no_combine_and_extra_fused_moe_kwargs(monkeypatch
     assert captured["quant_type"] == "per_1x32"
     assert captured["no_combine"] is True
     assert captured["custom_fused_moe_kwarg"] == "enabled"
+
+
+def test_aiter_runner_attaches_effective_gate_layout_to_fp4_weight(monkeypatch):
+    captured = {}
+
+    def fused_moe(**kwargs):
+        captured["gate_up_interleave"] = getattr(
+            kwargs["w1"], "gate_up_interleave", None
+        )
+        return kwargs["hidden_states"]
+
+    _install_fake_aiter(monkeypatch, fused_moe)
+    runner = AiterRunnerCore(MoeRunnerConfig(activation="silu"))
+
+    runner.run(
+        _runner_input(),
+        _quant_info(fused_moe_kwargs={"gate_mode": "interleave"}),
+        running_state={},
+    )
+
+    assert captured["gate_up_interleave"] is True
 
 
 def test_aiter_runner_rejects_no_combine_when_fused_moe_does_not_support_it(
@@ -248,87 +268,58 @@ def test_mori_pre_permute_consumes_dispatcher_cap(
         assert result.output.data_ptr() == dispatched.expert_output.data_ptr()
 
 
-def _deterministic_mode(monkeypatch, enabled):
-    monkeypatch.setattr(
-        aiter_runner,
-        "get_exec",
-        lambda: SimpleNamespace(
-            deterministic=SimpleNamespace(enable_deterministic_inference=enabled)
-        ),
-    )
-
-
-_SWIGLU_OAI = dict(
-    activation="silu", gemm1_alpha=1.702, gemm1_beta=1.0, gemm1_clamp_limit=7.0
-)
-
-
 @pytest.mark.parametrize(
-    "deterministic_mode, weight_dtype, swiglu, expert_mask, supports_option, expected",
-    [
-        (True, torch.uint8, True, None, True, True),  # MXFP4 SwiGLU experts
-        (
-            True,
-            torch.uint8,
-            "swiglu",
-            None,
-            True,
-            True,
-        ),  # activation="swiglu" (gpt-oss)
-        (False, torch.uint8, True, None, True, False),  # normal mode is unchanged
-        (True, torch.bfloat16, True, None, True, False),  # only MXFP4 experts
-        (True, torch.uint8, "silu", None, True, True),  # gated SiLU (GLM-5.3)
-        (True, torch.uint8, False, None, True, False),  # ungated SiLU: not covered
-        (True, torch.uint8, True, torch.ones(2), True, False),  # expert parallel
-        (True, torch.uint8, True, None, False, False),  # AITER without the option
-    ],
+    "gate_mode,expected_upscale", [("interleave", True), ("separated", False)]
 )
-def test_aiter_runner_requests_deterministic_mxfp4_moe(
-    monkeypatch,
-    deterministic_mode,
-    weight_dtype,
-    swiglu,
-    expert_mask,
-    supports_option,
-    expected,
+def test_mori_fp4_receive_uses_effective_gate_mode(
+    monkeypatch, gate_mode, expected_upscale
 ):
-    captured = {}
-
-    def fused_moe(**kwargs):
-        captured.update(kwargs)
-        return kwargs["hidden_states"]
-
-    _install_fake_aiter(monkeypatch, fused_moe)
-    sys.modules["aiter"].ActivationType = SimpleNamespace(Silu="Silu", Swiglu="Swiglu")
-    _deterministic_mode(monkeypatch, deterministic_mode)
-    monkeypatch.setattr(aiter_runner, "is_gfx95_supported", lambda: True)
-    monkeypatch.setattr(
-        aiter_runner, "_aiter_fused_moe_supports_deterministic", lambda: supports_option
-    )
-    monkeypatch.setattr(aiter_runner, "_SMALLM_MOE_ON", False)
-    if swiglu == "swiglu":
-        config = MoeRunnerConfig(activation="swiglu")
-    elif swiglu == "silu":
-        config = MoeRunnerConfig(activation="silu")
-    elif swiglu:
-        config = MoeRunnerConfig(**_SWIGLU_OAI)
-    else:
-        config = MoeRunnerConfig(activation="silu", is_gated=False)
-    runner = AiterRunnerCore(config)
-
-    runner.run(
-        _runner_input(),
-        _quant_info(
-            w13_weight=torch.empty((2, 8, 2), dtype=weight_dtype),
-            w2_weight=torch.empty((2, 4, 2), dtype=weight_dtype),
-            expert_mask=expert_mask,
-        ),
-        running_state={},
+    from sglang.srt.layers.moe.token_dispatcher.moriep import (
+        MoriEPNormalDispatchOutput,
     )
 
-    assert captured.get("deterministic", False) is expected
-    # Deterministic mode passes its one activation dtype explicitly.
-    assert (captured.get("quant_dtype_a") == "fp8") is expected
+    upscale_calls = []
+    fake_utils = ModuleType("sglang.kernels.ops.quantization.rocm_upscale")
+    fake_utils.upscale = None
+
+    def upscale_mxfp4(hidden_states, scale, num_local_tokens, output_dtype):
+        upscale_calls.append((hidden_states, scale, num_local_tokens, output_dtype))
+        return torch.zeros((hidden_states.shape[0], 4), dtype=output_dtype)
+
+    fake_utils.upscale_mxfp4 = upscale_mxfp4
+    monkeypatch.setitem(sys.modules, fake_utils.__name__, fake_utils)
+
+    hidden = torch.empty((16, 2), dtype=torch.float4_e2m1fn_x2)
+    scales = torch.ones((16, 1))
+    ids = torch.zeros((16, 2), dtype=torch.int32)
+    weights = torch.ones((16, 2))
+    dispatched = MoriEPNormalDispatchOutput(
+        hidden_states=hidden,
+        hidden_states_scale=scales,
+        topk_ids=ids,
+        topk_weights=weights,
+        num_recv_tokens_per_expert=torch.tensor([5]),
+        origin_topk_ids=ids[:2],
+        origin_topk_weights=weights[:2],
+        out_dtype=torch.bfloat16,
+        recv_cap=0,
+        expert_output=torch.empty((16, 4), dtype=torch.bfloat16),
+    )
+    quant_info = _quant_info(
+        quant_type=AiterQuantType.PER_1X32,
+        swiglu_limit=0.0,
+        fused_moe_kwargs={"gate_mode": gate_mode},
+    )
+
+    result = aiter_runner._pre_permute_deepep_to_aiter(
+        dispatched, quant_info, MoeRunnerConfig(), {}
+    )
+
+    assert bool(upscale_calls) is expected_upscale
+    assert result.hidden_states.dtype == (
+        torch.bfloat16 if expected_upscale else torch.float4_e2m1fn_x2
+    )
+    assert (result.a1_scale is None) is expected_upscale
 
 
 if __name__ == "__main__":

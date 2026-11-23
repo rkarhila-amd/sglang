@@ -1,5 +1,5 @@
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
 
 import torch
 
@@ -9,7 +9,8 @@ from sglang.kernels.ops.speculative.dspark.blockwise_rejection import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
-from sglang.srt.layers.logprob_processor import compute_spec_logprobs
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -26,7 +27,8 @@ from sglang.srt.runtime_context import (
     get_spec,
     mamba_track_grid,
 )
-from sglang.srt.sampling.watermarking.interface import VerifyWatermark
+from sglang.srt.sampling.sampling_batch_info import need_truncated_sampling
+from sglang.srt.sampling.verify_accept import VerifyAccept
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -80,6 +82,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
+    _accepts_on_shards,
     draft_folds_static_commit,
     target_model_type,
     verify_logits_adjustments_are_noop,
@@ -92,16 +95,21 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
 )
+from sglang.srt.speculative.sharded_verify import (
+    VocabShard,
+    sampling_allows_vocab_shards,
+    spec_allows_vocab_shards,
+)
 from sglang.srt.speculative.spec_sampling_mask import (
     SpeculativeSamplingMaskCapture,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
-    build_grammar_vocab_mask,
     draft_pp_context,
     draft_tp_context,
 )
+from sglang.srt.speculative.target_verify import TargetVerify, adjust_verify_logits
 from sglang.srt.utils import (
     is_cuda,
     is_cuda_alike,
@@ -163,11 +171,43 @@ def sim_draw_ahead_enabled(simulated_correct_len: Optional[torch.Tensor]) -> boo
     )
 
 
+# Targets whose DSpark verify was validated on vocabulary-sharded logits.
+_SHARDED_VERIFY_DSPARK_TARGETS = frozenset({"deepseek_v41"})
+
+
+def target_vocab_shards_refusal(
+    *,
+    tp_size: int,
+    model_type: Optional[str],
+    processors: list[LogitsProcessor],
+    simulate_acc_len: float,
+    observers_read_logits: bool,
+) -> Optional[str]:
+    """Why DSpark verify must keep the stock gathered target logits, or None."""
+    if tp_size <= 1:
+        return "TP 1 has no target gather"
+    if model_type not in _SHARDED_VERIFY_DSPARK_TARGETS:
+        return f"target {model_type} is not validated"
+    if len(processors) != 1:
+        return f"the target has {len(processors)} logits processors"
+    if processors[0].final_logit_softcapping is not None:
+        return "final logit softcapping needs the gathered rows"
+    if simulate_acc_len > 0:
+        return "SGLANG_SIMULATE_ACC_LEN reads the gathered rows"
+    if observers_read_logits:
+        return "a verify observer reads the gathered rows"
+    return None
+
+
 class DSparkWorkerV2(BaseSpecWorker):
     """Non-last PP stages run only the target; draft state belongs to the last stage."""
 
     _sampling_accept_graph = None
     _rejection_noise = None
+    # SGLANG_ENABLE_SHARDED_VERIFY: the target LM head's vocabulary shard when the
+    # verify keeps its logits there, and whether sampled rows may use it.
+    _target_vocab_shard: Optional[VocabShard] = None
+    _target_temperature_keys = False
     _sim_draw_ahead = False
     num_sim_draws_ahead = 0
     _prepare_inputs_once = False
@@ -190,7 +230,6 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         self.server_args = server_args
         self.gpu_id = gpu_id
-        self.nccl_port = nccl_port
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self.page_size = get_schedule().page_size
@@ -543,7 +582,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             rejection_noise=self._rejection_noise,
         )
 
-        self._forced_budget_frac: Optional[float] = None
         self._need_mamba_verify_commit = False
 
         self._observers = DsparkStepObservers(
@@ -554,9 +592,103 @@ class DSparkWorkerV2(BaseSpecWorker):
             device=self.device,
             simulate_acc_len=self._simulate_acc_len,
         )
+        self._target_vocab_shard = self._enable_target_vocab_shards()
 
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
+
+    def _enable_target_vocab_shards(self) -> Optional[VocabShard]:
+        """SGLANG_ENABLE_SHARDED_VERIFY; must run before the target's verify graphs
+        are captured, which then all keep this rank's vocabulary shard."""
+        if not envs.SGLANG_ENABLE_SHARDED_VERIFY.get():
+            return None
+        model = self.target_worker.model_runner.model
+        processors = [m for m in model.modules() if isinstance(m, LogitsProcessor)]
+        refusal = target_vocab_shards_refusal(
+            tp_size=get_parallel().tp_size,
+            model_type=target_model_type(self.target_worker),
+            processors=processors,
+            simulate_acc_len=self._simulate_acc_len,
+            observers_read_logits=self._observers.reads_target_logits,
+        )
+        if refusal is None and not (
+            isinstance(model.lm_head, VocabParallelEmbedding)
+            and not model.lm_head.shard_indices.num_added_elements_padded
+        ):
+            refusal = "the LM head has no plain vocabulary shard"
+        if refusal is None:
+            indices = model.lm_head.shard_indices
+            shard = VocabShard(
+                start=indices.org_vocab_start_index,
+                valid=indices.num_org_elements,
+                vocab_size=processors[0].vocab_size,
+            )
+            draft_shard = None
+            if self._sharded_accept:
+                draft_shard = self.draft_model.markov_head.vocab_shard
+            # Sampled rows run the sharded chain rule straight on the target shard.
+            self._target_temperature_keys = (
+                draft_shard is not None
+                and (draft_shard.start, draft_shard.width) == (shard.start, shard.valid)
+                and not get_spec().speculative_use_block_verification
+                and self._rejection_noise is None
+            )
+            processors[0].enable_sharded_verify(
+                temperature_keys=self._target_temperature_keys,
+                full_logits_graphs=False,
+            )
+            if not processors[0].sharded_verify:
+                refusal = "the target gathers its logits through another group"
+        if refusal is not None:
+            self._target_temperature_keys = False
+            if self._target_tp_rank == 0:
+                logger.warning("DSpark target vocab shards off: %s.", refusal)
+            return None
+        # The sampling-accept region replays an accept that reads full rows.
+        self._sampling_accept_graph = None
+        if self._target_tp_rank == 0:
+            logger.info(
+                "DSpark verify keeps the target logits on the vocab shards "
+                "(sampled rows too: %s): %s",
+                self._target_temperature_keys,
+                shard,
+            )
+        return shard
+
+    def _keeps_target_vocab_shards(self, *, batch, sampling_info, draft_block) -> bool:
+        """Whether this step consumes the target logits on the vocabulary shards;
+        every TP rank must decide alike, so only batch-uniform inputs are read."""
+        if self._target_vocab_shard is None:
+            return False
+        if batch.has_grammar or batch.return_logprob:
+            return False
+        if sampling_info is None:
+            return True
+        if (
+            sampling_info.watermark is not None
+            or sampling_info.sampling_mask_batch_indices is not None
+            or not verify_logits_adjustments_are_noop(
+                sampling_info, has_grammar=batch.has_grammar
+            )
+        ):
+            return False
+        spec = get_spec()
+        temperature_keys = (
+            self._target_temperature_keys
+            # request seeds stay on the gathered path, as in the logits processor
+            and sampling_info.sampling_seed is None
+            and _accepts_on_shards(
+                draft_block=draft_block,
+                sampling_info=sampling_info,
+                block_verification=spec.speculative_use_block_verification,
+            )
+        )
+        return sampling_allows_vocab_shards(
+            sampling_info,
+            adjusts_logits=False,
+            return_logprob=False,
+            has_local_keys=temperature_keys,
+        ) and spec_allows_vocab_shards(spec)
 
     def _build_verify_executor(self, **kwargs):
         return TargetVerifyExecutor(**kwargs)
@@ -741,7 +873,6 @@ class DSparkWorkerV2(BaseSpecWorker):
     def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
         if not self._hosts_draft:
             return
-        self._forced_budget_frac = frac
         self._verify_planner.set_forced_budget_frac(frac)
 
     def dump_info_records(self) -> Optional[dict]:
@@ -1074,11 +1205,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             simulate_bonus_sampling_info = sampling_info
             if (
                 self._simulate_acc_greedy
-                and not batch.has_grammar
-                and verify_logits_adjustments_are_noop(sampling_info)
-                and not sampling_info.need_top_p_sampling
-                and not sampling_info.need_top_k_sampling
-                and not sampling_info.need_min_p_sampling
+                and verify_logits_adjustments_are_noop(
+                    sampling_info, has_grammar=batch.has_grammar
+                )
+                and not need_truncated_sampling(sampling_info)
             ):
                 sampling_info = None
         if self._sim_draw_ahead:
@@ -1143,8 +1273,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             GrammarTree.from_linear_chain(verify_ids_2d) if batch.has_grammar else None
         )
 
-        # A live grammar forces the eager path: the folded epilogue accepts inside
-        # the cuda graph off its own buffers, where the mask below never lands.
         fold_eligible = (
             self._verify_executor.verify_epilogue is not None
             and proposal.folded
@@ -1152,14 +1280,17 @@ class DSparkWorkerV2(BaseSpecWorker):
             # sampling batches must take the eager accept path even when the
             # draft proposal itself folded.
             and (sampling_info is None or sampling_info.is_all_greedy)
-            and verify_logits_adjustments_are_noop(sampling_info)
+            # A live grammar forces the eager path: the folded epilogue accepts inside
+            # the cuda graph off its own buffers, where the mask below never lands.
+            and verify_logits_adjustments_are_noop(
+                sampling_info, has_grammar=batch.has_grammar
+            )
             # The graph accept is greedy: a sampled simulated bonus stays in the graph
             # only when the epilogue draws it there (SGLANG_DSPARK_SIMULATE_FOLD).
             and (
                 simulate_bonus_sampling_info is None
                 or self._verify_executor.verify_epilogue.simulate_fold
             )
-            and not batch.has_grammar
         )
         if not self._sim_draw_ahead:
             self._verify_executor.begin_simulated_step()
@@ -1172,6 +1303,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                         else simulate_bonus_sampling_info.temperatures[:bs]
                     ),
                 )
+        # A batch that needs full target rows gathers them right after the forward,
+        # before any logit adjustment reads them.
+        keep_target_shards = self._keeps_target_vocab_shards(
+            batch=batch, sampling_info=sampling_info, draft_block=draft_block
+        )
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
                 target_verify, hidden_strided = self._verify_executor.run_compact(
@@ -1181,9 +1317,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                     draft_tokens=draft_tokens,
                     bs=bs,
                     device=device,
-                    sampling_info=sampling_info,
                     verify_window=verify_window,
                     inject_gate=fold_eligible,
+                    keep_target_shards=keep_target_shards,
                 )
             else:
                 if (
@@ -1196,31 +1332,48 @@ class DSparkWorkerV2(BaseSpecWorker):
                     draft_input=draft_input,
                     verify_ids_2d=verify_ids_2d,
                     verify_window=verify_window,
-                    sampling_info=sampling_info,
+                    keep_target_shards=keep_target_shards,
                 )
                 hidden_strided = None
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
-        if batch.has_grammar:
-            # run_compact scatters its rows back to (bs * chain_len), so the mask
-            # lines up with the logits on both verify paths.
-            grammar_mask = build_grammar_vocab_mask(
-                reqs=batch.reqs,
-                tree=grammar_tree,
-                sampling_info=sampling_info,
-                device=logits_output.next_token_logits.device,
-                barrier=grammar_barrier,
-            )
-            if grammar_mask is not None:
-                grammar_mask.apply(logits_output.next_token_logits)
-
-        target_logits, sampling_info, watermark = self._force_watermark(
-            batch=batch,
+        verify = TargetVerify.prepare(
+            batch,
             logits_output=logits_output,
-            verify_ids_2d=verify_ids_2d,
-            positions_2d=verify_window.positions_2d,
-            sampling_info=sampling_info,
+            grammar_tree=grammar_tree,
+            grammar_barrier=grammar_barrier,
+            # Without sampling info (a simulated greedy accept drops it), no watermark.
+            watermark_engine=(
+                None
+                if sampling_info is None
+                else self.target_worker.model_runner.watermark
+            ),
+            watermark_full_mask=False,
         )
+        if sampling_info is not None:
+            # run_compact scatters its rows back to (bs * chain_len), so the rows
+            # line up with the verify ids on both verify paths.
+            adjust_verify_logits(
+                logits_output.next_token_logits,
+                sampling_info=sampling_info,
+                grammar_mask=verify.grammar_mask,
+                draft_tokens=verify_ids_2d,
+                has_custom_logit_processor=sampling_info.has_custom_logit_processor,
+            )
+
+        target_logits = logits_output.next_token_logits
+        if verify.watermark is not None:
+            target_logits, sampling_info = verify.watermark.apply(
+                target_logits,
+                sampling_info=sampling_info,
+                req_pool_indices=batch.req_pool_indices,
+                draft_tokens=verify_ids_2d,
+                positions=verify_window.positions_2d,
+                draft_token_num=verify_ids_2d.shape[1],
+                custom_mask=None,
+                # compute_spec_logprobs reads logits_output after acceptance.
+                keep_logits=batch.return_logprob,
+            )
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = (
             fold_eligible
@@ -1264,7 +1417,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                 prefix_lens=prefix_lens,
                 draft_tokens=draft_tokens,
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+                target_shard=logits_output.next_token_logits_vocab_shard,
             )
+        verify.commit(
+            batch,
+            logits_output=logits_output,
+            accept=VerifyAccept(
+                tokens=accept.out_tokens, accept_lens=accept.commit_lens
+            ),
+        )
         if proposal.acceptance_features is not None and self._simulate_acc_len <= 0:
             self._observe_acceptance(
                 features=proposal.acceptance_features,
@@ -1273,14 +1434,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         if graph_accept and self._deferred_draft_kv is not None:
             self._deferred_draft_kv.note_staged(batch.reqs)
-        if watermark is not None:
-            watermark.record(None, accept.commit_lens)
-            self.target_worker.model_runner.watermark.append_accept_tokens(
-                sampling_info.watermark,
-                batch.req_pool_indices,
-                accept.out_tokens,
-                accept.commit_lens,
-            )
         engram_in_graph = (
             folded_accept and not run_compact and epilogue.folds_engram_commit
         ) or (
@@ -1306,14 +1459,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 out_tokens=accept.out_tokens,
                 commit_lens=accept.commit_lens,
             )
-        if batch.return_logprob:
-            compute_spec_logprobs(
-                batch,
-                logits_output,
-                accept.out_tokens.reshape(-1),
-                chain_stride=self.verify_num_draft_tokens,
-            )
-
         relay = self._future_relay_in_graph(
             run_compact=run_compact, folded_accept=graph_accept
         )
@@ -1365,6 +1510,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_tokens=draft_tokens,
             draft_block=draft_block,
             sampling_info=sampling_info,
+            has_grammar=batch.has_grammar,
             correct_len=accept.correct_len,
             cap_trim_lens=accept.cap_trim_lens,
             bonus=accept.bonus,
@@ -1397,37 +1543,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             new_seq_lens=accept.new_seq_lens,
         )
 
-    def _force_watermark(
-        self,
-        *,
-        batch: ScheduleBatch,
-        logits_output,
-        verify_ids_2d: torch.Tensor,
-        positions_2d: torch.Tensor,
-        sampling_info,
-    ) -> tuple[torch.Tensor, Any, Optional[VerifyWatermark]]:
-        target_logits = logits_output.next_token_logits
-        engine = self.target_worker.model_runner.watermark
-        watermark = (
-            engine.bind_verify(sampling_info.watermark, full_mask=False)
-            if engine is not None and sampling_info is not None
-            else None
-        )
-        if watermark is None:
-            return target_logits, sampling_info, None
-        target_logits, sampling_info = watermark.apply(
-            target_logits,
-            sampling_info=sampling_info,
-            req_pool_indices=batch.req_pool_indices,
-            draft_tokens=verify_ids_2d,
-            positions=positions_2d,
-            draft_token_num=verify_ids_2d.shape[1],
-            custom_mask=None,
-            # compute_spec_logprobs reads logits_output after acceptance.
-            keep_logits=batch.return_logprob,
-        )
-        return target_logits, sampling_info, watermark
-
     def _sampling_graph_eligible(
         self,
         *,
@@ -1443,15 +1558,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             and self._verify_planner.mode_value == "static"
             and sampling_info is not None
             and not sampling_info.is_any_greedy
-            and not sampling_info.need_top_k_sampling
-            and not sampling_info.need_top_p_sampling
-            and verify_logits_adjustments_are_noop(sampling_info)
+            and not need_truncated_sampling(sampling_info)
+            and verify_logits_adjustments_are_noop(
+                sampling_info, has_grammar=batch.has_grammar
+            )
             # A simulated bonus is drawn in the region from this batch's temperatures.
             and (
                 simulate_bonus_sampling_info is None
                 or simulate_bonus_sampling_info is sampling_info
             )
-            and not batch.has_grammar
         )
 
     def _future_relay_in_graph(self, *, run_compact: bool, folded_accept: bool):

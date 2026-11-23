@@ -22,7 +22,6 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
-from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import get_bool_env_var, is_gfx95_supported
 
 _SMALLM_MOE_ON = envs.SGLANG_ROCM_SMALLM_MOE.get()
@@ -134,21 +133,6 @@ def aiter_swiglu_oai_limit(config: MoeRunnerConfig) -> Optional[float]:
     return float(config.gemm1_clamp_limit)
 
 
-def aiter_deterministic_moe_covers(config: MoeRunnerConfig) -> bool:
-    """Whether AITER's fused_moe(deterministic=True) can run these experts: SwiGLU
-    (incl. SwiGLU-OAI) or gated SiLU, with an AITER build that has the option."""
-    if not (
-        _AITER_ACTIVATIONS.get(config.activation) == "Swiglu"
-        or aiter_swiglu_oai_limit(config) is not None
-        or (config.activation == "silu" and config.is_gated)
-    ):
-        return False
-    if not _aiter_fused_moe_supports_deterministic():
-        _warn_no_deterministic_moe()
-        return False
-    return True
-
-
 def _aiter_activation(config: MoeRunnerConfig):
     from aiter import ActivationType
 
@@ -184,37 +168,10 @@ def _aiter_fused_moe_supports_output() -> bool:
 
 
 @functools.cache
-def _aiter_fused_moe_supports_deterministic() -> bool:
+def _aiter_fused_moe_supports_stage2_fp8() -> bool:
     from aiter.fused_moe import fused_moe
 
-    return "deterministic" in inspect.signature(fused_moe).parameters
-
-
-@functools.cache
-def _warn_no_deterministic_moe() -> None:
-    logger.warning(
-        "This AITER build's fused_moe has no deterministic option, so MXFP4 MoE "
-        "results can depend on the batch in deterministic mode."
-    )
-
-
-def _use_aiter_deterministic_moe(
-    config: MoeRunnerConfig,
-    w13_weight: torch.Tensor,
-    expert_mask: Optional[torch.Tensor],
-) -> bool:
-    """Whether to run MXFP4 experts with AITER's fused_moe(deterministic=True).
-
-    That option uses one fixed configuration with no atomics and no split-K, so a
-    token's result does not depend on its batch. It covers SwiGLU and gated SiLU
-    experts without expert-parallel masking; other experts keep the default path.
-    """
-    return (
-        w13_weight.element_size() == 1
-        and expert_mask is None
-        and get_exec().deterministic.enable_deterministic_inference
-        and aiter_deterministic_moe_covers(config)
-    )
+    return "stage2_fp8" in inspect.signature(fused_moe).parameters
 
 
 class AiterRunnerCore(MoeRunnerCore):
@@ -263,15 +220,11 @@ class AiterRunnerCore(MoeRunnerCore):
         extra: dict = {}
         if quant_info.fused_moe_kwargs:
             extra.update(quant_info.fused_moe_kwargs)
-        if _use_aiter_deterministic_moe(
-            self.config, quant_info.w13_weight, quant_info.expert_mask
-        ):
-            from aiter import dtypes
-
-            extra["deterministic"] = True
-            # Deterministic mode takes one activation dtype for every token
-            # count from the caller: MXFP8.
-            extra["quant_dtype_a"] = dtypes.fp8
+        gate_mode = extra.get("gate_mode")
+        if gate_mode is not None and quant_info.quant_type == AiterQuantType.PER_1X32:
+            quant_info.w13_weight.gate_up_interleave = (
+                str(getattr(gate_mode, "value", gate_mode)).lower() == "interleave"
+            )
         if runner_input.num_local_tokens is not None:
             extra["num_local_tokens"] = runner_input.num_local_tokens
         if runner_input.output_dtype is not None:
@@ -340,7 +293,6 @@ class AiterRunnerCore(MoeRunnerCore):
             _SMALLM_MOE_ON
             and quant_info.w13_weight.element_size() == 1
             and not quant_info.fp8_activations
-            and not extra.get("deterministic")
         ):
             from sglang.kernels.ops.moe import smallm_moe_gfx950 as _smallm
 
@@ -662,11 +614,15 @@ def _pre_permute_deepep_to_aiter(
         is_w4a4 = weight_quant == AiterQuantType.PER_1X32
         is_fp4_dispatch = hidden_states.dtype == torch.float4_e2m1fn_x2
 
-        # AITER fused_moe Clamped-SwiGLU is dispatched with
-        # gate_mode=INTERLEAVE, for which AITER picks a bf16/fp8 `q_dtype_a`
-        # Refer to https://github.com/ROCm/aiter/blob/a2617c366dc7271a1662ecda2023d19f6ccefcec/aiter/fused_moe.py#L406-L412
-        swiglu_interleave = quant_info.swiglu_limit > 0 and get_bool_env_var(
-            "SGLANG_USE_AITER_MOE_GU_ITLV", "true"
+        # INTERLEAVE makes AITER consume bf16/fp8 activations instead of the
+        # packed FP4 payload, including unclamped models whose quant method
+        # supplies the effective gate mode explicitly.
+        gate_mode = (quant_info.fused_moe_kwargs or {}).get("gate_mode")
+        swiglu_interleave = (
+            str(getattr(gate_mode, "value", gate_mode)).lower() == "interleave"
+            if gate_mode is not None
+            else quant_info.swiglu_limit > 0
+            and get_bool_env_var("SGLANG_USE_AITER_MOE_GU_ITLV", "true")
         )
 
         # MXFP8 dispatch already carries fp8 data with group-32 e8m0 scales,

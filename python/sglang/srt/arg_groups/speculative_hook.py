@@ -747,11 +747,12 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 "_handle_dspark",
                 speculative_draft_model_path=cfg.model_path,
             )
-            declare_resolution(
-                server_args,
-                "_handle_dspark",
-                speculative_draft_model_revision=cfg.revision,
-            )
+            if cfg.speculative_draft_model_revision is None:
+                declare_resolution(
+                    server_args,
+                    "_handle_dspark",
+                    speculative_draft_model_revision=cfg.revision,
+                )
             logger.info(
                 "DSpark draft weights are bundled in the target checkpoint; "
                 "defaulting --speculative-draft-model-path to --model-path (%s).",
@@ -1338,13 +1339,6 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         "HYV4ForCausalLM",
         # Qwen4-Exp ships its NEXTN draft layer inside the target checkpoint.
         "Qwen4ExpForConditionalGeneration",
-        # So does Qwen3.5: all four of these target loaders skip `mtp` weights,
-        # which are in the checkpoint only for the draft worker to pick up via
-        # the Qwen3_5ForCausalLMMTP rewrite in ModelConfig._config_draft_model.
-        "Qwen3_5ForCausalLM",
-        "Qwen3_5MoeForCausalLM",
-        "Qwen3_5ForConditionalGeneration",
-        "Qwen3_5MoeForConditionalGeneration",
     ]:
         if cfg.speculative_draft_model_path is None:
             declare_resolution(
@@ -1352,20 +1346,19 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                 "_handle_eagle_family",
                 speculative_draft_model_path=cfg.model_path,
             )
-            declare_resolution(
-                server_args,
-                "_handle_eagle_family",
-                speculative_draft_model_revision=cfg.revision,
-            )
+            if cfg.speculative_draft_model_revision is None:
+                declare_resolution(
+                    server_args,
+                    "_handle_eagle_family",
+                    speculative_draft_model_revision=cfg.revision,
+                )
         else:
             if model_arch not in [
                 "MistralLarge3ForCausalLM",
                 "PixtralForConditionalGeneration",
             ]:
                 logger.warning(
-                    "%s bundles its MTP draft in the target checkpoint, so "
-                    "--speculative-draft-model-path is not required.",
-                    model_arch,
+                    "DeepSeek MTP does not require setting speculative_draft_model_path."
                 )
 
     _handle_iquest_q1_mtp_draft(server_args)
@@ -1652,23 +1645,6 @@ def _auto_choose_speculative_params(server_args: ServerArgs, model_arch: str) ->
         return (3, 1, 4)
     if model_arch in ["LlamaForCausalLM"]:
         return (5, 4, 8)
-    elif model_arch in [
-        "DeepseekV32ForCausalLM",
-        "DeepseekV3ForCausalLM",
-        "DeepseekV2ForCausalLM",
-        "GptOssForCausalLM",
-        "Glm4MoeForCausalLM",
-        "Glm4MoeLiteForCausalLM",
-        "GlmMoeDsaForCausalLM",
-        "BailingMoeForCausalLM",
-        "BailingMoeV2ForCausalLM",
-        "BailingMoeV2_5ForCausalLM",
-        "MistralLarge3ForCausalLM",
-        "PixtralForConditionalGeneration",
-        "MiMoV2ForCausalLM",
-        "MiMoV2FlashForCausalLM",
-    ]:
-        return (3, 1, 4)
     elif model_arch in ["Grok1ForCausalLM", "Grok1VForCausalLM"]:
         return (5, 4, 8)
     elif model_arch == ERNIE5_5_MOE_ARCH:
