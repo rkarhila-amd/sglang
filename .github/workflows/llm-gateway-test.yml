@@ -1,0 +1,121 @@
+name: LLM gateway test
+
+on:
+  workflow_dispatch:
+    inputs:
+      host:
+        description: Gateway host
+        default: llm.amd.com
+        required: false
+      model:
+        description: Model for the chat probe (blank = first listed model)
+        default: ""
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: llm-gateway-test
+  cancel-in-progress: false
+
+jobs:
+  reach:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      LLM_GATEWAY_TOKEN: ${{ secrets.LLM_GATEWAY_TOKEN }}
+      LLM_AGENT_ID: ${{ vars.LLM_AGENT_ID }}
+      HOST: ${{ inputs.host }}
+      MODEL: ${{ inputs.model }}
+    steps:
+      - name: Runner egress
+        run: |
+          echo "runner: $(uname -sr)"
+          echo "egress ip: $(curl -s --max-time 10 https://api.ipify.org || echo unknown)"
+          echo "token present: $([ -n "$LLM_GATEWAY_TOKEN" ] && echo yes || echo no)"
+
+      - name: DNS
+        run: |
+          echo "== getent =="
+          getent ahosts "$HOST" | head -5 || echo "getent: no result"
+          echo "== dig =="
+          (dig +short "$HOST" || true) | head -5
+          getent hosts "$HOST" >/dev/null || { echo "DNS FAILED for $HOST"; exit 1; }
+          echo "DNS OK"
+
+      - name: TCP and TLS
+        run: |
+          echo "== tcp 443 =="
+          if timeout 10 bash -c "exec 3<>/dev/tcp/$HOST/443"; then echo "TCP 443 OK"; else echo "TCP 443 FAILED"; fi
+          echo "== tls handshake =="
+          out=$(echo | timeout 15 openssl s_client -connect "$HOST:443" -servername "$HOST" 2>&1 || true)
+          echo "$out" | grep -E "^(subject|issuer)=|Verification|Verify return code|Protocol|Cipher is|depth=0|CONNECTED|errno|error" | head -15
+          if echo "$out" | grep -q "Verify return code: 0"; then echo "TLS OK (certificate verified)"; else echo "TLS: certificate not verified or handshake failed"; fi
+          echo "== curl unauthenticated =="
+          curl -sS -o /dev/null --max-time 15 -w "root: http=%{http_code} ssl_verify=%{ssl_verify_result} ip=%{remote_ip}\n" "https://$HOST/" || echo "curl root failed (exit $?)"
+
+      - name: Authenticated probes
+        run: |
+          base="https://$HOST"
+          show() {
+            label="$1"; code="$2"; file="$3"
+            echo "--- $label -> HTTP $code"
+            head -c 400 "$file" | tr '\n' ' '
+            echo
+          }
+          get() {
+            label="$1"; path="$2"; shift 2
+            code=$(curl -sS --max-time 20 -o /tmp/body -w '%{http_code}' "$@" "$base$path" 2>/tmp/err) || { echo "--- $label -> curl failed: $(head -c 200 /tmp/err)"; return; }
+            show "$label" "$code" /tmp/body
+            echo "$code" > /tmp/last_code
+          }
+          post() {
+            label="$1"; path="$2"; data="$3"; shift 3
+            code=$(curl -sS --max-time 40 -o /tmp/body -w '%{http_code}' -X POST -H 'Content-Type: application/json' "$@" -d "$data" "$base$path" 2>/tmp/err) || { echo "--- $label -> curl failed: $(head -c 200 /tmp/err)"; return; }
+            show "$label" "$code" /tmp/body
+            echo "$code" > /tmp/last_code
+          }
+
+          bearer=(-H "Authorization: Bearer $LLM_GATEWAY_TOKEN")
+          apikey=(-H "api-key: $LLM_GATEWAY_TOKEN")
+          apim=(-H "Ocp-Apim-Subscription-Key: $LLM_GATEWAY_TOKEN")
+
+          echo "===== model listing, Bearer ====="
+          for p in /v1/models /models /api/v1/models /openai/v1/models; do
+            get "GET $p (bearer)" "$p" "${bearer[@]}"
+            if [ "$(cat /tmp/last_code 2>/dev/null)" = "200" ]; then
+              echo "$p" > /tmp/models_path
+              jq -r '(.data // .models // .)[]? | (.id // .name // .model // empty)' /tmp/body 2>/dev/null | head -60 > /tmp/model_ids || true
+              break
+            fi
+          done
+
+          echo "===== other auth header styles on /v1/models ====="
+          get "GET /v1/models (api-key)" /v1/models "${apikey[@]}"
+          get "GET /v1/models (Ocp-Apim-Subscription-Key)" /v1/models "${apim[@]}"
+          get "GET /v1/models (no auth)" /v1/models
+
+          echo "===== models listed ====="
+          if [ -s /tmp/model_ids ]; then cat /tmp/model_ids; else echo "(none parsed)"; fi
+
+          m="$MODEL"
+          [ -z "$m" ] && [ -s /tmp/model_ids ] && m=$(head -1 /tmp/model_ids)
+          [ -z "$m" ] && m="gpt-4o-mini"
+          echo "===== chat probe, model=$m ====="
+          data=$(jq -cn --arg m "$m" '{model:$m,messages:[{role:"user",content:"Reply with the single word: pong"}],max_tokens:8}')
+          for p in /v1/chat/completions /chat/completions /api/v1/chat/completions; do
+            post "POST $p (bearer)" "$p" "$data" "${bearer[@]}"
+            [ "$(cat /tmp/last_code 2>/dev/null)" = "200" ] && { echo "$p" > /tmp/chat_path; break; }
+          done
+          post "POST /v1/chat/completions (api-key)" /v1/chat/completions "$data" "${apikey[@]}"
+          post "POST /v1/chat/completions (Ocp-Apim-Subscription-Key)" /v1/chat/completions "$data" "${apim[@]}"
+
+          if [ -n "$LLM_AGENT_ID" ]; then
+            echo "===== agent invoke ====="
+            post "POST /v1/agents/<id>/invoke" "/v1/agents/$LLM_AGENT_ID/invoke" '{"input":"ping"}' "${bearer[@]}"
+          fi
+
+          echo "===== summary ====="
+          echo "models path: $(cat /tmp/models_path 2>/dev/null || echo none)"
+          echo "chat path: $(cat /tmp/chat_path 2>/dev/null || echo none)"
