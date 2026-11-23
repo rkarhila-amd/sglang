@@ -23,7 +23,7 @@ FORK_REPO = os.environ.get("FORK_REPO") or CONFIG.get("fork_repo", "rkarhila-amd
 UPSTREAM_BRANCH = CONFIG.get("upstream_branch", "main")
 FORK_REMOTE = os.environ.get("FORK_REMOTE", "origin")
 FORK_MAIN = "refs/remotes/forksync/main"
-TOOLING = (".github/workflows/fork-sync.yml", "scripts/fork_sync.py", CONFIG_PATH)
+TOOLING = (".github/workflows/fork-sync.yml", "scripts/fork_sync.py", "scripts/fork_conflicts.py", CONFIG_PATH)
 PREFIX = "stripy/"
 TAG_RE = re.compile(r"^stripy/(?:experimental/|unstable/)?([a-z0-9.]+)-(\d{8})$")
 DRY_RUN = os.environ.get("FORK_SYNC_DRY_RUN") == "1"
@@ -111,16 +111,8 @@ def team_logins():
     return [ln.strip() for ln in raw.splitlines() if ln.strip() and not ln.startswith("#")]
 
 
-def scrub(text, logins):
-    """Replace team logins (whole word, any case, optional leading @) in text that gets published."""
-    if not text or not logins:
-        return text
-    alts = "|".join(re.escape(x) for x in sorted(logins, key=len, reverse=True))
-    return re.sub(rf"@?(?<![A-Za-z0-9-])(?:{alts})(?![A-Za-z0-9-])", "a team member", text, flags=re.I)
-
-
 def load_open_prs():
-    """Open team PRs, plus the drafts that were left out (kept to complete stacks)."""
+    """The open PR subset, plus the drafts that were left out (kept to complete stacks)."""
     logins = team_logins()
     if not logins:
         sys.exit("FORK_TEAM_LOGINS is empty")
@@ -147,7 +139,7 @@ def load_open_prs():
 def resolve_stacks(prs, known):
     """Map each stacked upstream PR to the open PR whose head branch it is based on.
 
-    The base PR is pulled in even when it is not a team PR or is a draft, so
+    The base PR is pulled in even when it is not in the PR subset or is a draft, so
     the whole stack applies in order. A base branch without an open PR stays
     part of the stacked PR's own diff.
     """
@@ -557,7 +549,7 @@ def write_report(results, contained, multi, unpushed, removed, upstream, today, 
 
 
 def write_plan_json(built_all, titles, fork_only, upstream, fork_main, today, deps):
-    """Machine-readable twin of branch-build.md, read by the conflict resolver. No logins."""
+    """Machine-readable twin of branch-build.md, read by the conflict resolver."""
     nums = sorted({n for b in built_all for n in b["prs"]})
     heads = {}
     for n in nums:
@@ -675,8 +667,7 @@ def main():
         tag_ok, _ = push_ref(b["sha"], f"refs/tags/{b['name']}-{stamp}")
         b["tag_moved"] = tag_ok
     removed = prune_tags(today)
-    logins = team_logins()
-    titles = {n: scrub(pr.get("title") or "", logins) for n, pr in known.items()}
+    titles = {n: (pr.get("title") or "") for n, pr in known.items()}
     ctx = {"deps": deps, "drafts": sorted(n for n in drafts if n not in stack_bases), "held": sorted(held)}
     write_report(results, contained, multi, unpushed, removed, upstream, today, titles, ctx)
     write_plan_json(built_all, titles, fork_only, upstream, fork_main, today, deps)

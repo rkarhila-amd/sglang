@@ -30,9 +30,23 @@ jobs:
           FORK_REPO: rkarhila-amd/sglang
         run: python3 scripts/fork_sync.py
 
+      - name: Report PR conflicts
+        if: success()
+        continue-on-error: true
+        env:
+          FORK_TEAM_LOGINS: ${{ secrets.FORK_TEAM_LOGINS }}
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_REPO: sgl-project/sglang
+          FORK_REPO: rkarhila-amd/sglang
+        run: python3 scripts/fork_conflicts.py --set experimental --out fork-conflicts
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: branch-build
-          path: branch-build.md
+          path: |
+            branch-build.md
+            branch-build.json
+            fork-conflicts.md
+            fork-conflicts.json
           retention-days: 30
