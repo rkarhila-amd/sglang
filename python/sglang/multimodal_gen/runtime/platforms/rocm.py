@@ -156,21 +156,6 @@ class RocmPlatform(Platform):
             logger.info("Using aiter_quant attention backend on ROCm.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter_quant.AITERQuantBackend"
 
-        elif selected_backend == AttentionBackendEnum.AITER_SOL:
-            # Arch family only; whether the selected recipe has a Sol-Attn
-            # manifest row on this device is checked when the impl is built.
-            if not is_gfx95_supported():
-                raise ValueError(
-                    "aiter_sol requires a gfx950-class arch, got "
-                    f"{cls.get_device_name()}."
-                )
-            # The operand dtype is not known here: this runs at backend
-            # selection, where dtype is the default compute dtype and not what
-            # the attention layer receives. The Sol-Attn impl checks the real
-            # Q/K/V on every call and rejects anything but BF16.
-            logger.info("Using aiter_sol attention backend on ROCm.")
-            return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter_sol.AITERSolBackend"
-
         elif selected_backend in (
             AttentionBackendEnum.SLIDING_TILE_ATTN,
             AttentionBackendEnum.SAGE_ATTN,
@@ -270,6 +255,25 @@ class RocmPlatform(Platform):
                     "Failed to apply AITer GroupNorm to VAE.",
                     exc_info=True,
                 )
+
+        try:
+            from sglang.multimodal_gen.runtime.models.vaes.minimax_h3 import (
+                MiniMaxH3ImageVAE,
+            )
+            from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_vae_cuda_opt import (
+                maybe_optimize_minimax_h3_vae,
+            )
+
+            # batched tile decode and the fused residual-add RMSNorm
+            # (quality-gated). Video VAE only: the fused blocks change the image
+            # VAE's lossless output, which has no quality validation on ROCm.
+            if not isinstance(vae, MiniMaxH3ImageVAE):
+                vae = maybe_optimize_minimax_h3_vae(vae, fast_attention=False)
+        except Exception:
+            logger.warning(
+                "Failed to apply the MiniMax-H3 VAE fast path; using the unmodified VAE.",
+                exc_info=True,
+            )
 
         if is_gfx1250_supported():
             count = cls._force_math_sdpa_in_attention(vae)

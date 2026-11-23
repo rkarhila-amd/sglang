@@ -356,19 +356,11 @@ class FlashAttentionBackend(AttentionBackend):
         return FlashAttentionImpl
 
     @staticmethod
-    def get_metadata_cls() -> type["AttentionMetadata"]:
-        raise NotImplementedError
-
-    @staticmethod
     def get_builder_cls() -> type["AttentionMetadataBuilder"]:
         return FlashAttentionMetadataBuilder
 
 
 class FlashAttentionImpl(AttentionImpl):
-    @classmethod
-    def has_native_varlen_kernel(cls) -> bool:
-        return True
-
     def __init__(
         self,
         num_heads: int,
@@ -552,15 +544,8 @@ class FlashAttentionImpl(AttentionImpl):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
-        cu_seqlens_k: torch.Tensor | None = None,
-        max_seqlen_k: int | None = None,
     ) -> torch.Tensor:
         use_trtllm, skip_threshold = self._request_skip_softmax_threshold()
-        if use_trtllm and cu_seqlens_k is not None:
-            raise NotImplementedError(
-                "Skip Softmax derives one set of sequence lengths for queries "
-                "and keys; it cannot serve asymmetric packed varlen."
-            )
         if use_trtllm:
             bounds = cu_seqlens_host
             used = (
@@ -657,9 +642,9 @@ class FlashAttentionImpl(AttentionImpl):
             key,
             value,
             cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens if cu_seqlens_k is None else cu_seqlens_k,
+            cu_seqlens_k=cu_seqlens,
             max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen if max_seqlen_k is None else max_seqlen_k,
+            max_seqlen_k=max_seqlen,
             softmax_scale=self.softmax_scale,
             causal=self.causal,
             ver=fa_ver,

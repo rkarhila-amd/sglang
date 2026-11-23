@@ -67,11 +67,6 @@ class AttentionBackend(ABC):
 
     @staticmethod
     @abstractmethod
-    def get_metadata_cls() -> type["AttentionMetadata"]:
-        raise NotImplementedError
-
-    @staticmethod
-    @abstractmethod
     def get_builder_cls() -> type["AttentionMetadataBuilder"]:
         return None
 
@@ -100,15 +95,10 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
 
 
 class AttentionImpl(ABC, Generic[T]):
-    @classmethod
-    def has_native_varlen_kernel(cls) -> bool:
-        """Whether the underlying kernel consumes ``cu_seqlens`` itself.
-
-        False means ``forward_varlen`` emulates segments by slicing and calling
-        fixed-length attention per segment, so callers that would repack to
-        reach it should keep their own masked path.
-        """
-        return False
+    # Whether forward() reads Q/K/V through explicit strides. False means the
+    # caller must hand it packed rows, so the Ulysses exchange has to copy its
+    # interleaved [.., 3 * head_size] output apart first.
+    accepts_strided_qkv: bool = False
 
     @abstractmethod
     def __init__(
@@ -184,8 +174,6 @@ class AttentionImpl(ABC, Generic[T]):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
-        cu_seqlens_k: torch.Tensor | None = None,
-        max_seqlen_k: int | None = None,
     ) -> torch.Tensor:
         raise NotImplementedError(
             f"{type(self).__name__} does not implement packed varlen attention"

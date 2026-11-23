@@ -130,7 +130,7 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`aiter`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}>`AITER`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Requires <code>aiter</code>. On gfx1201, supported inputs use FlyDSL BF16/FP16 with <code>SGLANG_USE_AITER=1</code> and the gfx1201 FlyDSL API installed. Set <code>SGLANG_DIFFUSION_AITER_FP8_ATTN=1</code> to opt into FP8 attention. Unsupported inputs use generic AITER.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Requires <code>aiter</code>.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>aiter_sage</code></td>
@@ -1386,6 +1386,12 @@ establish model-quality parity; inspect generated outputs for your workload.
 ### Using Sliding Tile Attention (STA)
 
 `STA_INFERENCE` also reads the per-layer STA parameters from the file named by the `SGLANG_DIFFUSION_ATTENTION_CONFIG` environment variable.
+
+`STA_SEARCHING` writes one opaque sample name per submitted request; its positive
+and negative loss files share that name in separate directories. Repeating the
+same prompt adds a sample rather than overwriting the previous one. Existing
+calibration JSON remains readable. Use a private calibration directory; older
+files are not renamed or removed.
 
 ```bash
 # Pass the mask strategy file path via config
