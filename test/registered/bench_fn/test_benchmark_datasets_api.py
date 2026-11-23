@@ -3,6 +3,7 @@ import asyncio
 import base64
 import functools
 import io
+import itertools
 import json
 import pickle
 import random
@@ -1179,24 +1180,23 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertEqual(len(rows_a), 3 * 4)
         self.assertEqual(self._row_fields(rows_a), self._row_fields(rows_b))
 
-    def test_gsp_uniform_cache_path_format_unchanged(self):
-        # The uniform-mode cache filename keeps its existing
-        # gen_shared_prefix_<seed>_<N>_<P>_<sysL>_<qL>_<outL>_<TokenizerCls>.pkl
-        # shape. The trailing class name is a transformers/tokenizers internal
-        # detail (TokenizersBackend / PreTrainedTokenizerFast depending on
-        # version), so we only pin the deterministic numeric portion.
-        path = get_gen_prefix_cache_path(
-            seed=7,
-            num_groups=3,
-            prompts_per_group=4,
-            system_prompt_len=16,
-            question_len=8,
-            output_len=4,
-            tokenizer=self.tokenizer,
+    def test_gsp_default_ignores_legacy_fast_cache(self):
+        common = dict(num_groups=3, prompts_per_group=4, seed=7)
+        fast_rows = self._run_gsp(ordered=False, fast_prepare=True, **common)
+        legacy_path = (
+            self.tmpdir_path
+            / ".cache"
+            / "sglang"
+            / "benchmark"
+            / f"gen_shared_prefix_7_3_4_4_3_2_{type(self.tokenizer).__name__}.pkl"
         )
-        self.assertTrue(path.name.startswith("gen_shared_prefix_7_3_4_16_8_4_"))
-        self.assertTrue(path.name.endswith(".pkl"))
-        self.assertEqual(path.parent, Path.home() / ".cache" / "sglang" / "benchmark")
+        with legacy_path.open("wb") as handle:
+            pickle.dump(fast_rows, handle)
+
+        rows = self._run_gsp(ordered=False, fast_prepare=False, **common)
+        self.assertEqual(len(rows), len(fast_rows))
+        for row in rows:
+            self.assertEqual(row.prompt_len, len(self.tokenizer.encode(row.prompt)))
 
     def test_zipf_group_probs_helper(self):
         # Rank-based probability vector: weight(rank) = 1 / rank ** alpha,
@@ -1357,6 +1357,8 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
                 question_len=common["question_len"],
                 output_len=common["output_len"],
                 tokenizer=self.tokenizer,
+                ordered=common["ordered"],
+                fast_prepare=common["fast_prepare"],
             )
             zipf_path_a = get_gen_prefix_cache_path(
                 seed=common["seed"],
@@ -1368,6 +1370,8 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
                 tokenizer=self.tokenizer,
                 group_distribution="zipf",
                 zipf_alpha=1.5,
+                ordered=common["ordered"],
+                fast_prepare=common["fast_prepare"],
             )
             zipf_path_b = get_gen_prefix_cache_path(
                 seed=common["seed"],
@@ -1379,6 +1383,8 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
                 tokenizer=self.tokenizer,
                 group_distribution="zipf",
                 zipf_alpha=2.0,
+                ordered=common["ordered"],
+                fast_prepare=common["fast_prepare"],
             )
             self.assertNotEqual(uniform_path, zipf_path_a)
             self.assertNotEqual(zipf_path_a, zipf_path_b)
@@ -1407,6 +1413,26 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
                 pickle.dump(zipf_sentinel, f)
             reloaded = self._run_gsp(mode="zipf", alpha=1.5, **common)
             self.assertEqual(reloaded, zipf_sentinel)
+
+    def test_gsp_cache_is_keyed_by_ordered_and_fast_prepare(self):
+        """A cached run must not be served to a run that differs in --gsp-ordered
+        or --gsp-fast-prepare: the first decides whether rows are shuffled, the
+        second stores prompt_len=1 in every row."""
+        common = dict(num_groups=3, prompts_per_group=4, seed=11)
+
+        default_rows = self._run_gsp(ordered=False, fast_prepare=False, **common)
+        self.assertTrue(all(row.prompt_len > 1 for row in default_rows))
+
+        ordered_rows = self._run_gsp(ordered=True, fast_prepare=False, **common)
+        system_prompts = [row.prompt.split("\n\n")[0] for row in ordered_rows]
+        runs = [prompt for prompt, _ in itertools.groupby(system_prompts)]
+        self.assertEqual(len(runs), len(set(runs)))
+
+        fast_rows = self._run_gsp(ordered=False, fast_prepare=True, **common)
+        self.assertEqual({row.prompt_len for row in fast_rows}, {1})
+
+        cached_rows = self._run_gsp(ordered=False, fast_prepare=False, **common)
+        self.assertEqual(self._row_fields(cached_rows), self._row_fields(default_rows))
 
     def test_zipf_total_rows_and_unique_prompts(self):
         # Total returned row count under Zipf equals num_groups *
@@ -1538,6 +1564,147 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             "Traceback",
         ]:
             self.assertNotIn(forbidden, stderr)
+
+
+class TestDatasetSpecificResultArgs(unittest.TestCase):
+    """`_dataset_specific_args` should only surface args for the active dataset."""
+
+    def _args(self, dataset_name: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            dataset_name=dataset_name,
+            sharegpt_output_len=None,
+            random_input_len=1024,
+            random_output_len=1024,
+            random_range_ratio=0.0,
+            gsp_num_groups=64,
+            gsp_prompts_per_group=16,
+            gsp_system_prompt_len=2048,
+            gsp_question_len=128,
+            gsp_output_len=256,
+            gsp_range_ratio=1.0,
+            gsp_group_distribution="uniform",
+            gsp_zipf_alpha=None,
+        )
+
+    def _partial_args(self, dataset_name: str) -> SimpleNamespace:
+        return SimpleNamespace(dataset_name=dataset_name)
+
+    def test_random_dataset_omits_gsp_and_sharegpt(self):
+        from sglang.benchmark.serving import _dataset_specific_args
+
+        result = _dataset_specific_args(self._args("random"))
+        self.assertEqual(
+            result,
+            {
+                "random_input_len": 1024,
+                "random_output_len": 1024,
+                "random_range_ratio": 0.0,
+            },
+        )
+
+    def test_mmmu_dataset_reports_only_output_len(self):
+        from sglang.benchmark.serving import _dataset_specific_args
+
+        result = _dataset_specific_args(self._args("mmmu"))
+        self.assertEqual(result, {"random_output_len": 1024})
+
+    def test_gsp_dataset_omits_random_and_sharegpt(self):
+        from sglang.benchmark.serving import _dataset_specific_args
+
+        result = _dataset_specific_args(self._args("generated-shared-prefix"))
+        self.assertNotIn("random_input_len", result)
+        self.assertNotIn("sharegpt_output_len", result)
+        self.assertEqual(result["gsp_system_prompt_len"], 2048)
+        self.assertEqual(result["gsp_output_len"], 256)
+        self.assertEqual(result["gsp_group_distribution"], "uniform")
+        self.assertIsNone(result["gsp_zipf_alpha"])
+
+    def test_sharegpt_like_datasets_report_only_sharegpt_output_len(self):
+        from sglang.benchmark.serving import _dataset_specific_args
+
+        for dataset_name in (
+            "agentic-trace",
+            "sharegpt",
+            "custom",
+            "autobench",
+            "openai",
+            "longbench_v2",
+        ):
+            result = _dataset_specific_args(self._args(dataset_name))
+            self.assertEqual(result, {"sharegpt_output_len": None}, dataset_name)
+
+    def test_agentic_trace_reports_sharegpt_output_len_override(self):
+        from sglang.benchmark.serving import _dataset_specific_args
+
+        args = self._args("agentic-trace")
+        args.sharegpt_output_len = 64
+        self.assertEqual(_dataset_specific_args(args), {"sharegpt_output_len": 64})
+
+    def test_every_registered_dataset_is_classified(self):
+        """A new dataset must get result keys or join the deliberate exceptions."""
+        from sglang.benchmark.datasets import DATASET_MAPPING, DATASET_RESULT_ARG_KEYS
+
+        unlisted = set(DATASET_MAPPING) - set(DATASET_RESULT_ARG_KEYS)
+        self.assertEqual(unlisted, {"mooncake", "speed-bench"})
+
+    def test_other_dataset_returns_empty(self):
+        from sglang.benchmark.serving import _dataset_specific_args
+
+        for dataset_name in ("mooncake", "speed-bench"):
+            self.assertEqual(
+                _dataset_specific_args(self._args(dataset_name)), {}, dataset_name
+            )
+
+    def test_manual_random_namespace_missing_fields_returns_none(self):
+        from sglang.benchmark.serving import _dataset_specific_args
+
+        result = _dataset_specific_args(self._partial_args("random"))
+        self.assertEqual(
+            result,
+            {
+                "random_input_len": None,
+                "random_output_len": None,
+                "random_range_ratio": None,
+            },
+        )
+
+    def test_manual_mmmu_namespace_missing_fields_returns_none(self):
+        from sglang.benchmark.serving import _dataset_specific_args
+
+        result = _dataset_specific_args(self._partial_args("mmmu"))
+        self.assertEqual(result, {"random_output_len": None})
+
+    def test_manual_gsp_namespace_missing_fields_returns_none(self):
+        from sglang.benchmark.serving import _dataset_specific_args
+
+        result = _dataset_specific_args(self._partial_args("generated-shared-prefix"))
+        self.assertEqual(
+            result,
+            {
+                "gsp_num_groups": None,
+                "gsp_prompts_per_group": None,
+                "gsp_system_prompt_len": None,
+                "gsp_question_len": None,
+                "gsp_output_len": None,
+                "gsp_range_ratio": None,
+                "gsp_group_distribution": None,
+                "gsp_zipf_alpha": None,
+            },
+        )
+
+    def test_manual_sharegpt_like_namespace_missing_fields_returns_none(self):
+        from sglang.benchmark.serving import _dataset_specific_args
+
+        for dataset_name in (
+            "agentic-trace",
+            "sharegpt",
+            "custom",
+            "autobench",
+            "openai",
+            "longbench_v2",
+        ):
+            result = _dataset_specific_args(self._partial_args(dataset_name))
+            self.assertEqual(result, {"sharegpt_output_len": None}, dataset_name)
 
 
 if __name__ == "__main__":
