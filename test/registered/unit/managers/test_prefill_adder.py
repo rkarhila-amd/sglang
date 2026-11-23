@@ -20,6 +20,7 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
     estimate_prefill_extend_tile_metrics,
 )
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
@@ -267,6 +268,40 @@ class TestPrefillAdder(CustomTestCase):
         return self.create_adder(
             self.create_running_batch(), page_size=256, rem_chunk_tokens=chunk_tokens
         )
+
+    def test_capped_chunk_holds_its_rest_from_later_requests(self):
+        """A request admitted beside a capped chunk may not take the KV the
+        chunk's rest needs next pass; an uncapped chunk holds only itself."""
+        self.create_shortest_prefill_adder()
+        # Capped: a 512-token chunk + a page, and the 4564-token rest paged to
+        # 4608 + 1 decode token, hold 5185; a 256-token request needs 256 + a
+        # page + 1 = 321 more. Uncapped: a 1024-token chunk + a page = 1088,
+        # and the spent chunk budget turns the request away.
+        for cap, available, held, admitted in (
+            (512, 5400, 5185, ["long"]),
+            (512, 5600, 5185, ["long", "short"]),
+            (None, 5400, 1088, ["long"]),
+        ):
+            with self.subTest(cap=cap, available=available):
+                self.mock_token_allocator.available_size.return_value = available
+                long_req = self.create_mock_req("long", priority=0, max_new_tokens=1)
+                long_req.full_untruncated_fill_ids = list(range(6100))
+                long_req.prefix_len = 1024
+                short = self.create_mock_req("short", priority=0, max_new_tokens=1)
+                short.full_untruncated_fill_ids = list(range(256))
+                adder = self.create_adder(
+                    self.create_running_batch(), page_size=64, rem_chunk_tokens=1024
+                )
+                adder.chunked_req_limit = cap
+                before = adder.memory_budget.total_offset
+                self.assertIs(adder.add_chunked_req(long_req), long_req)
+                self.assertEqual(adder.memory_budget.total_offset - before, held)
+                result = adder.add_one_req(
+                    short, has_chunked_req=True, truncation_align_size=None
+                )
+                self.assertEqual([r.rid for r in adder.can_run_list], admitted)
+                if cap is not None and admitted == ["long"]:
+                    self.assertEqual(result, AddReqResult.NO_TOKEN)
 
     def test_shortest_prefill_reserves_space_for_complete_waiting_requests(self):
         adder = self.create_shortest_prefill_adder()
@@ -527,6 +562,44 @@ class TestPrefillAdder(CustomTestCase):
                     req, has_chunked_req=False, truncation_align_size=None
                 )
                 self.assertEqual(req.extend_len, expected)
+
+    def test_qsa_chunk_cuts_land_on_the_compress_ratio_grid(self):
+        # Compressed QSA asserts that every extend's prefix is a whole number of
+        # compress groups. Exact chunk fill bills raw lengths, so a cut's budget
+        # can be off that grid; the cut still lands on it.
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.truncation_align_size = None
+        kv_pool = SimpleNamespace(qsa_compress_ratio=4)
+        scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+            get_kvcache=lambda: kv_pool
+        )
+        scheduler.init_qsa_truncation_align()
+        align = scheduler.truncation_align_size
+        self.assertEqual(align, 4)
+        # Radix cache off: no prefix sharing, so exact chunk fill stays on.
+        self.mock_tree_cache.disable = True
+        self.mock_tree_cache.supports_mamba.return_value = True
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+        self.mock_token_allocator.available_size.return_value = 32768
+        # With the radix cache off, ignore-EOS requests take their own cut.
+        for site in ("admission", "ignore_eos"):
+            with (
+                self.subTest(site=site),
+                patch.object(
+                    schedule_policy, "_use_exact_chunk_fill", return_value=True
+                ),
+            ):
+                adder = self.create_adder(
+                    self.create_running_batch(), page_size=64, rem_chunk_tokens=102
+                )
+                req = self.create_shared_req(site)
+                req.sampling_params.ignore_eos = site == "ignore_eos"
+                req.full_untruncated_fill_ids = list(range(300))
+                req.origin_input_ids = req.full_untruncated_fill_ids
+                adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=align
+                )
+                self.assertEqual(req.extend_len, 100)
 
     def test_encoder_replay_rows_share_the_chunk(self):
         # A hit's replay rows run in the same step as its extend, so both must
@@ -1326,6 +1399,25 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(result, AddReqResult.NO_TOKEN)
         self.assertEqual(adder.can_run_list, [])
         self.assertIsNone(req.extend_end)
+
+    def test_ignore_eos_chunks_a_streaming_session_turn_after_its_prefix(self):
+        self.mock_tree_cache.disable = True
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_token_allocator.available_size.return_value = 4096
+        adder = self.create_adder(self.create_running_batch(), rem_chunk_tokens=128)
+
+        req = self.create_mock_req("session-turn", priority=0, max_new_tokens=8)
+        req.sampling_params.ignore_eos = True
+        req.origin_input_ids = list(range(512))
+        req.full_untruncated_fill_ids = list(range(512))
+        req.prefix_len = 64
+
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+
+        self.assertEqual(adder.can_run_list, [req])
+        self.assertIs(adder.new_chunked_req, req)
+        self.assertEqual(req.extend_end, 64 + 128)
+        self.assertEqual(adder.rem_chunk_tokens, 0)
 
     def create_sharded_adder(
         self,
@@ -2870,9 +2962,12 @@ class TestPrefillAdder(CustomTestCase):
 
     def _adder_with_extend_lens(self, extend_lens):
         adder = PrefillAdder.__new__(PrefillAdder)
-        adder.can_run_list = [
-            SimpleNamespace(extend_input_len=length) for length in extend_lens
-        ]
+        adder.can_run_list = []
+        for i, length in enumerate(extend_lens):
+            req = Req(str(i), "", array("q", range(8 + length)), SamplingParams())
+            req.prefix_len = 8
+            req.extend_end = req.prefix_len + length
+            adder.can_run_list.append(req)
         # BLOCK_M is auto-detected from the attention backend in production; the
         # __new__ helper bypasses __init__, so set it explicitly. 64 matches the
         # block_m the tile-count assertions below are computed against.
@@ -2906,6 +3001,18 @@ class TestPrefillAdder(CustomTestCase):
             patch.object(schedule_policy, "PREFILL_TILE_BUDGET_MODE", "legacy"),
         ):
             self.assertEqual(adder._check_prefill_tile_budget(129), AddReqResult.OTHER)
+
+    def test_prefill_tile_budget_counts_admitted_requests(self):
+        """The budget is charged for the requests already admitted in this pass,
+        not only for the candidate."""
+        adder = self._adder_with_extend_lens([129, 129])
+
+        with (
+            patch.object(schedule_policy, "_IS_HIP", True),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET", 6),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET_MODE", "compact"),
+        ):
+            self.assertEqual(adder._check_prefill_tile_budget(1), AddReqResult.OTHER)
 
     def test_prefill_tile_budget_always_allows_first_request(self):
         adder = self._adder_with_extend_lens([])
