@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import builtins
 import importlib
 import logging
 import os
@@ -42,7 +41,6 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "is_hip",
     "FP8_E4M3_MAX",
-    "FP8_E4M3_MIN",
     "is_cuda",
     "is_cuda_alike",
     "is_hpu",
@@ -116,7 +114,6 @@ __all__ = [
     "is_gfx942_supported",
     "is_gfx115_supported",
     "use_gfx115_kernels",
-    "is_gfx1201_supported",
     "is_gfx1250_supported",
     "get_hip_version",
     "get_nvidia_driver_version",
@@ -146,15 +143,6 @@ if is_hip():
     FP8_E4M3_MAX = HIP_FP8_E4M3_FNUZ_MAX
 else:
     FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
-
-
-FP8_E4M3_MIN = -FP8_E4M3_MAX
-
-
-builtins.FP8_E4M3_MAX = FP8_E4M3_MAX
-
-
-builtins.FP8_E4M3_MIN = FP8_E4M3_MIN
 
 
 @lru_cache(maxsize=1)
@@ -1356,15 +1344,6 @@ def use_gfx115_kernels() -> bool:
     from sglang.srt.environ import envs
 
     return is_gfx115_supported() and not envs.SGLANG_DISABLE_GFX115_KERNELS.get()
-
-
-@lru_cache(maxsize=1)
-def is_gfx1201_supported() -> bool:
-    if is_hip():
-        return (
-            torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] == "gfx1201"
-        )
-    return False
 
 
 @lru_cache(maxsize=1)

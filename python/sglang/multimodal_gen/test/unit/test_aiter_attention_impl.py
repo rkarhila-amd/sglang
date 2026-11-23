@@ -1,14 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """AITer attention impl construction guards (ROCm-only; skipped elsewhere)."""
 
+import sys
+import types
 import unittest
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
-
-from sglang.test.test_utils import CustomTestCase
 
 HEAD_SIZE = 128
 
@@ -42,6 +41,127 @@ def test_rejects_kv_heads_that_do_not_divide_the_query_heads():
         _build(32, 5)
 
 
+@pytest.mark.parametrize("racy", [True, False])
+def test_mha_v4_needs_the_aiter_race_fix(racy):
+    """ROCm/aiter#6841 fixed the BF16 kernel's races and dropped ``sparse`` here."""
+    _impl_cls()
+    from sglang.multimodal_gen.runtime.layers.attention.backends import aiter as backend
+
+    fake = types.ModuleType("aiter.ops.mha_v4")
+    if racy:
+        fake._check_lse_capable = lambda q_format, v_format, sparse: None
+    else:
+        fake._check_lse_capable = lambda q_format, v_format: None
+    with (
+        patch.object(backend, "USE_AITER_GFX95", True),
+        patch.dict(sys.modules, {"aiter.ops.mha_v4": fake}),
+        patch.object(sys.modules["aiter.ops"], "mha_v4", fake, create=True),
+    ):
+        assert (backend._load_mha_v4() is None) == racy
+
+
+def test_one_live_sequence_keeps_the_varlen_kernel_off_gfx950():
+    """The batch kernel and the key split were only measured on gfx950."""
+    impl = _build(4, 4)
+    from sglang.multimodal_gen.runtime.layers.attention.backends import aiter as backend
+
+    rows = 8
+    q = torch.randn(rows, 4, HEAD_SIZE)
+    bounds = (0, rows)
+    with (
+        patch.object(backend, "USE_AITER_GFX95", False),
+        patch.object(
+            backend.aiter, "flash_attn_varlen_func", lambda **kwargs: kwargs["q"] + 1
+        ),
+    ):
+        out = impl.forward_varlen(
+            q,
+            q,
+            q,
+            cu_seqlens=torch.tensor(bounds, dtype=torch.int32),
+            max_seqlen=rows,
+            cu_seqlens_host=bounds,
+        )
+    torch.testing.assert_close(out, q + 1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a ROCm GPU")
+@pytest.mark.parametrize("pad", [0, 24])
+def test_one_live_sequence_matches_the_varlen_kernel(pad):
+    """A packed single sequence (plus trailing padding) runs the batch kernel
+    on strided q/k/v: its live rows get the bytes of the same kernel on
+    contiguous inputs, match the varlen kernel (its bytes under fmha v3), and
+    the padding rows are zero."""
+    impl = _impl_cls()(
+        num_heads=4,
+        head_size=HEAD_SIZE,
+        softmax_scale=HEAD_SIZE**-0.5,
+        packed_trailing_padding=True,
+    )
+    from sglang.multimodal_gen.runtime.layers.attention.backends import aiter as backend
+
+    if not backend.USE_AITER_GFX95:
+        pytest.skip("the batch kernel path is gfx950-only")
+    torch.manual_seed(0)
+    total = 4096
+    used = total - pad
+    packed = torch.randn(total, 4, 3 * HEAD_SIZE, device="cuda", dtype=torch.bfloat16)
+    # strided views, as MiniMax-H3's Ulysses exchange hands them over
+    q, k, v = packed.split(HEAD_SIZE, dim=-1)
+    bounds = (0, used, total) if pad else (0, total)
+    cu_seqlens = torch.tensor(bounds, dtype=torch.int32, device="cuda")
+    out = impl.forward_varlen(
+        q, k, v, cu_seqlens=cu_seqlens, max_seqlen=used, cu_seqlens_host=bounds
+    )
+    live = (t[None, :used].contiguous() for t in (q, k, v))
+    assert torch.equal(out[:used], backend._flash(*live, HEAD_SIZE**-0.5)[0])
+    # without host bounds the call keeps the varlen kernel
+    ref = impl.forward_varlen(q, k, v, cu_seqlens=cu_seqlens, max_seqlen=used)
+    if backend._MHA_V4 is None:
+        assert torch.equal(out[:used], ref[:used])
+    torch.testing.assert_close(out[:used], ref[:used], atol=2e-2, rtol=2e-2)
+    assert not out[used:].any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a ROCm GPU")
+def test_tail_rows_with_split_keys_match_one_launch():
+    """Rows past the last full wave run with their keys split and an LSE
+    merge; they match a single launch within BF16 rounding, and repeat
+    bitwise."""
+    impl = _impl_cls()(
+        num_heads=7,
+        head_size=HEAD_SIZE,
+        softmax_scale=HEAD_SIZE**-0.5,
+        packed_trailing_padding=True,
+    )
+    from sglang.multimodal_gen.runtime.layers.attention.backends import aiter as backend
+
+    if not backend.USE_AITER_GFX95:
+        pytest.skip("the key split is gfx950-only")
+    heads, device = 7, torch.device("cuda", torch.cuda.current_device())
+    rows = 4 * backend._num_cus(device.index) // heads * 256 + 300
+    total = rows + 64
+    torch.manual_seed(0)
+    packed = torch.randn(
+        total, heads, 3 * HEAD_SIZE, device=device, dtype=torch.bfloat16
+    )
+    q, k, v = packed.split(HEAD_SIZE, dim=-1)
+    assert backend._tail_split_rows(rows, heads, device) is not None
+    bounds = (0, rows, total)
+    cu_seqlens = torch.tensor(bounds, dtype=torch.int32, device=device)
+    out = impl.forward_varlen(
+        q, k, v, cu_seqlens=cu_seqlens, max_seqlen=rows, cu_seqlens_host=bounds
+    )
+    live = (t[None, :rows] for t in (q, k, v))
+    single = backend._flash(*live, HEAD_SIZE**-0.5)[0]
+    torch.testing.assert_close(out[:rows], single, atol=2e-2, rtol=2e-2)
+    assert not out[rows:].any()
+    again = impl.forward_varlen(
+        q, k, v, cu_seqlens=cu_seqlens, max_seqlen=rows, cu_seqlens_host=bounds
+    )
+    assert torch.equal(out, again)
+
+
 class TestBF16AttentionUnderCompile(unittest.TestCase):
     """BF16 flash_attn_func must run outside Dynamo when tracing it would skip the DiT.
 
@@ -67,8 +187,6 @@ class TestBF16AttentionUnderCompile(unittest.TestCase):
         q = torch.randn(1, 8, 4, HEAD_SIZE)
         compiled_forward = torch.compile(impl.forward, backend="eager")
         with (
-            patch.object(aiter_backend, "_use_fp8_attn", False),
-            patch.object(aiter_backend, "USE_AITER_GFX1201", False),
             patch.object(aiter_backend, "USE_AITER_GFX1250", gfx1250),
             patch.object(aiter_backend, "_AITER_ENABLE_CK", enable_ck),
             patch.object(aiter_backend.aiter, "flash_attn_func", fake_flash_attn_func),
@@ -87,145 +205,5 @@ class TestBF16AttentionUnderCompile(unittest.TestCase):
         self.assertEqual(self._compiled_call(gfx1250=False, enable_ck=True), [True])
 
 
-NUM_HEADS = 4
-TOTAL_ROWS = 16
-LIVE_ROWS = 10
-
-
-class TestPackedTrailingPaddingVarlen(CustomTestCase):
-    """A packed caller's padding tail must not reach the grouped varlen kernel.
-
-    MiniMax H3 pads its single packed sequence up to a 64-row multiple, so
-    cu_seqlens carries a trailing segment of nothing but padding that the
-    kernel still schedules work over. Attending the live prefix alone is
-    invisible in the live rows, so only a dispatch-level assertion catches a
-    regression back to the two-segment call.
-    """
-
-    def _varlen_call(
-        self,
-        *,
-        packed_trailing_padding: bool = True,
-        cu_seqlens_host: tuple[int, ...] | None = (0, LIVE_ROWS, TOTAL_ROWS),
-        max_seqlen: int = LIVE_ROWS,
-        return_tuple: bool = False,
-    ) -> SimpleNamespace:
-        pytest.importorskip("aiter", reason="AITer is a ROCm-only dependency")
-        from sglang.multimodal_gen.runtime.layers.attention.backends import (
-            aiter as aiter_backend,
-        )
-
-        calls = []
-        kernel_outputs = []
-
-        def fake_flash_attn_varlen_func(**kwargs):
-            calls.append(kwargs)
-            # Derived from q so the assertions can tell which rows were fed in
-            # and where the kernel's output landed.
-            out = kwargs["q"] * 2 + 1
-            kernel_outputs.append(out)
-            return (out, None) if return_tuple else out
-
-        impl = _impl_cls()(
-            num_heads=NUM_HEADS,
-            head_size=HEAD_SIZE,
-            softmax_scale=HEAD_SIZE**-0.5,
-            num_kv_heads=NUM_HEADS,
-            packed_trailing_padding=packed_trailing_padding,
-        )
-        qkv = torch.randn(TOTAL_ROWS, NUM_HEADS, HEAD_SIZE)
-        cu_seqlens = torch.tensor(
-            (
-                cu_seqlens_host
-                if cu_seqlens_host is not None
-                else (0, LIVE_ROWS, TOTAL_ROWS)
-            ),
-            dtype=torch.int32,
-        )
-        with patch.object(
-            aiter_backend.aiter,
-            "flash_attn_varlen_func",
-            fake_flash_attn_varlen_func,
-        ):
-            out = impl.forward_varlen(
-                qkv,
-                qkv,
-                qkv,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                cu_seqlens_host=cu_seqlens_host,
-            )
-        return SimpleNamespace(
-            calls=calls, kernel_outputs=kernel_outputs, qkv=qkv, out=out
-        )
-
-    def test_live_prefix_is_attended_as_a_single_segment(self):
-        run = self._varlen_call()
-
-        (call,) = run.calls
-        for operand in ("q", "k", "v"):
-            self.assertEqual(call[operand].shape[0], LIVE_ROWS)
-            torch.testing.assert_close(call[operand], run.qkv[:LIVE_ROWS])
-        for bounds in ("cu_seqlens_q", "cu_seqlens_k"):
-            self.assertEqual(call[bounds].tolist(), [0, LIVE_ROWS])
-        self.assertEqual(call["max_seqlen_q"], LIVE_ROWS)
-        self.assertEqual(call["max_seqlen_k"], LIVE_ROWS)
-
-    def test_padding_rows_are_zeroed_and_live_rows_keep_their_offsets(self):
-        run = self._varlen_call()
-
-        self.assertEqual(run.out.shape, (TOTAL_ROWS, NUM_HEADS, HEAD_SIZE))
-        torch.testing.assert_close(run.out[:LIVE_ROWS], run.qkv[:LIVE_ROWS] * 2 + 1)
-        torch.testing.assert_close(
-            run.out[LIVE_ROWS:], torch.zeros_like(run.out[LIVE_ROWS:])
-        )
-
-    def test_tuple_return_is_unwrapped_on_the_live_prefix_path(self):
-        # aiter returns (out, lse) for some configurations; the padded path
-        # has its own unwrap, and a tuple reaching new_zeros() raises.
-        run = self._varlen_call(return_tuple=True)
-
-        torch.testing.assert_close(run.out[:LIVE_ROWS], run.qkv[:LIVE_ROWS] * 2 + 1)
-        torch.testing.assert_close(
-            run.out[LIVE_ROWS:], torch.zeros_like(run.out[LIVE_ROWS:])
-        )
-
-    def test_empty_trailing_segment_is_collapsed_to_one(self):
-        # H3's token refiner always packs [0, N, N]: the rows are trimmed, so
-        # the trailing segment holds nothing and only costs the kernel a
-        # partition. There is no tail to drop, so the result comes back as is.
-        run = self._varlen_call(
-            cu_seqlens_host=(0, TOTAL_ROWS, TOTAL_ROWS), max_seqlen=TOTAL_ROWS
-        )
-
-        (call,) = run.calls
-        self.assertEqual(call["q"].shape[0], TOTAL_ROWS)
-        self.assertEqual(call["cu_seqlens_q"].tolist(), [0, TOTAL_ROWS])
-        self.assertEqual(call["max_seqlen_q"], TOTAL_ROWS)
-        # Returned straight through: allocating and copying here would cost
-        # more than the empty segment it saves.
-        self.assertIs(run.out, run.kernel_outputs[0])
-
-    def test_full_sequence_is_attended_when_the_caller_does_not_opt_in(self):
-        run = self._varlen_call(packed_trailing_padding=False, max_seqlen=TOTAL_ROWS)
-
-        (call,) = run.calls
-        self.assertEqual(call["q"].shape[0], TOTAL_ROWS)
-        self.assertEqual(call["cu_seqlens_q"].tolist(), [0, LIVE_ROWS, TOTAL_ROWS])
-        torch.testing.assert_close(run.out, run.qkv * 2 + 1)
-
-    def test_full_sequence_is_attended_without_host_bounds(self):
-        # The live length is a host value; without it there is nothing to slice
-        # at, and reading it off the device tensor would sync every call.
-        run = self._varlen_call(cu_seqlens_host=None)
-
-        (call,) = run.calls
-        self.assertEqual(call["q"].shape[0], TOTAL_ROWS)
-        self.assertEqual(call["cu_seqlens_q"].tolist(), [0, LIVE_ROWS, TOTAL_ROWS])
-        torch.testing.assert_close(run.out, run.qkv * 2 + 1)
-
-
 if __name__ == "__main__":
-    import sys
-
     sys.exit(pytest.main([__file__, "-v"]))
